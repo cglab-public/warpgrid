@@ -485,7 +485,7 @@ static void test_dspark_and_verify_kernels() {
     auto p_mg = g_ctx.pso("markov_gate_kernel");
     EXPECT_TRUE(p_sg != nil && p_ba != nil && p_mg != nil);
 
-    const uint32_t M = 4, N = 64, K = 128;
+    const uint32_t M = 8, N = 64, K = 128;
     std::vector<uint16_t> X(M * K);
     std::vector<uint8_t> W8(N * K, 0x38);
     std::vector<float> Wsc(N, 1.0f);
@@ -515,7 +515,7 @@ static void test_dspark_and_verify_kernels() {
     [enc setBuffer:bY_bf offset:0 atIndex:3];
     [enc setBuffer:bY_f32 offset:0 atIndex:4];
     [enc setBytes:&gp length:sizeof(gp) atIndex:5];
-    [enc dispatchThreadgroups:MTLSizeMake((N + 3) / 4, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    [enc dispatchThreadgroups:MTLSizeMake((N + 7) / 8, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
 
     [enc setComputePipelineState:p_ba];
     [enc setBuffer:bY_f32 offset:0 atIndex:0];

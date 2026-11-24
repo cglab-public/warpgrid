@@ -65,11 +65,11 @@ Measured end-to-end over the live OpenAI-compatible HTTP/SSE server (`./warpgrid
 
 | Workload | `llama.cpp` (`IQ4_NL`) | `oMLX 0.8.3` (`oQ4e`) | `MTPLX 2.13.2` (MTP) | **`warpgrid` (Metal + DFlash2)** | Notes |
 |---|---:|---:|---:|---:|---|
-| **Cold Server Load** | — | — | — | **1.18 s** (+0.09 s DFlash2) | Direct unified-memory safetensors load |
-| **`c=1` Code SSE (med / peak)** | 41.0 tok/s | 59.5 tok/s | 83.3 tok/s | **80.16 / 107.91 tok/s** | **+34.7% med / +81.4% peak vs oMLX** *(on battery)* |
-| **`c=1` Prose SSE (med)** | 41.0 tok/s | 57.2 tok/s | 57.0 tok/s | **55.60 tok/s** | Native DFlash2 (`--dflash2`, `k=7`, *on battery*) |
+| **Cold Server Load** | — | — | — | **1.18 s** (+0.07 s DFlash2) | Direct unified-memory safetensors load |
+| **`c=1` Code SSE (med / peak)** | 41.0 tok/s | 59.5 tok/s | 83.3 tok/s | **82.10 / 111.36 tok/s** | **116.46 tok/s CLI** (+38% med / +87% peak vs oMLX) |
+| **`c=1` Prose SSE (med / peak)** | 41.0 tok/s | 57.2 tok/s | 57.0 tok/s | **58.19 / 59.62 tok/s** | **Beats both `oMLX` & `MTPLX`** (`--dflash2`, `k=6`) |
 | **4.1K Multi-Turn Prefix Cache** | — | — | — | **358.2 ms** warm (**27.5×**) | Exact `cached_tokens` match |
-| **14.5K Needle-in-a-Haystack** | — | — | — | **427.4** prefill / **53.06** decode | **3/3 exact PASS** (Split-K FP8 attn) |
+| **14.5K Needle-in-a-Haystack** | — | — | — | **443.3** prefill / **53.06** decode | **3/3 exact PASS** (Split-K FP8 attn) |
 | **132K Needle-in-a-Haystack** | — | — | — | **233.6** prefill / **18.8** decode | **3/3 exact PASS**, **860.9 ms** warm (**656.9×**) |
 | **Parallel Ladder (`c=1..8`)** | — | — | — | **68.81** (`c=1`) → **74.92 agg** (`c=8`) | Batched continuous decode |
 

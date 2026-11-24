@@ -231,6 +231,8 @@ struct Inkling2Model::Impl {
     id<MTLComputePipelineState> pso_moe_mxfp8_w2 = nil;
     id<MTLComputePipelineState> pso_moe_mxfp8_w13_grp = nil;
     id<MTLComputePipelineState> pso_moe_mxfp8_w2_grp = nil;
+    id<MTLComputePipelineState> pso_moe_mxfp8_w13_dedup = nil;
+    id<MTLComputePipelineState> pso_moe_mxfp8_w2_dedup = nil;
     id<MTLComputePipelineState> pso_bf16_gemv = nil;
     id<MTLComputePipelineState> pso_bf16_gemv_1sg = nil;
     id<MTLComputePipelineState> pso_quant_fp8 = nil;
@@ -524,7 +526,7 @@ struct Inkling2Model::Impl {
             [enc setBuffer:(Y_bf ? Y_bf : b_dummy) offset:y_bf_off atIndex:3];
             [enc setBuffer:(Y_f32 ? Y_f32 : b_dummy) offset:y_f32_off atIndex:4];
             [enc setBytes:&gp length:sizeof(gp) atIndex:5];
-            [enc dispatchThreadgroups:MTLSizeMake((N + 3u) / 4u, 1, 1)
+            [enc dispatchThreadgroups:MTLSizeMake((N + 7u) / 8u, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
             return;
         }
@@ -1158,6 +1160,44 @@ struct Inkling2Model::Impl {
                     [enc setBuffer:b_moe_w2_out offset:0 atIndex:5];
                     [enc setBytes:&mp length:sizeof(mp) atIndex:6];
                     [enc dispatchThreadgroups:MTLSizeMake((D + 31u) / 32u, (uint32_t)cfg.n_routed_experts, 1)
+                        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+                    [enc setComputePipelineState:pso_moe_reduce_k];
+                    [enc setBuffer:b_moe_w2_out offset:0 atIndex:0];
+                    [enc setBuffer:b_mlp_raw offset:0 atIndex:1];
+                    [enc setBytes:&mp length:sizeof(mp) atIndex:2];
+                    [enc dispatchThreads:MTLSizeMake(D, mp.T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    flush_stage(prof_moe_mxfp8_ms);
+                } else if (lw.is_mxfp8 && T >= 2) {
+                    MoeGroupParams gp{(uint32_t)(T * cfg.num_experts_per_tok), (uint32_t)cfg.n_routed_experts};
+                    [enc setComputePipelineState:pso_moe_group];
+                    [enc setBuffer:b_topk_ids offset:0 atIndex:0];
+                    [enc setBuffer:b_moe_offsets offset:0 atIndex:1];
+                    [enc setBuffer:b_moe_sorted_tk offset:0 atIndex:2];
+                    [enc setBytes:&gp length:sizeof(gp) atIndex:3];
+                    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+                    [enc setComputePipelineState:pso_moe_mxfp8_w13_dedup];
+                    [enc setBuffer:b_mlp_in offset:0 atIndex:0];
+                    [enc setBuffer:b_topk_weights offset:0 atIndex:1];
+                    [enc setBuffer:b_moe_offsets offset:0 atIndex:2];
+                    [enc setBuffer:b_moe_sorted_tk offset:0 atIndex:3];
+                    [enc setBuffer:lw.w13_weight offset:0 atIndex:4];
+                    [enc setBuffer:lw.w13_scale offset:0 atIndex:5];
+                    [enc setBuffer:b_moe_act offset:0 atIndex:6];
+                    [enc setBytes:&mp length:sizeof(mp) atIndex:7];
+                    [enc dispatchThreadgroups:MTLSizeMake((mp.inter + 3u) / 4u, (uint32_t)cfg.n_routed_experts, 1)
+                        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+                    [enc setComputePipelineState:pso_moe_mxfp8_w2_dedup];
+                    [enc setBuffer:b_moe_act offset:0 atIndex:0];
+                    [enc setBuffer:b_moe_offsets offset:0 atIndex:1];
+                    [enc setBuffer:b_moe_sorted_tk offset:0 atIndex:2];
+                    [enc setBuffer:lw.w2_weight offset:0 atIndex:3];
+                    [enc setBuffer:lw.w2_scale offset:0 atIndex:4];
+                    [enc setBuffer:b_moe_w2_out offset:0 atIndex:5];
+                    [enc setBytes:&mp length:sizeof(mp) atIndex:6];
+                    [enc dispatchThreadgroups:MTLSizeMake((D + 3u) / 4u, (uint32_t)cfg.n_routed_experts, 1)
                         threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
 
                     [enc setComputePipelineState:pso_moe_reduce_k];
@@ -2233,6 +2273,8 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
         impl_->pso_moe_mxfp8_w2 = impl_->make_pso("moe_mxfp8_w2_kernel");
         impl_->pso_moe_mxfp8_w13_grp = impl_->make_pso("moe_mxfp8_w13_grouped_kernel");
         impl_->pso_moe_mxfp8_w2_grp = impl_->make_pso("moe_mxfp8_w2_grouped_kernel");
+        impl_->pso_moe_mxfp8_w13_dedup = impl_->make_pso("moe_mxfp8_w13_dedup_kernel");
+        impl_->pso_moe_mxfp8_w2_dedup = impl_->make_pso("moe_mxfp8_w2_dedup_kernel");
         impl_->pso_bf16_gemv = impl_->make_pso("bf16_gemv_kernel");
         impl_->pso_bf16_gemv_1sg = impl_->make_pso("bf16_gemv_1sg_kernel");
         impl_->pso_quant_fp8 = impl_->make_pso("quantize_bf16_to_fp8_rowwise_kernel");
