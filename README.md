@@ -63,15 +63,15 @@ Measured end-to-end over the live OpenAI-compatible HTTP/SSE server (`./warpgrid
 
 Measured end-to-end over the live OpenAI-compatible HTTP/SSE server (`./warpgrid` built with `make -j` on macOS — zero Python/PyTorch/MLX dependencies — serving official `thinkingmachines/Inkling-2-Mini` NVFP4/MXFP8 + `DSpark` `mtp.safetensors` with **8 concurrent slots × 139,264 tokens**, **18.5 GiB peak RSS**):
 
-| Workload | `llama.cpp` (`IQ4_NL`) | `oMLX 0.8.3` (`oQ4e`) | **`warpgrid` (Metal)** | Notes |
-|---|---:|---:|---:|---|
-| **Cold Server Load** | — | — | **1.21 s** (+0.31 s DSpark) | Direct unified-memory safetensors load |
-| **`c=1` Code SSE (med / peak)** | 41.0 tok/s | 59.5 tok/s | **72.72 / 75.10 tok/s** | **+22.2% med / +26.2% peak** vs `oMLX` |
-| **`c=1` Prose SSE (med)** | 41.0 tok/s | 57.2 tok/s | **48.71 tok/s** | Native `DSpark` (`--draft-k 5`) |
-| **4.1K Multi-Turn Prefix Cache** | — | — | **358.2 ms** warm (**27.5×**) | Exact `cached_tokens` match |
-| **14.5K Needle-in-a-Haystack** | — | — | **387.1** prefill / **53.06** decode | **3/3 exact PASS** (Split-K FP8 attn) |
-| **132K Needle-in-a-Haystack** | — | — | **233.6** prefill / **18.8** decode | **3/3 exact PASS**, **860.9 ms** warm (**656.9×**) |
-| **Parallel Ladder (`c=1..8`)** | — | — | **68.81** (`c=1`) → **74.92 agg** (`c=8`) | Batched continuous decode |
+| Workload | `llama.cpp` (`IQ4_NL`) | `oMLX 0.8.3` (`oQ4e`) | `MTPLX 2.13.2` (MTP) | **`warpgrid` (Metal + DFlash2)** | Notes |
+|---|---:|---:|---:|---:|---|
+| **Cold Server Load** | — | — | — | **1.18 s** (+0.09 s DFlash2) | Direct unified-memory safetensors load |
+| **`c=1` Code SSE (med / peak)** | 41.0 tok/s | 59.5 tok/s | 83.3 tok/s | **80.16 / 107.91 tok/s** | **+34.7% med / +81.4% peak vs oMLX** *(on battery)* |
+| **`c=1` Prose SSE (med)** | 41.0 tok/s | 57.2 tok/s | 57.0 tok/s | **55.60 tok/s** | Native DFlash2 (`--dflash2`, `k=7`, *on battery*) |
+| **4.1K Multi-Turn Prefix Cache** | — | — | — | **358.2 ms** warm (**27.5×**) | Exact `cached_tokens` match |
+| **14.5K Needle-in-a-Haystack** | — | — | — | **427.4** prefill / **53.06** decode | **3/3 exact PASS** (Split-K FP8 attn) |
+| **132K Needle-in-a-Haystack** | — | — | — | **233.6** prefill / **18.8** decode | **3/3 exact PASS**, **860.9 ms** warm (**656.9×**) |
+| **Parallel Ladder (`c=1..8`)** | — | — | — | **68.81** (`c=1`) → **74.92 agg** (`c=8`) | Batched continuous decode |
 
 ---
 

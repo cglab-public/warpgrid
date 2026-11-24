@@ -10,19 +10,43 @@ inline float safe_tanh(float x) {
     return tanh(clamp(x, -20.0f, 20.0f));
 }
 
+constant float kE4M3Lut[256] = {
+    0.0f, 0.001953125f, 0.00390625f, 0.005859375f, 0.0078125f, 0.009765625f, 0.01171875f, 0.013671875f,
+    0.015625f, 0.017578125f, 0.01953125f, 0.021484375f, 0.0234375f, 0.025390625f, 0.02734375f, 0.029296875f,
+    0.03125f, 0.03515625f, 0.0390625f, 0.04296875f, 0.046875f, 0.05078125f, 0.0546875f, 0.05859375f,
+    0.0625f, 0.0703125f, 0.078125f, 0.0859375f, 0.09375f, 0.1015625f, 0.109375f, 0.1171875f,
+    0.125f, 0.140625f, 0.15625f, 0.171875f, 0.1875f, 0.203125f, 0.21875f, 0.234375f,
+    0.25f, 0.28125f, 0.3125f, 0.34375f, 0.375f, 0.40625f, 0.4375f, 0.46875f,
+    0.5f, 0.5625f, 0.625f, 0.6875f, 0.75f, 0.8125f, 0.875f, 0.9375f,
+    1.0f, 1.125f, 1.25f, 1.375f, 1.5f, 1.625f, 1.75f, 1.875f,
+    2.0f, 2.25f, 2.5f, 2.75f, 3.0f, 3.25f, 3.5f, 3.75f,
+    4.0f, 4.5f, 5.0f, 5.5f, 6.0f, 6.5f, 7.0f, 7.5f,
+    8.0f, 9.0f, 10.0f, 11.0f, 12.0f, 13.0f, 14.0f, 15.0f,
+    16.0f, 18.0f, 20.0f, 22.0f, 24.0f, 26.0f, 28.0f, 30.0f,
+    32.0f, 36.0f, 40.0f, 44.0f, 48.0f, 52.0f, 56.0f, 60.0f,
+    64.0f, 72.0f, 80.0f, 88.0f, 96.0f, 104.0f, 112.0f, 120.0f,
+    128.0f, 144.0f, 160.0f, 176.0f, 192.0f, 208.0f, 224.0f, 240.0f,
+    256.0f, 288.0f, 320.0f, 352.0f, 384.0f, 416.0f, 448.0f, 0.0f,
+    -0.0f, -0.001953125f, -0.00390625f, -0.005859375f, -0.0078125f, -0.009765625f, -0.01171875f, -0.013671875f,
+    -0.015625f, -0.017578125f, -0.01953125f, -0.021484375f, -0.0234375f, -0.025390625f, -0.02734375f, -0.029296875f,
+    -0.03125f, -0.03515625f, -0.0390625f, -0.04296875f, -0.046875f, -0.05078125f, -0.0546875f, -0.05859375f,
+    -0.0625f, -0.0703125f, -0.078125f, -0.0859375f, -0.09375f, -0.1015625f, -0.109375f, -0.1171875f,
+    -0.125f, -0.140625f, -0.15625f, -0.171875f, -0.1875f, -0.203125f, -0.21875f, -0.234375f,
+    -0.25f, -0.28125f, -0.3125f, -0.34375f, -0.375f, -0.40625f, -0.4375f, -0.46875f,
+    -0.5f, -0.5625f, -0.625f, -0.6875f, -0.75f, -0.8125f, -0.875f, -0.9375f,
+    -1.0f, -1.125f, -1.25f, -1.375f, -1.5f, -1.625f, -1.75f, -1.875f,
+    -2.0f, -2.25f, -2.5f, -2.75f, -3.0f, -3.25f, -3.5f, -3.75f,
+    -4.0f, -4.5f, -5.0f, -5.5f, -6.0f, -6.5f, -7.0f, -7.5f,
+    -8.0f, -9.0f, -10.0f, -11.0f, -12.0f, -13.0f, -14.0f, -15.0f,
+    -16.0f, -18.0f, -20.0f, -22.0f, -24.0f, -26.0f, -28.0f, -30.0f,
+    -32.0f, -36.0f, -40.0f, -44.0f, -48.0f, -52.0f, -56.0f, -60.0f,
+    -64.0f, -72.0f, -80.0f, -88.0f, -96.0f, -104.0f, -112.0f, -120.0f,
+    -128.0f, -144.0f, -160.0f, -176.0f, -192.0f, -208.0f, -224.0f, -240.0f,
+    -256.0f, -288.0f, -320.0f, -352.0f, -384.0f, -416.0f, -448.0f, 0.0f
+};
+
 inline float e4m3_to_f32(uchar b) {
-    uint sign = (b >> 7) & 1u;
-    uint exp = (b >> 3) & 0xFu;
-    uint mant = b & 0x7u;
-    if (exp == 15u && mant == 7u) return 0.0f;
-    float v;
-    if (exp == 0u) {
-        v = float(mant) * 0.001953125f;
-    } else {
-        uint fbits = ((exp + 120u) << 23) | (mant << 20);
-        v = as_type<float>(fbits);
-    }
-    return sign ? -v : v;
+    return kE4M3Lut[b];
 }
 
 inline uchar f32_to_e4m3(float v) {
@@ -2350,20 +2374,44 @@ kernel void fp8_small_gemm_kernel(
     float a4 = 0.0f, a5 = 0.0f, a6 = 0.0f, a7 = 0.0f;
     uint M = p.M;
 
-    for (uint i = lane; i < k4; i += 32u) {
-        uchar4 wv = wr4[i];
-        float w0 = e4m3_to_f32(wv.x);
-        float w1 = e4m3_to_f32(wv.y);
-        float w2 = e4m3_to_f32(wv.z);
-        float w3 = e4m3_to_f32(wv.w);
-        { float4 xv = float4(x0[i]); a0 = fma(w0, xv.x, fma(w1, xv.y, fma(w2, xv.z, fma(w3, xv.w, a0)))); }
-        if (M > 1u) { float4 xv = float4(x1[i]); a1 = fma(w0, xv.x, fma(w1, xv.y, fma(w2, xv.z, fma(w3, xv.w, a1)))); }
-        if (M > 2u) { float4 xv = float4(x2[i]); a2 = fma(w0, xv.x, fma(w1, xv.y, fma(w2, xv.z, fma(w3, xv.w, a2)))); }
-        if (M > 3u) { float4 xv = float4(x3[i]); a3 = fma(w0, xv.x, fma(w1, xv.y, fma(w2, xv.z, fma(w3, xv.w, a3)))); }
-        if (M > 4u) { float4 xv = float4(x4[i]); a4 = fma(w0, xv.x, fma(w1, xv.y, fma(w2, xv.z, fma(w3, xv.w, a4)))); }
-        if (M > 5u) { float4 xv = float4(x5[i]); a5 = fma(w0, xv.x, fma(w1, xv.y, fma(w2, xv.z, fma(w3, xv.w, a5)))); }
-        if (M > 6u) { float4 xv = float4(x6[i]); a6 = fma(w0, xv.x, fma(w1, xv.y, fma(w2, xv.z, fma(w3, xv.w, a6)))); }
-        if (M > 7u) { float4 xv = float4(x7[i]); a7 = fma(w0, xv.x, fma(w1, xv.y, fma(w2, xv.z, fma(w3, xv.w, a7)))); }
+    if (M == 8u) {
+        for (uint i = lane; i < k4; i += 32u) {
+            uchar4 wv = wr4[i];
+            float4 fw = float4(kE4M3Lut[wv.x], kE4M3Lut[wv.y], kE4M3Lut[wv.z], kE4M3Lut[wv.w]);
+            a0 += dot(fw, float4(x0[i]));
+            a1 += dot(fw, float4(x1[i]));
+            a2 += dot(fw, float4(x2[i]));
+            a3 += dot(fw, float4(x3[i]));
+            a4 += dot(fw, float4(x4[i]));
+            a5 += dot(fw, float4(x5[i]));
+            a6 += dot(fw, float4(x6[i]));
+            a7 += dot(fw, float4(x7[i]));
+        }
+    } else if (M == 7u) {
+        for (uint i = lane; i < k4; i += 32u) {
+            uchar4 wv = wr4[i];
+            float4 fw = float4(kE4M3Lut[wv.x], kE4M3Lut[wv.y], kE4M3Lut[wv.z], kE4M3Lut[wv.w]);
+            a0 += dot(fw, float4(x0[i]));
+            a1 += dot(fw, float4(x1[i]));
+            a2 += dot(fw, float4(x2[i]));
+            a3 += dot(fw, float4(x3[i]));
+            a4 += dot(fw, float4(x4[i]));
+            a5 += dot(fw, float4(x5[i]));
+            a6 += dot(fw, float4(x6[i]));
+        }
+    } else {
+        for (uint i = lane; i < k4; i += 32u) {
+            uchar4 wv = wr4[i];
+            float4 fw = float4(kE4M3Lut[wv.x], kE4M3Lut[wv.y], kE4M3Lut[wv.z], kE4M3Lut[wv.w]);
+            a0 += dot(fw, float4(x0[i]));
+            if (M > 1u) a1 += dot(fw, float4(x1[i]));
+            if (M > 2u) a2 += dot(fw, float4(x2[i]));
+            if (M > 3u) a3 += dot(fw, float4(x3[i]));
+            if (M > 4u) a4 += dot(fw, float4(x4[i]));
+            if (M > 5u) a5 += dot(fw, float4(x5[i]));
+            if (M > 6u) a6 += dot(fw, float4(x6[i]));
+            if (M > 7u) a7 += dot(fw, float4(x7[i]));
+        }
     }
 
     float sc = Wsc[n];
@@ -2869,5 +2917,432 @@ kernel void zero_bf16_kernel(
     uint gid           [[thread_position_in_grid]])
 {
     if (gid < N) dst[gid] = bfloat(0.0f);
+}
+
+struct Df2ConcatParams {
+    uint T;
+    uint D;
+    uint stack_stride;
+};
+
+kernel void dflash2_concat_taps_kernel(
+    device const bfloat* aux_states [[buffer(0)]],
+    device bfloat* out              [[buffer(1)]],
+    constant Df2ConcatParams& p     [[buffer(2)]],
+    uint2 gid                       [[thread_position_in_grid]])
+{
+    uint col = gid.x;
+    uint t = gid.y;
+    if (t >= p.T || col >= 4u * p.D) return;
+    uint tap = col / p.D;
+    uint d = col - tap * p.D;
+    out[long(t) * long(4u * p.D) + long(col)] = aux_states[long(tap) * long(p.stack_stride) + long(t) * long(p.D) + long(d)];
+}
+
+struct Df2ConvParams {
+    uint T;
+    uint D;
+    uint group_size;
+    uint half_idx;
+};
+
+kernel void dflash2_grouped_dyn_conv_kernel(
+    device const bfloat* x      [[buffer(0)]],
+    device const bfloat* base_k [[buffer(1)]],
+    device const bfloat* dyn_k  [[buffer(2)]],
+    device bfloat* out          [[buffer(3)]],
+    constant Df2ConvParams& p   [[buffer(4)]],
+    uint2 gid                   [[thread_position_in_grid]])
+{
+    uint d = gid.x;
+    uint t = gid.y;
+    if (t >= p.T || d >= p.D) return;
+    uint nG = p.D / p.group_size;
+    uint g = d / p.group_size;
+    long d_base = long(t) * long(4u * nG) + long(p.half_idx * 2u * nG) + long(g);
+    float w0 = float(base_k[long(d)]) + float(dyn_k[d_base]);
+    float w1 = float(base_k[long(p.D) + long(d)]) + float(dyn_k[d_base + long(nG)]);
+    float x0 = float(x[long(t) * long(p.D) + long(d)]);
+    float x1 = (t > 0u) ? float(x[long(t - 1u) * long(p.D) + long(d)]) : 0.0f;
+    out[long(t) * long(p.D) + long(d)] = bfloat(fma(w0, x0, w1 * x1));
+}
+
+kernel void dflash2_block_attn_kernel(
+    device const bfloat* q_blk   [[buffer(0)]],
+    device const bfloat* k_blk   [[buffer(1)]],
+    device const bfloat* v_blk   [[buffer(2)]],
+    device const bfloat* k_cache [[buffer(3)]],
+    device const bfloat* v_cache [[buffer(4)]],
+    device bfloat* out           [[buffer(5)]],
+    constant DraftAttnParams& p  [[buffer(6)]],
+    uint2 tgid                   [[threadgroup_position_in_grid]],
+    uint lane                    [[thread_index_in_simdgroup]])
+{
+    uint h = tgid.x;
+    uint t = tgid.y;
+    if (h >= p.n_heads || t >= p.B) return;
+
+    uint kv_h = h / (p.n_heads / p.n_kv_heads);
+    uint q_pos = p.anchor_pos + t;
+    uint c_start = (q_pos + 1u > p.window_size) ? (q_pos + 1u - p.window_size) : 0u;
+    uint c_end = p.anchor_pos;
+    float inv_sqrt_d = rsqrt(float(p.head_dim));
+
+    device const bfloat* qp = q_blk + (long(t) * long(p.n_heads) + long(h)) * long(p.head_dim);
+    float q0 = float(qp[lane]);
+    float q1 = float(qp[lane + 32u]);
+    float q2 = float(qp[lane + 64u]);
+    float q3 = float(qp[lane + 96u]);
+
+    float m_val = -INFINITY;
+    float l_val = 0.0f;
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    long kv_stride = long(p.n_kv_heads) * long(p.head_dim);
+
+    for (uint kp = c_start; kp < c_end; ++kp) {
+        uint slot = kp % p.cap;
+        device const bfloat* kp_ptr = k_cache + long(slot) * kv_stride + long(kv_h) * long(p.head_dim);
+        device const bfloat* vp_ptr = v_cache + long(slot) * kv_stride + long(kv_h) * long(p.head_dim);
+        float dot = fma(q0, float(kp_ptr[lane]), 0.0f);
+        dot = fma(q1, float(kp_ptr[lane + 32u]), dot);
+        dot = fma(q2, float(kp_ptr[lane + 64u]), dot);
+        dot = fma(q3, float(kp_ptr[lane + 96u]), dot);
+        dot = simd_sum(dot) * inv_sqrt_d;
+        float m_new = max(m_val, dot);
+        float al = (l_val > 0.0f) ? exp(m_val - m_new) : 0.0f;
+        float pr = exp(dot - m_new);
+        l_val = l_val * al + pr;
+        a0 = a0 * al + pr * float(vp_ptr[lane]);
+        a1 = a1 * al + pr * float(vp_ptr[lane + 32u]);
+        a2 = a2 * al + pr * float(vp_ptr[lane + 64u]);
+        a3 = a3 * al + pr * float(vp_ptr[lane + 96u]);
+        m_val = m_new;
+    }
+
+    for (uint j = 0u; j < p.B; ++j) {
+        device const bfloat* kp_ptr = k_blk + long(j) * kv_stride + long(kv_h) * long(p.head_dim);
+        device const bfloat* vp_ptr = v_blk + long(j) * kv_stride + long(kv_h) * long(p.head_dim);
+        float dot = fma(q0, float(kp_ptr[lane]), 0.0f);
+        dot = fma(q1, float(kp_ptr[lane + 32u]), dot);
+        dot = fma(q2, float(kp_ptr[lane + 64u]), dot);
+        dot = fma(q3, float(kp_ptr[lane + 96u]), dot);
+        dot = simd_sum(dot) * inv_sqrt_d;
+        float m_new = max(m_val, dot);
+        float al = (l_val > 0.0f) ? exp(m_val - m_new) : 0.0f;
+        float pr = exp(dot - m_new);
+        l_val = l_val * al + pr;
+        a0 = a0 * al + pr * float(vp_ptr[lane]);
+        a1 = a1 * al + pr * float(vp_ptr[lane + 32u]);
+        a2 = a2 * al + pr * float(vp_ptr[lane + 64u]);
+        a3 = a3 * al + pr * float(vp_ptr[lane + 96u]);
+        m_val = m_new;
+    }
+
+    float inv_l = 1.0f / l_val;
+    device bfloat* op = out + (long(t) * long(p.n_heads) + long(h)) * long(p.head_dim);
+    op[lane]       = bfloat(a0 * inv_l);
+    op[lane + 32u] = bfloat(a1 * inv_l);
+    op[lane + 64u] = bfloat(a2 * inv_l);
+    op[lane + 96u] = bfloat(a3 * inv_l);
+}
+
+struct Df2TopKParams {
+    uint M;
+    uint V;
+};
+
+kernel void dflash2_topk16_kernel(
+    device float* logits       [[buffer(0)]],
+    device float* top_vals     [[buffer(1)]],
+    device int* top_ids        [[buffer(2)]],
+    constant Df2TopKParams& p  [[buffer(3)]],
+    uint tgid                  [[threadgroup_position_in_grid]],
+    uint tid                   [[thread_index_in_threadgroup]],
+    uint tg_size               [[threads_per_threadgroup]])
+{
+    uint m = tgid;
+    if (m >= p.M) return;
+    device float* row = logits + long(m) * long(p.V);
+    threadgroup float sm_v[32];
+    threadgroup int sm_i[32];
+    uint lane = tid & 31u;
+    uint wid = tid >> 5;
+    uint nw = (tg_size + 31u) >> 5;
+
+    for (uint k = 0u; k < 16u; ++k) {
+        float best_v = -1e30f;
+        int best_i = 0;
+        for (uint i = tid; i < p.V; i += tg_size) {
+            float v = row[i];
+            if (v > best_v) {
+                best_v = v;
+                best_i = int(i);
+            }
+        }
+        for (uint off = 16u; off > 0u; off >>= 1) {
+            float ov = simd_shuffle_down(best_v, off);
+            int oi = simd_shuffle_down(best_i, off);
+            if (ov > best_v || (ov == best_v && oi < best_i)) {
+                best_v = ov;
+                best_i = oi;
+            }
+        }
+        if (lane == 0u) {
+            sm_v[wid] = best_v;
+            sm_i[wid] = best_i;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (wid == 0u) {
+            best_v = (lane < nw) ? sm_v[lane] : -1e30f;
+            best_i = (lane < nw) ? sm_i[lane] : 0;
+            for (uint off = 16u; off > 0u; off >>= 1) {
+                float ov = simd_shuffle_down(best_v, off);
+                int oi = simd_shuffle_down(best_i, off);
+                if (ov > best_v || (ov == best_v && oi < best_i)) {
+                    best_v = ov;
+                    best_i = oi;
+                }
+            }
+            if (lane == 0u) {
+                top_vals[long(m) * 16L + long(k)] = best_v;
+                top_ids[long(m) * 16L + long(k)] = best_i;
+                row[best_i] = -1e30f;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    }
+}
+
+kernel void moe_nvfp4_w13_dedup_kernel(
+    device const bfloat* x         [[buffer(0)]],
+    device const float* topk_wts   [[buffer(1)]],
+    device const uint* offsets     [[buffer(2)]],
+    device const uint* sorted_tk   [[buffer(3)]],
+    device const uchar* w13_u8     [[buffer(4)]],
+    device const uchar* w13_scale  [[buffer(5)]],
+    device const float* w13_amax   [[buffer(6)]],
+    device const float* w13_denom  [[buffer(7)]],
+    device float* act_out          [[buffer(8)]],
+    constant MoeParams& p          [[buffer(9)]],
+    uint2 tgid                     [[threadgroup_position_in_grid]],
+    uint sg_id                     [[simdgroup_index_in_threadgroup]],
+    uint lane                      [[thread_index_in_simdgroup]])
+{
+    uint expert = tgid.y;
+    uint j = tgid.x * 4u + sg_id;
+    if (j >= p.inter) return;
+    uint s0 = offsets[expert];
+    uint s1 = offsets[expert + 1u];
+    if (s0 >= s1) return;
+
+    float gscale = w13_amax[expert] / w13_denom[0];
+    long row_g = long(2u * j);
+    long row_u = long(2u * j + 1u);
+    long half_D = long(p.D / 2u);
+    long scale_D = long(p.D / 16u);
+    long exp_base = long(expert) * long(2u * p.inter);
+
+    device const uint2* wg2 = reinterpret_cast<device const uint2*>(w13_u8 + (exp_base + row_g) * half_D);
+    device const uint2* wu2 = reinterpret_cast<device const uint2*>(w13_u8 + (exp_base + row_u) * half_D);
+    device const uchar* sg = w13_scale + (exp_base + row_g) * scale_D;
+    device const uchar* su = w13_scale + (exp_base + row_u) * scale_D;
+
+    for (uint idx = s0; idx < s1; idx += 4u) {
+        uint n = min(4u, s1 - idx);
+        uint tk0 = sorted_tk[idx];
+        device const bfloat4* x0 = reinterpret_cast<device const bfloat4*>(x + long(tk0 / p.K) * long(p.D));
+        if (n == 1u) {
+            float ag0 = 0.0f, au0 = 0.0f;
+            for (uint blk = lane; blk < uint(scale_D); blk += 32u) {
+                float bsg = kE4M3Lut[sg[blk]];
+                float bsu = kE4M3Lut[su[blk]];
+                uint2 bg = wg2[blk];
+                uint2 bu = wu2[blk];
+                float lg0 = 0.0f, lu0 = 0.0f;
+                for (uint h = 0u; h < 2u; ++h) {
+                    uint bw_g = (h == 0u) ? bg.x : bg.y;
+                    uint bw_u = (h == 0u) ? bu.x : bu.y;
+                    for (uint q = 0u; q < 2u; ++q) {
+                        uint bg0 = (bw_g >> (q * 16u)) & 0xFFu;
+                        uint bg1 = (bw_g >> (q * 16u + 8u)) & 0xFFu;
+                        uint bu0 = (bw_u >> (q * 16u)) & 0xFFu;
+                        uint bu1 = (bw_u >> (q * 16u + 8u)) & 0xFFu;
+                        float4 fg = float4(kE2M1Lut[bg0 & 0xFu], kE2M1Lut[bg0 >> 4], kE2M1Lut[bg1 & 0xFu], kE2M1Lut[bg1 >> 4]);
+                        float4 fu = float4(kE2M1Lut[bu0 & 0xFu], kE2M1Lut[bu0 >> 4], kE2M1Lut[bu1 & 0xFu], kE2M1Lut[bu1 >> 4]);
+                        float4 v0 = float4(x0[blk * 4u + h * 2u + q]);
+                        lg0 += dot(fg, v0);
+                        lu0 += dot(fu, v0);
+                    }
+                }
+                ag0 = fma(lg0, bsg, ag0);
+                au0 = fma(lu0, bsu, au0);
+            }
+            ag0 = simd_sum(ag0) * gscale;
+            au0 = simd_sum(au0) * gscale;
+            if (lane == 0u) {
+                float sig = 1.0f / (1.0f + exp(-ag0));
+                float gc = safe_tanh(ag0 / p.gate_cap) * p.gate_cap;
+                float uc = safe_tanh(au0 / p.up_cap) * p.up_cap;
+                act_out[long(tk0) * long(p.inter) + long(j)] = float(bfloat((gc * sig * uc) * topk_wts[tk0]));
+            }
+            continue;
+        }
+        uint tk1 = sorted_tk[idx + 1u];
+        uint tk2 = (n > 2u) ? sorted_tk[idx + 2u] : tk0;
+        uint tk3 = (n > 3u) ? sorted_tk[idx + 3u] : tk0;
+
+        device const bfloat4* x1 = reinterpret_cast<device const bfloat4*>(x + long(tk1 / p.K) * long(p.D));
+        device const bfloat4* x2 = reinterpret_cast<device const bfloat4*>(x + long(tk2 / p.K) * long(p.D));
+        device const bfloat4* x3 = reinterpret_cast<device const bfloat4*>(x + long(tk3 / p.K) * long(p.D));
+
+        float ag0 = 0.0f, ag1 = 0.0f, ag2 = 0.0f, ag3 = 0.0f;
+        float au0 = 0.0f, au1 = 0.0f, au2 = 0.0f, au3 = 0.0f;
+
+        for (uint blk = lane; blk < uint(scale_D); blk += 32u) {
+            float bsg = e4m3_to_f32(sg[blk]);
+            float bsu = e4m3_to_f32(su[blk]);
+            uint2 bg = wg2[blk];
+            uint2 bu = wu2[blk];
+            float lg0 = 0.0f, lg1 = 0.0f, lg2 = 0.0f, lg3 = 0.0f;
+            float lu0 = 0.0f, lu1 = 0.0f, lu2 = 0.0f, lu3 = 0.0f;
+            for (uint h = 0u; h < 2u; ++h) {
+                uint bw_g = (h == 0u) ? bg.x : bg.y;
+                uint bw_u = (h == 0u) ? bu.x : bu.y;
+                for (uint q = 0u; q < 2u; ++q) {
+                    uint bg0 = (bw_g >> (q * 16u)) & 0xFFu;
+                    uint bg1 = (bw_g >> (q * 16u + 8u)) & 0xFFu;
+                    uint bu0 = (bw_u >> (q * 16u)) & 0xFFu;
+                    uint bu1 = (bw_u >> (q * 16u + 8u)) & 0xFFu;
+                    float4 fg = float4(kE2M1Lut[bg0 & 0xFu], kE2M1Lut[bg0 >> 4], kE2M1Lut[bg1 & 0xFu], kE2M1Lut[bg1 >> 4]);
+                    float4 fu = float4(kE2M1Lut[bu0 & 0xFu], kE2M1Lut[bu0 >> 4], kE2M1Lut[bu1 & 0xFu], kE2M1Lut[bu1 >> 4]);
+                    uint off = blk * 4u + h * 2u + q;
+                    float4 v0 = float4(x0[off]);
+                    lg0 += dot(fg, v0); lu0 += dot(fu, v0);
+                    if (n > 1u) { float4 v1 = float4(x1[off]); lg1 += dot(fg, v1); lu1 += dot(fu, v1); }
+                    if (n > 2u) { float4 v2 = float4(x2[off]); lg2 += dot(fg, v2); lu2 += dot(fu, v2); }
+                    if (n > 3u) { float4 v3 = float4(x3[off]); lg3 += dot(fg, v3); lu3 += dot(fu, v3); }
+                }
+            }
+            ag0 = fma(lg0, bsg, ag0); au0 = fma(lu0, bsu, au0);
+            if (n > 1u) { ag1 = fma(lg1, bsg, ag1); au1 = fma(lu1, bsu, au1); }
+            if (n > 2u) { ag2 = fma(lg2, bsg, ag2); au2 = fma(lu2, bsu, au2); }
+            if (n > 3u) { ag3 = fma(lg3, bsg, ag3); au3 = fma(lu3, bsu, au3); }
+        }
+
+        ag0 = simd_sum(ag0) * gscale; au0 = simd_sum(au0) * gscale;
+        if (n > 1u) { ag1 = simd_sum(ag1) * gscale; au1 = simd_sum(au1) * gscale; }
+        if (n > 2u) { ag2 = simd_sum(ag2) * gscale; au2 = simd_sum(au2) * gscale; }
+        if (n > 3u) { ag3 = simd_sum(ag3) * gscale; au3 = simd_sum(au3) * gscale; }
+
+        if (lane == 0u) {
+            uint tks[4] = {tk0, tk1, tk2, tk3};
+            float gs[4] = {ag0, ag1, ag2, ag3};
+            float us[4] = {au0, au1, au2, au3};
+            for (uint qi = 0u; qi < n; ++qi) {
+                float sig = 1.0f / (1.0f + exp(-gs[qi]));
+                float gc = safe_tanh(gs[qi] / p.gate_cap) * p.gate_cap;
+                float uc = safe_tanh(us[qi] / p.up_cap) * p.up_cap;
+                float y = (gc * sig * uc) * topk_wts[tks[qi]];
+                act_out[long(tks[qi]) * long(p.inter) + long(j)] = float(bfloat(y));
+            }
+        }
+    }
+}
+
+kernel void moe_nvfp4_w2_dedup_kernel(
+    device const float* act_in     [[buffer(0)]],
+    device const uint* offsets     [[buffer(1)]],
+    device const uint* sorted_tk   [[buffer(2)]],
+    device const uchar* w2_u8      [[buffer(3)]],
+    device const uchar* w2_scale   [[buffer(4)]],
+    device const float* w2_amax    [[buffer(5)]],
+    device const float* w2_denom   [[buffer(6)]],
+    device bfloat* w2_out          [[buffer(7)]],
+    constant MoeParams& p          [[buffer(8)]],
+    uint2 tgid                     [[threadgroup_position_in_grid]],
+    uint sg_id                     [[simdgroup_index_in_threadgroup]],
+    uint lane                      [[thread_index_in_simdgroup]])
+{
+    uint expert = tgid.y;
+    uint d = tgid.x * 4u + sg_id;
+    if (d >= p.D) return;
+    uint s0 = offsets[expert];
+    uint s1 = offsets[expert + 1u];
+    if (s0 >= s1) return;
+
+    float gscale = w2_amax[expert] / w2_denom[0];
+    long half_I = long(p.inter / 2u);
+    long scale_I = long(p.inter / 16u);
+    long row_idx = long(expert) * long(p.D) + long(d);
+    device const uint2* w2_2 = reinterpret_cast<device const uint2*>(w2_u8 + row_idx * half_I);
+    device const uchar* s2r = w2_scale + row_idx * scale_I;
+
+    for (uint idx = s0; idx < s1; idx += 4u) {
+        uint n = min(4u, s1 - idx);
+        uint tk0 = sorted_tk[idx];
+        device const float4* a0 = reinterpret_cast<device const float4*>(act_in + long(tk0) * long(p.inter));
+        if (n == 1u) {
+            float r0 = 0.0f;
+            for (uint blk = lane; blk < uint(scale_I); blk += 32u) {
+                float bs = kE4M3Lut[s2r[blk]];
+                uint2 bw = w2_2[blk];
+                float l0 = 0.0f;
+                for (uint h = 0u; h < 2u; ++h) {
+                    uint w32 = (h == 0u) ? bw.x : bw.y;
+                    for (uint q = 0u; q < 2u; ++q) {
+                        uint b0 = (w32 >> (q * 16u)) & 0xFFu;
+                        uint b1 = (w32 >> (q * 16u + 8u)) & 0xFFu;
+                        float4 fw = float4(kE2M1Lut[b0 & 0xFu], kE2M1Lut[b0 >> 4], kE2M1Lut[b1 & 0xFu], kE2M1Lut[b1 >> 4]);
+                        l0 += dot(fw, a0[blk * 4u + h * 2u + q]);
+                    }
+                }
+                r0 = fma(l0, bs, r0);
+            }
+            r0 = simd_sum(r0) * gscale;
+            if (lane == 0u) w2_out[long(tk0) * long(p.D) + long(d)] = bfloat(r0);
+            continue;
+        }
+        uint tk1 = sorted_tk[idx + 1u];
+        uint tk2 = (n > 2u) ? sorted_tk[idx + 2u] : tk0;
+        uint tk3 = (n > 3u) ? sorted_tk[idx + 3u] : tk0;
+
+        device const float4* a1 = reinterpret_cast<device const float4*>(act_in + long(tk1) * long(p.inter));
+        device const float4* a2 = reinterpret_cast<device const float4*>(act_in + long(tk2) * long(p.inter));
+        device const float4* a3 = reinterpret_cast<device const float4*>(act_in + long(tk3) * long(p.inter));
+
+        float r0 = 0.0f, r1 = 0.0f, r2 = 0.0f, r3 = 0.0f;
+        for (uint blk = lane; blk < uint(scale_I); blk += 32u) {
+            float bs = e4m3_to_f32(s2r[blk]);
+            uint2 bw = w2_2[blk];
+            float l0 = 0.0f, l1 = 0.0f, l2 = 0.0f, l3 = 0.0f;
+            for (uint h = 0u; h < 2u; ++h) {
+                uint w32 = (h == 0u) ? bw.x : bw.y;
+                for (uint q = 0u; q < 2u; ++q) {
+                    uint b0 = (w32 >> (q * 16u)) & 0xFFu;
+                    uint b1 = (w32 >> (q * 16u + 8u)) & 0xFFu;
+                    float4 fw = float4(kE2M1Lut[b0 & 0xFu], kE2M1Lut[b0 >> 4], kE2M1Lut[b1 & 0xFu], kE2M1Lut[b1 >> 4]);
+                    uint off = blk * 4u + h * 2u + q;
+                    l0 += dot(fw, a0[off]);
+                    if (n > 1u) l1 += dot(fw, a1[off]);
+                    if (n > 2u) l2 += dot(fw, a2[off]);
+                    if (n > 3u) l3 += dot(fw, a3[off]);
+                }
+            }
+            r0 = fma(l0, bs, r0);
+            if (n > 1u) r1 = fma(l1, bs, r1);
+            if (n > 2u) r2 = fma(l2, bs, r2);
+            if (n > 3u) r3 = fma(l3, bs, r3);
+        }
+        r0 = simd_sum(r0) * gscale;
+        if (n > 1u) r1 = simd_sum(r1) * gscale;
+        if (n > 2u) r2 = simd_sum(r2) * gscale;
+        if (n > 3u) r3 = simd_sum(r3) * gscale;
+        if (lane == 0u) {
+            w2_out[long(tk0) * long(p.D) + long(d)] = bfloat(r0);
+            if (n > 1u) w2_out[long(tk1) * long(p.D) + long(d)] = bfloat(r1);
+            if (n > 2u) w2_out[long(tk2) * long(p.D) + long(d)] = bfloat(r2);
+            if (n > 3u) w2_out[long(tk3) * long(p.D) + long(d)] = bfloat(r3);
+        }
+    }
 }
 

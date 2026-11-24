@@ -218,6 +218,7 @@ public:
     __nv_bfloat16* d_last_aux = nullptr;   // [4, 1, D] (last committed token's aux features)
     int draft_k = 0;                       // 0 = disabled, 1..7 = DSpark speculative tokens
     std::string draft_vocab_file;          // optional frequency-ranked pruned draft vocab binary
+    std::string dflash2_dir;
     int moe_group_thresh = 64;             // T >= thresh uses grouped cuBLAS prefill MoE (T < 64 stays pure GPU!)
     bool save_conv_snaps = false;
 

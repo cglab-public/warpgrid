@@ -22,6 +22,7 @@ int main(int argc, char** argv) {
     int bench_prefill = 0;
     int draft_k = 0;
     std::string draft_vocab_file;
+    std::string dflash2_dir;
     int moe_group_thresh = 64;
     std::string bench_prompt = "What is 17 * 19? Reply with just the number.";
 
@@ -39,6 +40,7 @@ int main(int argc, char** argv) {
         else if (a == "--bench-prefill" && i + 1 < argc) bench_prefill = std::stoi(argv[++i]);
         else if (a == "--draft-k" && i + 1 < argc) draft_k = std::stoi(argv[++i]);
         else if (a == "--draft-vocab-file" && i + 1 < argc) draft_vocab_file = argv[++i];
+        else if (a == "--dflash2" && i + 1 < argc) dflash2_dir = argv[++i];
         else if (a == "--moe-group-thresh" && i + 1 < argc) moe_group_thresh = std::stoi(argv[++i]);
         else if (a == "--prompt" && i + 1 < argc) bench_prompt = argv[++i];
         else if (a == "--no-gemv") no_gemv = true;
@@ -57,8 +59,9 @@ int main(int argc, char** argv) {
         ink::Inkling2Model model;
         model.use_bf16_gemv = !no_gemv;
         model.use_cuda_graph = !no_graph;
-        model.draft_k = draft_k;
+        model.draft_k = (draft_k == 0 && !dflash2_dir.empty()) ? 7 : draft_k;
         model.draft_vocab_file = draft_vocab_file;
+        model.dflash2_dir = dflash2_dir;
         model.moe_group_thresh = moe_group_thresh;
         model.load(model_dir, max_seq, max_chunk, max_slots);
 

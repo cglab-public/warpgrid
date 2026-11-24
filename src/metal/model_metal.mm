@@ -68,6 +68,9 @@ struct MarkovInParams { uint32_t rank; uint32_t D; };
 struct MarkovArgParams { uint32_t V; uint32_t has_map; };
 struct GatherParams { uint32_t M; uint32_t D; };
 struct FoldParams { uint32_t V; uint32_t D; uint32_t rank; };
+struct Df2ConcatParams { uint32_t T; uint32_t D; uint32_t stack_stride; };
+struct Df2ConvParams { uint32_t T; uint32_t D; uint32_t group_size; uint32_t half_idx; };
+struct Df2TopKParams { uint32_t M; uint32_t V; };
 
 static float bf16_bits_to_f32(uint16_t b) {
     uint32_t u = (uint32_t)b << 16;
@@ -93,6 +96,26 @@ struct MetalDraftLayerWeights {
     id<MTLBuffer> gate_fp8 = nil, gate_sc = nil;
     id<MTLBuffer> up_fp8 = nil, up_sc = nil;
     id<MTLBuffer> down_fp8 = nil, down_sc = nil;
+};
+
+struct MetalDFlash2LayerWeights {
+    id<MTLBuffer> input_ln = nil;
+    id<MTLBuffer> post_ln = nil;
+    id<MTLBuffer> q_norm = nil;
+    id<MTLBuffer> k_norm = nil;
+    id<MTLBuffer> attn_conv_base = nil;
+    id<MTLBuffer> attn_conv_proj = nil;
+    id<MTLBuffer> mlp_conv_base = nil;
+    id<MTLBuffer> mlp_conv_proj = nil;
+    id<MTLBuffer> k_proj_bf16 = nil;
+    id<MTLBuffer> v_proj_bf16 = nil;
+    id<MTLBuffer> q_fp8 = nil, q_sc = nil;
+    id<MTLBuffer> k_fp8 = nil, k_sc = nil;
+    id<MTLBuffer> v_fp8 = nil, v_sc = nil;
+    id<MTLBuffer> o_fp8 = nil, o_sc = nil;
+    id<MTLBuffer> g_fp8 = nil, g_sc = nil;
+    id<MTLBuffer> u_fp8 = nil, u_sc = nil;
+    id<MTLBuffer> d_fp8 = nil, d_sc = nil;
 };
 
 struct MetalLayerWeights {
@@ -201,6 +224,8 @@ struct Inkling2Model::Impl {
     id<MTLComputePipelineState> pso_moe_nvfp4_w2 = nil;
     id<MTLComputePipelineState> pso_moe_nvfp4_w13_grp = nil;
     id<MTLComputePipelineState> pso_moe_nvfp4_w2_grp = nil;
+    id<MTLComputePipelineState> pso_moe_nvfp4_w13_dedup = nil;
+    id<MTLComputePipelineState> pso_moe_nvfp4_w2_dedup = nil;
     id<MTLComputePipelineState> pso_moe_reduce_k = nil;
     id<MTLComputePipelineState> pso_moe_mxfp8_w13 = nil;
     id<MTLComputePipelineState> pso_moe_mxfp8_w2 = nil;
@@ -227,6 +252,10 @@ struct Inkling2Model::Impl {
     id<MTLComputePipelineState> pso_gather_bf16 = nil;
     id<MTLComputePipelineState> pso_fold_unembed = nil;
     id<MTLComputePipelineState> pso_zero_bf16 = nil;
+    id<MTLComputePipelineState> pso_df2_concat = nil;
+    id<MTLComputePipelineState> pso_df2_conv = nil;
+    id<MTLComputePipelineState> pso_df2_attn = nil;
+    id<MTLComputePipelineState> pso_df2_topk16 = nil;
 
     id<MTLBuffer> embed_w = nil;
     id<MTLBuffer> embed_norm_w = nil;
@@ -341,6 +370,52 @@ struct Inkling2Model::Impl {
     id<MTLBuffer> ds_markov_bias = nil;
     id<MTLBuffer> ds_draft_tok = nil;
     id<MTLBuffer> ds_anchor_tok = nil;
+
+    bool df2_loaded = false;
+    int df2_num_layers = 5;
+    int df2_hidden = 2304;
+    int df2_inter = 6912;
+    int df2_heads = 32;
+    int df2_kv_heads = 8;
+    int df2_head_dim = 128;
+    int df2_window = 2048;
+    int df2_block = 8;
+    int df2_mask_id = 200056;
+    int df2_group_size = 16;
+    int df2_sel_rank = 256;
+    int df2_vocab_unpadded = 200058;
+    float df2_rope_theta = 10000.0f;
+    float df2_eps = 1e-6f;
+    int df2_kv_cap = 2072;
+    id<MTLBuffer> df2_fc = nil;
+    id<MTLBuffer> df2_hidden_norm = nil;
+    id<MTLBuffer> df2_final_norm = nil;
+    id<MTLBuffer> df2_sel_hproj = nil;
+    id<MTLBuffer> df2_sel_pred_cb = nil;
+    id<MTLBuffer> df2_sel_succ_cb = nil;
+    std::vector<MetalDFlash2LayerWeights> df2_layers;
+    std::vector<id<MTLBuffer>> df2_k_cache;
+    std::vector<id<MTLBuffer>> df2_v_cache;
+    id<MTLBuffer> df2_ctx_cat = nil;
+    id<MTLBuffer> df2_ctx_fc = nil;
+    id<MTLBuffer> df2_ctx_norm = nil;
+    id<MTLBuffer> df2_ctx_k = nil;
+    id<MTLBuffer> df2_ctx_v = nil;
+    id<MTLBuffer> df2_tok_ids = nil;
+    id<MTLBuffer> df2_res = nil;
+    id<MTLBuffer> df2_x = nil;
+    id<MTLBuffer> df2_xc = nil;
+    id<MTLBuffer> df2_dyn = nil;
+    id<MTLBuffer> df2_q = nil;
+    id<MTLBuffer> df2_k = nil;
+    id<MTLBuffer> df2_v = nil;
+    id<MTLBuffer> df2_attn_out = nil;
+    id<MTLBuffer> df2_proj_out = nil;
+    id<MTLBuffer> df2_mlp_g = nil;
+    id<MTLBuffer> df2_mlp_u = nil;
+    id<MTLBuffer> df2_h_sel = nil;
+    id<MTLBuffer> df2_top_v = nil;
+    id<MTLBuffer> df2_top_i = nil;
 
     double gpu_ws_gib = 0.0;
     uint32_t gpu_max_tg = 256;
@@ -638,7 +713,7 @@ struct Inkling2Model::Impl {
             }
 
             size_t partial_off = (size_t)num_blocks * stack_stride_bytes;
-            if (ds_loaded) {
+            if (ds_loaded || df2_loaded) {
                 int aux_slot = (v == 5) ? 0 : (v == 23 ? 1 : (v == 41 ? 2 : -1));
                 if (aux_slot >= 0) {
                     blit_copy(b_stack, partial_off, b_aux_states,
@@ -1155,6 +1230,48 @@ struct Inkling2Model::Impl {
                     [enc setBytes:&mp length:sizeof(mp) atIndex:2];
                     [enc dispatchThreads:MTLSizeMake(D, mp.T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
                     flush_stage(prof_moe_nvfp4_ms);
+                } else if (T >= 2) {
+                    MoeGroupParams gp{(uint32_t)(T * cfg.num_experts_per_tok), (uint32_t)cfg.n_routed_experts};
+                    [enc setComputePipelineState:pso_moe_group];
+                    [enc setBuffer:b_topk_ids offset:0 atIndex:0];
+                    [enc setBuffer:b_moe_offsets offset:0 atIndex:1];
+                    [enc setBuffer:b_moe_sorted_tk offset:0 atIndex:2];
+                    [enc setBytes:&gp length:sizeof(gp) atIndex:3];
+                    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+                    [enc setComputePipelineState:pso_moe_nvfp4_w13_dedup];
+                    [enc setBuffer:b_mlp_in offset:0 atIndex:0];
+                    [enc setBuffer:b_topk_weights offset:0 atIndex:1];
+                    [enc setBuffer:b_moe_offsets offset:0 atIndex:2];
+                    [enc setBuffer:b_moe_sorted_tk offset:0 atIndex:3];
+                    [enc setBuffer:lw.w13_weight offset:0 atIndex:4];
+                    [enc setBuffer:lw.w13_scale offset:0 atIndex:5];
+                    [enc setBuffer:lw.w13_amax offset:0 atIndex:6];
+                    [enc setBuffer:lw.w13_denom offset:0 atIndex:7];
+                    [enc setBuffer:b_moe_act offset:0 atIndex:8];
+                    [enc setBytes:&mp length:sizeof(mp) atIndex:9];
+                    [enc dispatchThreadgroups:MTLSizeMake((mp.inter + 3u) / 4u, (uint32_t)cfg.n_routed_experts, 1)
+                        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+                    [enc setComputePipelineState:pso_moe_nvfp4_w2_dedup];
+                    [enc setBuffer:b_moe_act offset:0 atIndex:0];
+                    [enc setBuffer:b_moe_offsets offset:0 atIndex:1];
+                    [enc setBuffer:b_moe_sorted_tk offset:0 atIndex:2];
+                    [enc setBuffer:lw.w2_weight offset:0 atIndex:3];
+                    [enc setBuffer:lw.w2_scale offset:0 atIndex:4];
+                    [enc setBuffer:lw.w2_amax offset:0 atIndex:5];
+                    [enc setBuffer:lw.w2_denom offset:0 atIndex:6];
+                    [enc setBuffer:b_moe_w2_out offset:0 atIndex:7];
+                    [enc setBytes:&mp length:sizeof(mp) atIndex:8];
+                    [enc dispatchThreadgroups:MTLSizeMake((D + 3u) / 4u, (uint32_t)cfg.n_routed_experts, 1)
+                        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+                    [enc setComputePipelineState:pso_moe_reduce_k];
+                    [enc setBuffer:b_moe_w2_out offset:0 atIndex:0];
+                    [enc setBuffer:b_mlp_raw offset:0 atIndex:1];
+                    [enc setBytes:&mp length:sizeof(mp) atIndex:2];
+                    [enc dispatchThreads:MTLSizeMake(D, mp.T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    flush_stage(prof_moe_nvfp4_ms);
                 } else {
                     [enc setComputePipelineState:pso_moe_nvfp4_w13];
                     [enc setBuffer:b_mlp_in offset:0 atIndex:0];
@@ -1231,7 +1348,7 @@ struct Inkling2Model::Impl {
                         output_query, 0, 1,
                         final_norm_w, 0, b_mlp_in, 0, nil, 0,
                         (uint32_t)T, D, cfg.rms_norm_eps);
-        if (ds_loaded) {
+        if (ds_loaded || df2_loaded) {
             blit_copy(b_mlp_in, 0, b_aux_states,
                       (size_t)3 * stack_stride_bytes + (size_t)aux_tok_offset * D * 2,
                       (size_t)T * D * 2);
@@ -1646,6 +1763,355 @@ struct Inkling2Model::Impl {
         commit_and_wait(cb);
         memcpy(h_out_drafts, ds_draft_tok.contents, (size_t)num_draft * sizeof(int32_t));
     }
+
+    void load_dflash2(const std::string& df2_dir, const InklingConfig& cfg,
+                      int max_ctx_chunk, int n_ds_slots)
+    {
+        auto t0 = std::chrono::steady_clock::now();
+        dspark_slots = n_ds_slots;
+        df2_vocab_unpadded = cfg.unpadded_vocab_size;
+        df2_hidden = cfg.hidden_size;
+        SafetensorsFile dfst;
+        dfst.open(df2_dir + "/model.safetensors");
+
+        df2_fc = load_tensor(dfst, "fc.weight");
+        df2_hidden_norm = load_tensor(dfst, "hidden_norm.weight");
+        df2_final_norm = load_tensor(dfst, "norm.weight");
+        df2_sel_hproj = load_tensor(dfst, "candidate_selector.hidden_projection.weight");
+        df2_sel_pred_cb = load_tensor(dfst, "candidate_selector.predecessor_codebook");
+        df2_sel_succ_cb = load_tensor(dfst, "candidate_selector.successor_codebook");
+
+        int q_dim = df2_heads * df2_head_dim;
+        int kv_dim = df2_kv_heads * df2_head_dim;
+        df2_layers.resize(df2_num_layers);
+
+        id<MTLCommandBuffer> qcb = [queue commandBuffer];
+        id<MTLComputeCommandEncoder> qenc = [qcb computeCommandEncoder];
+        auto load_q_fp8 = [&](const std::string& name, uint32_t N, uint32_t K,
+                              id<MTLBuffer> __strong& fp8, id<MTLBuffer> __strong& sc) {
+            id<MTLBuffer> raw = load_tensor(dfst, name);
+            fp8 = alloc_shared((size_t)N * K);
+            sc = alloc_shared((size_t)N * sizeof(float));
+            quantize_rowwise_fp8(qenc, raw, fp8, sc, N, K);
+        };
+
+        for (int i = 0; i < df2_num_layers; ++i) {
+            auto& lw = df2_layers[i];
+            std::string p = "layers." + std::to_string(i) + ".";
+            lw.input_ln = load_tensor(dfst, p + "input_layernorm.weight");
+            lw.post_ln = load_tensor(dfst, p + "post_attention_layernorm.weight");
+            lw.q_norm = load_tensor(dfst, p + "self_attn.q_norm.weight");
+            lw.k_norm = load_tensor(dfst, p + "self_attn.k_norm.weight");
+            lw.attn_conv_base = load_tensor(dfst, p + "attention_conv.base_kernel");
+            lw.attn_conv_proj = load_tensor(dfst, p + "attention_conv.kernel_projection.weight");
+            lw.mlp_conv_base = load_tensor(dfst, p + "mlp_conv.base_kernel");
+            lw.mlp_conv_proj = load_tensor(dfst, p + "mlp_conv.kernel_projection.weight");
+            lw.k_proj_bf16 = load_tensor(dfst, p + "self_attn.k_proj.weight");
+            lw.v_proj_bf16 = load_tensor(dfst, p + "self_attn.v_proj.weight");
+
+            load_q_fp8(p + "self_attn.q_proj.weight", (uint32_t)q_dim, (uint32_t)df2_hidden, lw.q_fp8, lw.q_sc);
+            lw.k_fp8 = alloc_shared((size_t)kv_dim * df2_hidden);
+            lw.k_sc = alloc_shared((size_t)kv_dim * sizeof(float));
+            quantize_rowwise_fp8(qenc, lw.k_proj_bf16, lw.k_fp8, lw.k_sc, (uint32_t)kv_dim, (uint32_t)df2_hidden);
+            lw.v_fp8 = alloc_shared((size_t)kv_dim * df2_hidden);
+            lw.v_sc = alloc_shared((size_t)kv_dim * sizeof(float));
+            quantize_rowwise_fp8(qenc, lw.v_proj_bf16, lw.v_fp8, lw.v_sc, (uint32_t)kv_dim, (uint32_t)df2_hidden);
+            load_q_fp8(p + "self_attn.o_proj.weight", (uint32_t)df2_hidden, (uint32_t)q_dim, lw.o_fp8, lw.o_sc);
+            load_q_fp8(p + "mlp.gate_proj.weight", (uint32_t)df2_inter, (uint32_t)df2_hidden, lw.g_fp8, lw.g_sc);
+            load_q_fp8(p + "mlp.up_proj.weight", (uint32_t)df2_inter, (uint32_t)df2_hidden, lw.u_fp8, lw.u_sc);
+            load_q_fp8(p + "mlp.down_proj.weight", (uint32_t)df2_hidden, (uint32_t)df2_inter, lw.d_fp8, lw.d_sc);
+        }
+        [qenc endEncoding];
+        commit_and_wait(qcb);
+
+        df2_kv_cap = df2_window + df2_block + 16;
+        df2_k_cache.resize(df2_num_layers);
+        df2_v_cache.resize(df2_num_layers);
+        for (int i = 0; i < df2_num_layers; ++i) {
+            size_t sz = (size_t)dspark_slots * (size_t)df2_kv_cap * kv_dim * 2;
+            df2_k_cache[i] = alloc_shared(sz);
+            df2_v_cache[i] = alloc_shared(sz);
+        }
+
+        df2_ctx_cat = alloc_shared((size_t)max_ctx_chunk * 4 * df2_hidden * 2);
+        df2_ctx_fc = alloc_shared((size_t)max_ctx_chunk * df2_hidden * 2);
+        df2_ctx_norm = alloc_shared((size_t)max_ctx_chunk * df2_hidden * 2);
+        df2_ctx_k = alloc_shared((size_t)max_ctx_chunk * kv_dim * 2);
+        df2_ctx_v = alloc_shared((size_t)max_ctx_chunk * kv_dim * 2);
+        df2_tok_ids = alloc_shared((size_t)df2_block * sizeof(int32_t));
+        df2_res = alloc_shared((size_t)df2_block * df2_hidden * 2);
+        df2_x = alloc_shared((size_t)df2_block * df2_hidden * 2);
+        df2_xc = alloc_shared((size_t)df2_block * df2_hidden * 2);
+        df2_dyn = alloc_shared((size_t)df2_block * 4 * (df2_hidden / df2_group_size) * 2);
+        df2_q = alloc_shared((size_t)df2_block * q_dim * 2);
+        df2_k = alloc_shared((size_t)df2_block * kv_dim * 2);
+        df2_v = alloc_shared((size_t)df2_block * kv_dim * 2);
+        df2_attn_out = alloc_shared((size_t)df2_block * q_dim * 2);
+        df2_proj_out = alloc_shared((size_t)df2_block * df2_hidden * 2);
+        df2_mlp_g = alloc_shared((size_t)df2_block * df2_inter * 2);
+        df2_mlp_u = alloc_shared((size_t)df2_block * df2_inter * 2);
+        df2_h_sel = alloc_shared((size_t)df2_block * df2_sel_rank * 2);
+        df2_top_v = alloc_shared((size_t)df2_block * 16 * sizeof(float));
+        df2_top_i = alloc_shared((size_t)df2_block * 16 * sizeof(int32_t));
+
+        df2_loaded = true;
+        double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        fprintf(stderr, "[warpgrid-metal] Loaded DFlash2 drafter (%d layers, W8A16 FP8, block=%d, SWA=%d, slots=%d) in %.2f s\n",
+                df2_num_layers, df2_block, df2_window, dspark_slots, sec);
+    }
+
+    void store_dflash2_context_kv(size_t aux_off_bytes, uint32_t aux_stride, int T, int start_pos, int slot_id) {
+        uint32_t D = (uint32_t)df2_hidden;
+        if (T > df2_window) {
+            int skip = T - df2_window;
+            aux_off_bytes += (size_t)skip * D * 2;
+            start_pos += skip;
+            T = df2_window;
+        }
+        uint32_t kv_dim = (uint32_t)(df2_kv_heads * df2_head_dim);
+        id<MTLCommandBuffer> cb = [queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+
+        Df2ConcatParams cp{(uint32_t)T, D, aux_stride};
+        [enc setComputePipelineState:pso_df2_concat];
+        [enc setBuffer:b_aux_states offset:aux_off_bytes atIndex:0];
+        [enc setBuffer:df2_ctx_cat offset:0 atIndex:1];
+        [enc setBytes:&cp length:sizeof(cp) atIndex:2];
+        [enc dispatchThreads:MTLSizeMake(4u * D, (uint32_t)T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+        encode_linear_bf16(enc, df2_ctx_cat, 0, df2_fc, 0, df2_ctx_fc, 0, nil, 0, (uint32_t)T, D, 4u * D, false);
+
+        RmsParams rp{(uint32_t)T, D, df2_eps};
+        [enc setComputePipelineState:pso_rmsnorm];
+        [enc setBuffer:df2_ctx_fc offset:0 atIndex:0];
+        [enc setBuffer:df2_hidden_norm offset:0 atIndex:1];
+        [enc setBuffer:df2_ctx_norm offset:0 atIndex:2];
+        [enc setBytes:&rp length:sizeof(rp) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake((uint32_t)T, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+        for (int i = 0; i < df2_num_layers; ++i) {
+            const auto& lw = df2_layers[i];
+            size_t slot_off = (size_t)slot_id * (size_t)df2_kv_cap * kv_dim * 2;
+            if (T <= 8) {
+                encode_linear_fp8(enc, df2_ctx_norm, 0, lw.k_fp8, 0, lw.k_sc, 0, df2_ctx_k, 0, nil, 0, (uint32_t)T, kv_dim, D, false);
+                encode_linear_fp8(enc, df2_ctx_norm, 0, lw.v_fp8, 0, lw.v_sc, 0, df2_ctx_v, 0, nil, 0, (uint32_t)T, kv_dim, D, false);
+            } else {
+                encode_linear_bf16(enc, df2_ctx_norm, 0, lw.k_proj_bf16, 0, df2_ctx_k, 0, nil, 0, (uint32_t)T, kv_dim, D, false);
+                encode_linear_bf16(enc, df2_ctx_norm, 0, lw.v_proj_bf16, 0, df2_ctx_v, 0, nil, 0, (uint32_t)T, kv_dim, D, false);
+            }
+
+            QkRopeParams qrp{(uint32_t)start_pos, (uint32_t)T, (uint32_t)df2_kv_heads, (uint32_t)df2_head_dim, df2_rope_theta, df2_eps};
+            [enc setComputePipelineState:pso_qk_rope];
+            [enc setBuffer:df2_ctx_k offset:0 atIndex:0];
+            [enc setBuffer:lw.k_norm offset:0 atIndex:1];
+            [enc setBytes:&qrp length:sizeof(qrp) atIndex:2];
+            [enc dispatchThreadgroups:MTLSizeMake((uint32_t)df2_kv_heads, (uint32_t)T, 1)
+                threadsPerThreadgroup:MTLSizeMake((uint32_t)(df2_head_dim / 2), 1, 1)];
+
+            DraftWriteKvParams wkp{(uint32_t)start_pos, (uint32_t)T, (uint32_t)df2_kv_cap, 1u, kv_dim};
+            [enc setComputePipelineState:pso_draft_write_kv];
+            [enc setBuffer:df2_ctx_k offset:0 atIndex:0];
+            [enc setBuffer:df2_ctx_v offset:0 atIndex:1];
+            [enc setBuffer:df2_k_cache[i] offset:slot_off atIndex:2];
+            [enc setBuffer:df2_v_cache[i] offset:slot_off atIndex:3];
+            [enc setBytes:&wkp length:sizeof(wkp) atIndex:4];
+            [enc dispatchThreads:MTLSizeMake(kv_dim, (uint32_t)T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        }
+        [enc endEncoding];
+        commit_and_wait(cb);
+    }
+
+    void run_dflash2_draft(int32_t anchor_tok, int anchor_pos, int num_draft, int32_t* h_out_drafts, int slot_id) {
+        int nd = std::max(1, std::min(df2_block - 1, num_draft));
+        uint32_t B = (uint32_t)(nd + 1);
+        uint32_t D = (uint32_t)df2_hidden;
+        uint32_t q_dim = (uint32_t)(df2_heads * df2_head_dim);
+        uint32_t kv_dim = (uint32_t)(df2_kv_heads * df2_head_dim);
+        uint32_t dyn_dim = 4u * (D / (uint32_t)df2_group_size);
+
+        int32_t* tids = static_cast<int32_t*>(df2_tok_ids.contents);
+        tids[0] = anchor_tok;
+        for (uint32_t i = 1; i < B; ++i) tids[i] = df2_mask_id;
+
+        id<MTLCommandBuffer> cb = [queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+
+        RmsParams erp{B, D, df2_eps};
+        [enc setComputePipelineState:pso_embed_norm];
+        [enc setBuffer:df2_tok_ids offset:0 atIndex:0];
+        [enc setBuffer:embed_w offset:0 atIndex:1];
+        [enc setBuffer:embed_norm_w offset:0 atIndex:2];
+        [enc setBuffer:df2_res offset:0 atIndex:3];
+        [enc setBytes:&erp length:sizeof(erp) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(B, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+        for (int i = 0; i < df2_num_layers; ++i) {
+            const auto& lw = df2_layers[i];
+            size_t slot_off = (size_t)slot_id * (size_t)df2_kv_cap * kv_dim * 2;
+
+            [enc setComputePipelineState:pso_rmsnorm];
+            [enc setBuffer:df2_res offset:0 atIndex:0];
+            [enc setBuffer:lw.input_ln offset:0 atIndex:1];
+            [enc setBuffer:df2_x offset:0 atIndex:2];
+            [enc setBytes:&erp length:sizeof(erp) atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake(B, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+            encode_linear_bf16(enc, df2_x, 0, lw.attn_conv_proj, 0, df2_dyn, 0, nil, 0, B, dyn_dim, D, false);
+            Df2ConvParams cv0{B, D, (uint32_t)df2_group_size, 0u};
+            [enc setComputePipelineState:pso_df2_conv];
+            [enc setBuffer:df2_x offset:0 atIndex:0];
+            [enc setBuffer:lw.attn_conv_base offset:0 atIndex:1];
+            [enc setBuffer:df2_dyn offset:0 atIndex:2];
+            [enc setBuffer:df2_xc offset:0 atIndex:3];
+            [enc setBytes:&cv0 length:sizeof(cv0) atIndex:4];
+            [enc dispatchThreads:MTLSizeMake(D, B, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+            encode_linear_fp8(enc, df2_xc, 0, lw.q_fp8, 0, lw.q_sc, 0, df2_q, 0, nil, 0, B, q_dim, D, false);
+            encode_linear_fp8(enc, df2_xc, 0, lw.k_fp8, 0, lw.k_sc, 0, df2_k, 0, nil, 0, B, kv_dim, D, false);
+            encode_linear_fp8(enc, df2_xc, 0, lw.v_fp8, 0, lw.v_sc, 0, df2_v, 0, nil, 0, B, kv_dim, D, false);
+
+            QkRopeParams qrp_q{(uint32_t)anchor_pos, B, (uint32_t)df2_heads, (uint32_t)df2_head_dim, df2_rope_theta, df2_eps};
+            [enc setComputePipelineState:pso_qk_rope];
+            [enc setBuffer:df2_q offset:0 atIndex:0];
+            [enc setBuffer:lw.q_norm offset:0 atIndex:1];
+            [enc setBytes:&qrp_q length:sizeof(qrp_q) atIndex:2];
+            [enc dispatchThreadgroups:MTLSizeMake((uint32_t)df2_heads, B, 1)
+                threadsPerThreadgroup:MTLSizeMake((uint32_t)(df2_head_dim / 2), 1, 1)];
+
+            QkRopeParams qrp_k{(uint32_t)anchor_pos, B, (uint32_t)df2_kv_heads, (uint32_t)df2_head_dim, df2_rope_theta, df2_eps};
+            [enc setComputePipelineState:pso_qk_rope];
+            [enc setBuffer:df2_k offset:0 atIndex:0];
+            [enc setBuffer:lw.k_norm offset:0 atIndex:1];
+            [enc setBytes:&qrp_k length:sizeof(qrp_k) atIndex:2];
+            [enc dispatchThreadgroups:MTLSizeMake((uint32_t)df2_kv_heads, B, 1)
+                threadsPerThreadgroup:MTLSizeMake((uint32_t)(df2_head_dim / 2), 1, 1)];
+
+            DraftAttnParams dap{(uint32_t)anchor_pos, B, (uint32_t)df2_kv_cap, 1u, (uint32_t)df2_window,
+                                (uint32_t)df2_heads, (uint32_t)df2_kv_heads, (uint32_t)df2_head_dim};
+            [enc setComputePipelineState:pso_df2_attn];
+            [enc setBuffer:df2_q offset:0 atIndex:0];
+            [enc setBuffer:df2_k offset:0 atIndex:1];
+            [enc setBuffer:df2_v offset:0 atIndex:2];
+            [enc setBuffer:df2_k_cache[i] offset:slot_off atIndex:3];
+            [enc setBuffer:df2_v_cache[i] offset:slot_off atIndex:4];
+            [enc setBuffer:df2_attn_out offset:0 atIndex:5];
+            [enc setBytes:&dap length:sizeof(dap) atIndex:6];
+            [enc dispatchThreadgroups:MTLSizeMake((uint32_t)df2_heads, B, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+            encode_linear_fp8(enc, df2_attn_out, 0, lw.o_fp8, 0, lw.o_sc, 0, df2_proj_out, 0, nil, 0, B, D, q_dim, false);
+
+            Df2ConvParams cv1{B, D, (uint32_t)df2_group_size, 1u};
+            [enc setComputePipelineState:pso_df2_conv];
+            [enc setBuffer:df2_proj_out offset:0 atIndex:0];
+            [enc setBuffer:lw.attn_conv_base offset:(size_t)2 * D * 2 atIndex:1];
+            [enc setBuffer:df2_dyn offset:0 atIndex:2];
+            [enc setBuffer:df2_xc offset:0 atIndex:3];
+            [enc setBytes:&cv1 length:sizeof(cv1) atIndex:4];
+            [enc dispatchThreads:MTLSizeMake(D, B, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+            [enc setComputePipelineState:pso_add_rmsnorm];
+            [enc setBuffer:df2_xc offset:0 atIndex:0];
+            [enc setBuffer:df2_res offset:0 atIndex:1];
+            [enc setBuffer:lw.post_ln offset:0 atIndex:2];
+            [enc setBuffer:df2_x offset:0 atIndex:3];
+            [enc setBytes:&erp length:sizeof(erp) atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake(B, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+            encode_linear_bf16(enc, df2_x, 0, lw.mlp_conv_proj, 0, df2_dyn, 0, nil, 0, B, dyn_dim, D, false);
+            [enc setComputePipelineState:pso_df2_conv];
+            [enc setBuffer:df2_x offset:0 atIndex:0];
+            [enc setBuffer:lw.mlp_conv_base offset:0 atIndex:1];
+            [enc setBuffer:df2_dyn offset:0 atIndex:2];
+            [enc setBuffer:df2_xc offset:0 atIndex:3];
+            [enc setBytes:&cv0 length:sizeof(cv0) atIndex:4];
+            [enc dispatchThreads:MTLSizeMake(D, B, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+            encode_linear_fp8(enc, df2_xc, 0, lw.g_fp8, 0, lw.g_sc, 0, df2_mlp_g, 0, nil, 0, B, (uint32_t)df2_inter, D, false);
+            encode_linear_fp8(enc, df2_xc, 0, lw.u_fp8, 0, lw.u_sc, 0, df2_mlp_u, 0, nil, 0, B, (uint32_t)df2_inter, D, false);
+
+            uint32_t n_inter = B * (uint32_t)df2_inter;
+            [enc setComputePipelineState:pso_silu_mul];
+            [enc setBuffer:df2_mlp_g offset:0 atIndex:0];
+            [enc setBuffer:df2_mlp_u offset:0 atIndex:1];
+            [enc setBytes:&n_inter length:sizeof(n_inter) atIndex:2];
+            [enc dispatchThreads:MTLSizeMake(n_inter, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+            encode_linear_fp8(enc, df2_mlp_g, 0, lw.d_fp8, 0, lw.d_sc, 0, df2_proj_out, 0, nil, 0, B, D, (uint32_t)df2_inter, false);
+
+            [enc setComputePipelineState:pso_df2_conv];
+            [enc setBuffer:df2_proj_out offset:0 atIndex:0];
+            [enc setBuffer:lw.mlp_conv_base offset:(size_t)2 * D * 2 atIndex:1];
+            [enc setBuffer:df2_dyn offset:0 atIndex:2];
+            [enc setBuffer:df2_xc offset:0 atIndex:3];
+            [enc setBytes:&cv1 length:sizeof(cv1) atIndex:4];
+            [enc dispatchThreads:MTLSizeMake(D, B, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+            uint32_t bd_n = B * D;
+            [enc setComputePipelineState:pso_add_bf16];
+            [enc setBuffer:df2_res offset:0 atIndex:0];
+            [enc setBuffer:df2_xc offset:0 atIndex:1];
+            [enc setBuffer:df2_res offset:0 atIndex:2];
+            [enc setBytes:&bd_n length:sizeof(bd_n) atIndex:3];
+            [enc dispatchThreads:MTLSizeMake(bd_n, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        }
+
+        RmsParams nrp{(uint32_t)nd, D, df2_eps};
+        [enc setComputePipelineState:pso_rmsnorm];
+        [enc setBuffer:df2_res offset:(size_t)D * 2 atIndex:0];
+        [enc setBuffer:df2_final_norm offset:0 atIndex:1];
+        [enc setBuffer:df2_x offset:0 atIndex:2];
+        [enc setBytes:&nrp length:sizeof(nrp) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake((uint32_t)nd, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+        encode_linear_fp8(enc, df2_x, 0, unembed_fp8, 0, unembed_sc, 0, nil, 0, b_logits, 0,
+                          (uint32_t)nd, (uint32_t)df2_vocab_unpadded, D, true);
+        encode_linear_bf16(enc, df2_x, 0, df2_sel_hproj, 0, df2_h_sel, 0, nil, 0,
+                           (uint32_t)nd, (uint32_t)df2_sel_rank, D, false);
+
+        Df2TopKParams tkp{(uint32_t)nd, (uint32_t)df2_vocab_unpadded};
+        [enc setComputePipelineState:pso_df2_topk16];
+        [enc setBuffer:b_logits offset:0 atIndex:0];
+        [enc setBuffer:df2_top_v offset:0 atIndex:1];
+        [enc setBuffer:df2_top_i offset:0 atIndex:2];
+        [enc setBytes:&tkp length:sizeof(tkp) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake((uint32_t)nd, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+        [enc endEncoding];
+        commit_and_wait(cb);
+
+        const float* top_v = static_cast<const float*>(df2_top_v.contents);
+        const int32_t* top_i = static_cast<const int32_t*>(df2_top_i.contents);
+        const uint16_t* h_sel = static_cast<const uint16_t*>(df2_h_sel.contents);
+        const uint16_t* pred_cb = static_cast<const uint16_t*>(df2_sel_pred_cb.contents);
+        const uint16_t* succ_cb = static_cast<const uint16_t*>(df2_sel_succ_cb.contents);
+
+        int32_t pred = anchor_tok;
+        float pv[256];
+        for (int pos = 0; pos < nd; ++pos) {
+            const uint16_t* pr = pred_cb + (size_t)pred * df2_sel_rank;
+            const uint16_t* hr = h_sel + (size_t)pos * df2_sel_rank;
+            for (int r = 0; r < df2_sel_rank; ++r) {
+                pv[r] = bf16_bits_to_f32(pr[r]) * bf16_bits_to_f32(hr[r]);
+            }
+            float best_s = -1e30f;
+            int32_t best_tok = top_i[pos * 16];
+            for (int k = 0; k < 16; ++k) {
+                int32_t cid = top_i[pos * 16 + k];
+                const uint16_t* sr = succ_cb + (size_t)cid * df2_sel_rank;
+                float corr = 0.0f;
+                for (int r = 0; r < df2_sel_rank; ++r) {
+                    corr += pv[r] * bf16_bits_to_f32(sr[r]);
+                }
+                float sc = top_v[pos * 16 + k] + corr;
+                if (sc > best_s) {
+                    best_s = sc;
+                    best_tok = cid;
+                }
+            }
+            h_out_drafts[pos] = best_tok;
+            pred = best_tok;
+        }
+    }
 };
 
 Inkling2Model::Inkling2Model() : impl_(std::make_unique<Impl>()) {}
@@ -1760,6 +2226,8 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
         impl_->pso_moe_nvfp4_w2 = impl_->make_pso("moe_nvfp4_w2_kernel");
         impl_->pso_moe_nvfp4_w13_grp = impl_->make_pso("moe_nvfp4_w13_grouped_kernel");
         impl_->pso_moe_nvfp4_w2_grp = impl_->make_pso("moe_nvfp4_w2_grouped_kernel");
+        impl_->pso_moe_nvfp4_w13_dedup = impl_->make_pso("moe_nvfp4_w13_dedup_kernel");
+        impl_->pso_moe_nvfp4_w2_dedup = impl_->make_pso("moe_nvfp4_w2_dedup_kernel");
         impl_->pso_moe_reduce_k = impl_->make_pso("moe_reduce_k_kernel");
         impl_->pso_moe_mxfp8_w13 = impl_->make_pso("moe_mxfp8_w13_kernel");
         impl_->pso_moe_mxfp8_w2 = impl_->make_pso("moe_mxfp8_w2_kernel");
@@ -1786,6 +2254,10 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
         impl_->pso_gather_bf16 = impl_->make_pso("gather_bf16_rows_kernel");
         impl_->pso_fold_unembed = impl_->make_pso("fold_unembed_ho_kernel");
         impl_->pso_zero_bf16 = impl_->make_pso("zero_bf16_kernel");
+        impl_->pso_df2_concat = impl_->make_pso("dflash2_concat_taps_kernel");
+        impl_->pso_df2_conv = impl_->make_pso("dflash2_grouped_dyn_conv_kernel");
+        impl_->pso_df2_attn = impl_->make_pso("dflash2_block_attn_kernel");
+        impl_->pso_df2_topk16 = impl_->make_pso("dflash2_topk16_kernel");
 
         impl_->b_dummy = impl_->alloc_shared(64);
         impl_->embed_w = impl_->load_tensor(st, "model.llm.embed.weight");
@@ -2046,7 +2518,10 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
                 impl_->device.name.UTF8String, sec,
                 kv_bytes_total / (1024.0 * 1024.0 * 1024.0), max_slots, max_seq_len);
 
-        if (draft_k > 0) {
+        if (!dflash2_dir.empty()) {
+            if (draft_k <= 0) draft_k = 7;
+            impl_->load_dflash2(dflash2_dir, cfg, max_batch_tokens, n_ds_slots);
+        } else if (draft_k > 0) {
             impl_->load_dspark(model_dir, cfg, max_seq_len, max_batch_tokens, draft_vocab_file, n_ds_slots);
         }
     }
@@ -2188,11 +2663,15 @@ void Inkling2Model::rollback_conv_states(int accepted_len, int slot_id) {
 }
 
 void Inkling2Model::commit_dspark_context(int count, int start_pos, int slot_id, int aux_tok_offset) {
-    if (!impl_->ds_loaded || count <= 0 || slot_id >= impl_->dspark_slots) return;
+    if ((!impl_->ds_loaded && !impl_->df2_loaded) || count <= 0 || slot_id >= impl_->dspark_slots) return;
     @autoreleasepool {
         int D = cfg.hidden_size;
         uint32_t stack_stride = (uint32_t)(max_batch_tokens * D);
-        impl_->store_dspark_context_kv((size_t)aux_tok_offset * D * 2, stack_stride, count, start_pos, slot_id);
+        if (impl_->df2_loaded) {
+            impl_->store_dflash2_context_kv((size_t)aux_tok_offset * D * 2, stack_stride, count, start_pos, slot_id);
+        } else {
+            impl_->store_dspark_context_kv((size_t)aux_tok_offset * D * 2, stack_stride, count, start_pos, slot_id);
+        }
         uint8_t* dst_aux = static_cast<uint8_t*>(impl_->b_last_aux.contents) + (size_t)slot_id * 4 * D * 2;
         const uint8_t* src_base = static_cast<const uint8_t*>(impl_->b_aux_states.contents);
         size_t last_off = (size_t)(aux_tok_offset + count - 1) * D * 2;
@@ -2210,7 +2689,11 @@ int Inkling2Model::max_dspark_slots() const {
 
 void Inkling2Model::draft_tokens(int32_t anchor_tok, int anchor_pos, int num_draft, int32_t* h_out_drafts, int slot_id) {
     @autoreleasepool {
-        impl_->run_dspark_draft(anchor_tok, anchor_pos, num_draft, h_out_drafts, slot_id);
+        if (impl_->df2_loaded) {
+            impl_->run_dflash2_draft(anchor_tok, anchor_pos, num_draft, h_out_drafts, slot_id);
+        } else {
+            impl_->run_dspark_draft(anchor_tok, anchor_pos, num_draft, h_out_drafts, slot_id);
+        }
     }
 }
 

@@ -886,6 +886,113 @@ static void test_moe_router_and_grouped_parity() {
     EXPECT_TRUE(max_rel < 2e-2f);
 }
 
+static void test_dflash2_kernels() {
+    auto p_cat = g_ctx.pso("dflash2_concat_taps_kernel");
+    auto p_cnv = g_ctx.pso("dflash2_grouped_dyn_conv_kernel");
+    auto p_top = g_ctx.pso("dflash2_topk16_kernel");
+    EXPECT_TRUE(p_cat != nil && p_cnv != nil && p_top != nil);
+
+    const uint32_t T = 4, D = 64, stack_stride = 8 * D, G = 16, nG = D / G;
+    std::vector<uint16_t> aux(4 * stack_stride, 0);
+    for (uint32_t tap = 0; tap < 4; ++tap) {
+        for (uint32_t t = 0; t < T; ++t) {
+            for (uint32_t d = 0; d < D; ++d) {
+                aux[tap * stack_stride + t * D + d] = f32_to_bf16(0.1f * (float)(tap + 1) + 0.01f * (float)(t * D + d));
+            }
+        }
+    }
+    auto bAux = g_ctx.buf(aux.size() * 2, aux.data());
+    auto bCat = g_ctx.buf(T * 4 * D * 2);
+
+    std::vector<uint16_t> h_in(T * D), base_k(2 * D), dyn_k(T * 2 * 2 * nG);
+    for (uint32_t i = 0; i < T * D; ++i) h_in[i] = f32_to_bf16(0.4f * sinf(0.17f * (float)i));
+    for (uint32_t i = 0; i < 2 * D; ++i) base_k[i] = f32_to_bf16(0.25f * cosf(0.11f * (float)i));
+    for (uint32_t i = 0; i < T * 4 * nG; ++i) dyn_k[i] = f32_to_bf16(0.15f * sinf(0.23f * (float)i));
+    auto bHin = g_ctx.buf(h_in.size() * 2, h_in.data());
+    auto bBase = g_ctx.buf(base_k.size() * 2, base_k.data());
+    auto bDyn = g_ctx.buf(dyn_k.size() * 2, dyn_k.data());
+    auto bCout = g_ctx.buf(T * D * 2);
+
+    const uint32_t M_top = 3, V_top = 1024;
+    std::vector<float> logits(M_top * V_top);
+    for (uint32_t m = 0; m < M_top; ++m) {
+        for (uint32_t v = 0; v < V_top; ++v) {
+            logits[m * V_top + v] = -5.0f + 0.001f * (float)((v * 37u + m * 13u) % V_top);
+        }
+        logits[m * V_top + (100u + m * 17u)] = 12.5f;
+        logits[m * V_top + (500u + m * 11u)] = 9.25f;
+    }
+    auto bLogits = g_ctx.buf(logits.size() * 4, logits.data());
+    auto bTopV = g_ctx.buf(M_top * 16 * 4);
+    auto bTopI = g_ctx.buf(M_top * 16 * 4);
+
+    struct Df2ConcatParams { uint32_t T; uint32_t D; uint32_t stack_stride; } cp{T, D, stack_stride};
+    struct Df2ConvParams { uint32_t T; uint32_t D; uint32_t group_size; uint32_t half_idx; } cvp{T, D, G, 0u};
+    struct Df2TopKParams { uint32_t M; uint32_t V; } tkp{M_top, V_top};
+
+    id<MTLCommandBuffer> cb = [g_ctx.q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+
+    [enc setComputePipelineState:p_cat];
+    [enc setBuffer:bAux offset:0 atIndex:0];
+    [enc setBuffer:bCat offset:0 atIndex:1];
+    [enc setBytes:&cp length:sizeof(cp) atIndex:2];
+    [enc dispatchThreads:MTLSizeMake(4 * D, T, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+
+    [enc setComputePipelineState:p_cnv];
+    [enc setBuffer:bHin offset:0 atIndex:0];
+    [enc setBuffer:bBase offset:0 atIndex:1];
+    [enc setBuffer:bDyn offset:0 atIndex:2];
+    [enc setBuffer:bCout offset:0 atIndex:3];
+    [enc setBytes:&cvp length:sizeof(cvp) atIndex:4];
+    [enc dispatchThreads:MTLSizeMake(D, T, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+
+    [enc setComputePipelineState:p_top];
+    [enc setBuffer:bLogits offset:0 atIndex:0];
+    [enc setBuffer:bTopV offset:0 atIndex:1];
+    [enc setBuffer:bTopI offset:0 atIndex:2];
+    [enc setBytes:&tkp length:sizeof(tkp) atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake(M_top, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+    [enc endEncoding];
+    EXPECT_TRUE(g_ctx.run_cb(cb));
+
+    const uint16_t* gcat = (const uint16_t*)bCat.contents;
+    for (uint32_t t = 0; t < T; ++t) {
+        for (uint32_t tap = 0; tap < 4; ++tap) {
+            for (uint32_t d = 0; d < D; ++d) {
+                EXPECT_TRUE(gcat[(t * 4 + tap) * D + d] == aux[tap * stack_stride + t * D + d]);
+            }
+        }
+    }
+
+    const uint16_t* gcout = (const uint16_t*)bCout.contents;
+    float max_err = 0.0f;
+    for (uint32_t t = 0; t < T; ++t) {
+        for (uint32_t d = 0; d < D; ++d) {
+            uint32_t g = d / G;
+            float w0 = bf16_to_f32(base_k[0 * D + d]) + bf16_to_f32(dyn_k[(t * 4 + 0) * nG + g]);
+            float w1 = bf16_to_f32(base_k[1 * D + d]) + bf16_to_f32(dyn_k[(t * 4 + 1) * nG + g]);
+            float x0 = bf16_to_f32(h_in[t * D + d]);
+            float x1 = (t > 0) ? bf16_to_f32(h_in[(t - 1) * D + d]) : 0.0f;
+            float ref = w0 * x0 + w1 * x1;
+            float got = bf16_to_f32(gcout[t * D + d]);
+            EXPECT_TRUE(std::isfinite(got));
+            max_err = std::max(max_err, std::fabs(got - ref));
+        }
+    }
+    EXPECT_TRUE(max_err < 2e-2f);
+
+    const float* tv = (const float*)bTopV.contents;
+    const int32_t* ti = (const int32_t*)bTopI.contents;
+    for (uint32_t m = 0; m < M_top; ++m) {
+        EXPECT_TRUE(ti[m * 16 + 0] == (int32_t)(100u + m * 17u));
+        EXPECT_TRUE(std::fabs(tv[m * 16 + 0] - 12.5f) < 1e-4f);
+        EXPECT_TRUE(ti[m * 16 + 1] == (int32_t)(500u + m * 11u));
+        EXPECT_TRUE(std::fabs(tv[m * 16 + 1] - 9.25f) < 1e-4f);
+    }
+}
+
 int main() {
     @autoreleasepool {
         if (!g_ctx.init()) {
@@ -902,6 +1009,7 @@ int main() {
         run_test("test_dspark_and_verify_kernels", test_dspark_and_verify_kernels);
         run_test("test_attention_fp8_splitk", test_attention_fp8_splitk);
         run_test("test_moe_router_and_grouped_parity", test_moe_router_and_grouped_parity);
+        run_test("test_dflash2_kernels", test_dflash2_kernels);
         printf("Metal kernel tests: %d passed, %d failed\n", g_passed, g_failed);
         return g_failed == 0 ? 0 : 1;
     }

@@ -21,6 +21,7 @@ public:
 
     int draft_k = 0;
     std::string draft_vocab_file;
+    std::string dflash2_dir;
     int moe_group_thresh = 64;
     bool use_bf16_gemv = true;
     bool use_cuda_graph = true;
