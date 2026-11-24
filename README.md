@@ -142,7 +142,7 @@ uv run --with numpy python3 scripts/quantize_q2.py \
   --drop-vision
 ```
 
-Endpoints:
+Endpoints (see [OBSERVABILITY.md](OBSERVABILITY.md) for Prometheus, Datadog, and OpenTelemetry setup):
 - `GET /health`
 - `GET /status` (live JSON snapshot: active/pending requests, per-slot KV occupancy, prefix-cache hit ratio, decode `tok/s`, DFlash 2 `mean_a`)
 - `GET /metrics` (Prometheus / Datadog OpenMetrics text format)
