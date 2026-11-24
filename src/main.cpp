@@ -23,6 +23,8 @@ int main(int argc, char** argv) {
     int draft_k = 0;
     std::string draft_vocab_file;
     std::string dflash2_dir;
+    std::string dump_imatrix_path;
+    std::string calib_file;
     int moe_group_thresh = 64;
     std::string bench_prompt = "What is 17 * 19? Reply with just the number.";
 
@@ -41,6 +43,8 @@ int main(int argc, char** argv) {
         else if (a == "--draft-k" && i + 1 < argc) draft_k = std::stoi(argv[++i]);
         else if (a == "--draft-vocab-file" && i + 1 < argc) draft_vocab_file = argv[++i];
         else if (a == "--dflash2" && i + 1 < argc) dflash2_dir = argv[++i];
+        else if (a == "--dump-imatrix" && i + 1 < argc) dump_imatrix_path = argv[++i];
+        else if (a == "--calib-file" && i + 1 < argc) calib_file = argv[++i];
         else if (a == "--moe-group-thresh" && i + 1 < argc) moe_group_thresh = std::stoi(argv[++i]);
         else if (a == "--prompt" && i + 1 < argc) bench_prompt = argv[++i];
         else if (a == "--no-gemv") no_gemv = true;
@@ -64,6 +68,33 @@ int main(int argc, char** argv) {
         model.dflash2_dir = dflash2_dir;
         model.moe_group_thresh = moe_group_thresh;
         model.load(model_dir, max_seq, max_chunk, max_slots);
+
+        if (!dump_imatrix_path.empty()) {
+#ifdef WARPGRID_METAL
+            std::string ctext = bench_prompt;
+            if (!calib_file.empty()) {
+                std::ifstream cf(calib_file);
+                if (!cf) throw std::runtime_error("Cannot open calib file: " + calib_file);
+                ctext.assign((std::istreambuf_iterator<char>(cf)), std::istreambuf_iterator<char>());
+            }
+            auto cids = tok.encode(ctext);
+            int max_t = std::min((int)cids.size(), model.max_seq_len);
+            fprintf(stderr, "[imatrix] Calibrating on %d tokens...\n", max_t);
+            model.reset_cache();
+            model.enable_imatrix_capture(true);
+            int pos = 0;
+            while (pos < max_t) {
+                int n = std::min(model.max_batch_tokens, max_t - pos);
+                model.forward_and_greedy(cids.data() + pos, n, pos);
+                pos += n;
+            }
+            model.enable_imatrix_capture(false);
+            model.save_imatrix(dump_imatrix_path);
+            return 0;
+#else
+            throw std::runtime_error("--dump-imatrix is only supported on the Metal backend");
+#endif
+        }
 
         if (bench_prefill > 0) {
             std::vector<int32_t> ptoks(bench_prefill);

@@ -61,6 +61,8 @@ public:
 
     void reset_profile();
     void print_profile() const;
+    void enable_imatrix_capture(bool enable);
+    void save_imatrix(const std::string& path) const;
 
 private:
     std::unique_ptr<Impl> impl_;

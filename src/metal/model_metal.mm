@@ -438,6 +438,9 @@ struct Inkling2Model::Impl {
     double prof_moe_mxfp8_ms = 0.0;
     double prof_lm_head_ms = 0.0;
     int prof_steps = 0;
+    bool capture_imatrix = false;
+    std::vector<double> imatrix_sq;
+    int64_t imatrix_tokens = 0;
 
     id<MTLBuffer> alloc_shared(size_t bytes) {
         size_t sz = std::max<size_t>(16, bytes);
@@ -1112,6 +1115,22 @@ struct Inkling2Model::Impl {
                                 (uint32_t)T, D, cfg.rms_norm_eps);
             }
             flush_stage(prof_attn_res_ctrl_ms);
+            if (capture_imatrix) {
+                [enc endEncoding];
+                commit_and_wait(cb);
+                const uint16_t* mp_ptr = static_cast<const uint16_t*>(b_mlp_in.contents);
+                double* acc = imatrix_sq.data() + (size_t)i * D;
+                for (int t = 0; t < T; ++t) {
+                    const uint16_t* row = mp_ptr + (size_t)t * D;
+                    for (uint32_t d = 0; d < D; ++d) {
+                        double val = (double)bf16_bits_to_f32(row[d]);
+                        acc[d] += val * val;
+                    }
+                }
+                if (v == 0) imatrix_tokens += T;
+                cb = [queue commandBuffer];
+                enc = [cb computeCommandEncoder];
+            }
 
             {
                 RouterParams rp{(uint32_t)T, D, (uint32_t)cfg.n_routed_experts, (uint32_t)cfg.num_experts_per_tok, cfg.route_scale};
@@ -2842,6 +2861,27 @@ void Inkling2Model::reset_profile() {
     impl_->prof_moe_mxfp8_ms = 0.0;
     impl_->prof_lm_head_ms = 0.0;
     impl_->prof_steps = 0;
+}
+
+void Inkling2Model::enable_imatrix_capture(bool enable) {
+    impl_->capture_imatrix = enable;
+    if (enable) {
+        impl_->imatrix_sq.assign((size_t)cfg.num_hidden_layers * (size_t)cfg.hidden_size, 0.0);
+        impl_->imatrix_tokens = 0;
+    }
+}
+
+void Inkling2Model::save_imatrix(const std::string& path) const {
+    std::ofstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("Cannot open imatrix output: " + path);
+    double denom = (double)std::max<int64_t>(1, impl_->imatrix_tokens);
+    std::vector<float> out(impl_->imatrix_sq.size());
+    for (size_t idx = 0; idx < out.size(); ++idx) {
+        out[idx] = (float)(impl_->imatrix_sq[idx] / denom);
+    }
+    f.write(reinterpret_cast<const char*>(out.data()), (std::streamsize)(out.size() * sizeof(float)));
+    fprintf(stderr, "[warpgrid-metal] Saved imatrix (%zu floats, %lld tokens) -> %s\n",
+            out.size(), (long long)impl_->imatrix_tokens, path.c_str());
 }
 
 void Inkling2Model::print_profile() const {
