@@ -377,6 +377,99 @@ static void test_bf16_gemv_and_softcap_argmax() {
     EXPECT_TRUE(std::isfinite(big_out[51]) && std::abs(big_out[51] - 30.0f) < 1e-3f);
 }
 
+static void test_w8a16_fp8_quant_and_gemv() {
+    auto p_q = g_ctx.pso("quantize_bf16_to_fp8_rowwise_kernel");
+    auto p_g = g_ctx.pso("fp8_gemv_kernel");
+    EXPECT_TRUE(p_q != nil && p_g != nil);
+
+    const uint32_t M = 2, N = 64, K = 128;
+    std::vector<uint16_t> X(M * K), W(N * K);
+    for (uint32_t i = 0; i < M * K; ++i) X[i] = f32_to_bf16(0.3f * std::sin((float)i * 0.17f));
+    for (uint32_t i = 0; i < N * K; ++i) W[i] = f32_to_bf16(0.5f * std::cos((float)i * 0.09f));
+
+    auto bX = g_ctx.buf(X.size() * 2, X.data());
+    auto bW = g_ctx.buf(W.size() * 2, W.data());
+    auto bW8 = g_ctx.buf(N * K);
+    auto bSc = g_ctx.buf(N * 4);
+    auto bY_bf = g_ctx.buf(M * N * 2);
+    auto bY_f32 = g_ctx.buf(M * N * 4);
+
+    struct QuantParams { uint32_t N; uint32_t K; } qp{N, K};
+    struct GemvParams { uint32_t M; uint32_t N; uint32_t K; uint32_t out_fp32; } gp{M, N, K, 1};
+
+    id<MTLCommandBuffer> cb = [g_ctx.q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:p_q];
+    [enc setBuffer:bW offset:0 atIndex:0];
+    [enc setBuffer:bW8 offset:0 atIndex:1];
+    [enc setBuffer:bSc offset:0 atIndex:2];
+    [enc setBytes:&qp length:sizeof(qp) atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+    [enc setComputePipelineState:p_g];
+    [enc setBuffer:bX offset:0 atIndex:0];
+    [enc setBuffer:bW8 offset:0 atIndex:1];
+    [enc setBuffer:bSc offset:0 atIndex:2];
+    [enc setBuffer:bY_bf offset:0 atIndex:3];
+    [enc setBuffer:bY_f32 offset:0 atIndex:4];
+    [enc setBytes:&gp length:sizeof(gp) atIndex:5];
+    [enc dispatchThreadgroups:MTLSizeMake((N + 3) / 4, M, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    [enc endEncoding];
+    EXPECT_TRUE(g_ctx.run_cb(cb));
+
+    const float* gy = (const float*)bY_f32.contents;
+    float max_err = 0.0f;
+    for (uint32_t m = 0; m < M; ++m) {
+        for (uint32_t n = 0; n < N; ++n) {
+            float ref = 0.0f;
+            for (uint32_t k = 0; k < K; ++k) ref += bf16_to_f32(X[m * K + k]) * bf16_to_f32(W[n * K + k]);
+            float gv = gy[m * N + n];
+            EXPECT_TRUE(std::isfinite(gv));
+            max_err = std::max(max_err, std::abs(gv - ref));
+        }
+    }
+    EXPECT_TRUE(max_err < 0.25f);
+}
+
+static void test_bf16_gemm_tiled() {
+    auto p_mm = g_ctx.pso("bf16_gemm_tiled_kernel");
+    EXPECT_TRUE(p_mm != nil);
+
+    const uint32_t M = 32, N = 64, K = 128;
+    std::vector<uint16_t> X(M * K), W(N * K);
+    for (uint32_t i = 0; i < M * K; ++i) X[i] = f32_to_bf16(0.25f * std::sin((float)i * 0.13f));
+    for (uint32_t i = 0; i < N * K; ++i) W[i] = f32_to_bf16(0.25f * std::cos((float)i * 0.11f));
+
+    auto bX = g_ctx.buf(X.size() * 2, X.data());
+    auto bW = g_ctx.buf(W.size() * 2, W.data());
+    auto bY = g_ctx.buf(M * N * 2);
+
+    struct GemvParams { uint32_t M; uint32_t N; uint32_t K; uint32_t out_fp32; } gp{M, N, K, 0};
+    id<MTLCommandBuffer> cb = [g_ctx.q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:p_mm];
+    [enc setBuffer:bX offset:0 atIndex:0];
+    [enc setBuffer:bW offset:0 atIndex:1];
+    [enc setBuffer:bY offset:0 atIndex:2];
+    [enc setBytes:&gp length:sizeof(gp) atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake((N + 31) / 32, (M + 31) / 32, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    [enc endEncoding];
+    EXPECT_TRUE(g_ctx.run_cb(cb));
+
+    const uint16_t* gy = (const uint16_t*)bY.contents;
+    float max_err = 0.0f;
+    for (uint32_t m = 0; m < M; ++m) {
+        for (uint32_t n = 0; n < N; ++n) {
+            float ref = 0.0f;
+            for (uint32_t k = 0; k < K; ++k) ref += bf16_to_f32(X[m * K + k]) * bf16_to_f32(W[n * K + k]);
+            float gv = bf16_to_f32(gy[m * N + n]);
+            EXPECT_TRUE(std::isfinite(gv));
+            max_err = std::max(max_err, std::abs(gv - ref));
+        }
+    }
+    EXPECT_TRUE(max_err < 5e-2f);
+}
+
 int main() {
     @autoreleasepool {
         if (!g_ctx.init()) {
@@ -388,6 +481,8 @@ int main() {
         run_test("test_sconv_static_and_dynamic", test_sconv_static_and_dynamic);
         run_test("test_moe_nvfp4_and_mxfp8", test_moe_nvfp4_and_mxfp8);
         run_test("test_bf16_gemv_and_softcap_argmax", test_bf16_gemv_and_softcap_argmax);
+        run_test("test_w8a16_fp8_quant_and_gemv", test_w8a16_fp8_quant_and_gemv);
+        run_test("test_bf16_gemm_tiled", test_bf16_gemm_tiled);
         printf("Metal kernel tests: %d passed, %d failed\n", g_passed, g_failed);
         return g_failed == 0 ? 0 : 1;
     }

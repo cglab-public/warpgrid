@@ -47,6 +47,7 @@ struct AttnParams {
 struct RouterParams { uint32_t T; uint32_t D; uint32_t E; uint32_t K; float route_scale; };
 struct MoeParams { uint32_t T; uint32_t D; uint32_t inter; uint32_t K; float gate_cap; float up_cap; };
 struct GemvParams { uint32_t M; uint32_t N; uint32_t K; uint32_t out_fp32; };
+struct QuantParams { uint32_t N; uint32_t K; };
 struct ArgmaxParams { uint32_t vocab_size; float softcap; };
 
 struct MetalLayerWeights {
@@ -59,6 +60,12 @@ struct MetalLayerWeights {
     id<MTLBuffer> w_qrgs = nil;
     id<MTLBuffer> w_kv = nil;
     id<MTLBuffer> wo = nil;
+    id<MTLBuffer> w_qrgs_fp8 = nil;
+    id<MTLBuffer> w_qrgs_sc = nil;
+    id<MTLBuffer> w_kv_fp8 = nil;
+    id<MTLBuffer> w_kv_sc = nil;
+    id<MTLBuffer> wo_fp8 = nil;
+    id<MTLBuffer> wo_sc = nil;
 
     id<MTLBuffer> q_clip_scale = nil;
     id<MTLBuffer> rel_clip_scale = nil;
@@ -93,6 +100,10 @@ struct MetalVisitCache {
     int cap = 0;
     id<MTLBuffer> k_cache = nil;
     id<MTLBuffer> v_cache = nil;
+    id<MTLBuffer> k_cache_fp8 = nil;
+    id<MTLBuffer> v_cache_fp8 = nil;
+    id<MTLBuffer> k_scale_fp8 = nil;
+    id<MTLBuffer> v_scale_fp8 = nil;
     id<MTLBuffer> k_conv_state = nil;
     id<MTLBuffer> v_conv_state = nil;
     id<MTLBuffer> attn_conv_state = nil;
@@ -115,17 +126,22 @@ struct Inkling2Model::Impl {
     id<MTLComputePipelineState> pso_embed_norm = nil;
     id<MTLComputePipelineState> pso_rmsnorm = nil;
     id<MTLComputePipelineState> pso_add_bf16 = nil;
+    id<MTLComputePipelineState> pso_copy_bf16 = nil;
     id<MTLComputePipelineState> pso_split_qrgs = nil;
     id<MTLComputePipelineState> pso_split_kv = nil;
     id<MTLComputePipelineState> pso_attn_res = nil;
     id<MTLComputePipelineState> pso_pair_rms_norm = nil;
     id<MTLComputePipelineState> pso_fused_ctrl = nil;
+    id<MTLComputePipelineState> pso_ctrl_gf_small_t = nil;
+    id<MTLComputePipelineState> pso_fp32_rmsnorm = nil;
     id<MTLComputePipelineState> pso_sconv_static = nil;
     id<MTLComputePipelineState> pso_sconv_dynamic = nil;
     id<MTLComputePipelineState> pso_attn_prep_qr = nil;
     id<MTLComputePipelineState> pso_attn_prep_kv = nil;
+    id<MTLComputePipelineState> pso_attn_prep_kv_fp8 = nil;
     id<MTLComputePipelineState> pso_rel_matmul = nil;
     id<MTLComputePipelineState> pso_attention = nil;
+    id<MTLComputePipelineState> pso_attention_fp8 = nil;
     id<MTLComputePipelineState> pso_router_logits = nil;
     id<MTLComputePipelineState> pso_router_topk = nil;
     id<MTLComputePipelineState> pso_moe_nvfp4_w13 = nil;
@@ -133,12 +149,18 @@ struct Inkling2Model::Impl {
     id<MTLComputePipelineState> pso_moe_mxfp8_w13 = nil;
     id<MTLComputePipelineState> pso_moe_mxfp8_w2 = nil;
     id<MTLComputePipelineState> pso_bf16_gemv = nil;
+    id<MTLComputePipelineState> pso_bf16_gemv_1sg = nil;
+    id<MTLComputePipelineState> pso_quant_fp8 = nil;
+    id<MTLComputePipelineState> pso_fp8_gemv = nil;
+    id<MTLComputePipelineState> pso_bf16_gemm_tiled = nil;
     id<MTLComputePipelineState> pso_softcap_argmax = nil;
 
     id<MTLBuffer> embed_w = nil;
     id<MTLBuffer> embed_norm_w = nil;
     id<MTLBuffer> final_norm_w = nil;
     id<MTLBuffer> unembed_w = nil;
+    id<MTLBuffer> unembed_fp8 = nil;
+    id<MTLBuffer> unembed_sc = nil;
 
     std::vector<id<MTLBuffer>> attn_queries;
     std::vector<id<MTLBuffer>> mlp_queries;
@@ -161,6 +183,7 @@ struct Inkling2Model::Impl {
     id<MTLBuffer> b_mlp_in = nil;
     id<MTLBuffer> b_pair = nil;
     id<MTLBuffer> b_ctrl_h = nil;
+    id<MTLBuffer> b_ctrl_tmp = nil;
     id<MTLBuffer> b_qrgs = nil;
     id<MTLBuffer> b_kv_out = nil;
     id<MTLBuffer> b_Q = nil;
@@ -186,6 +209,18 @@ struct Inkling2Model::Impl {
     id<MTLBuffer> b_out_token = nil;
 
     int dspark_slots = 0;
+    double gpu_ws_gib = 0.0;
+    uint32_t gpu_max_tg = 256;
+    bool gpu_is_apple9 = false;
+    bool gpu_low_mem = false;
+    double prof_attn_res_ctrl_ms = 0.0;
+    double prof_dense_proj_ms = 0.0;
+    double prof_attn_sconv_ms = 0.0;
+    double prof_router_ms = 0.0;
+    double prof_moe_nvfp4_ms = 0.0;
+    double prof_moe_mxfp8_ms = 0.0;
+    double prof_lm_head_ms = 0.0;
+    int prof_steps = 0;
 
     id<MTLBuffer> alloc_shared(size_t bytes) {
         size_t sz = std::max<size_t>(16, bytes);
@@ -231,7 +266,29 @@ struct Inkling2Model::Impl {
                             id<MTLBuffer> Y_f32, size_t y_f32_off,
                             uint32_t M, uint32_t N, uint32_t K, bool out_fp32)
     {
+        if (!out_fp32 && M >= 16u && (K & 31u) == 0u) {
+            GemvParams gp{M, N, K, 0u};
+            [enc setComputePipelineState:pso_bf16_gemm_tiled];
+            [enc setBuffer:X offset:x_off atIndex:0];
+            [enc setBuffer:W offset:w_off atIndex:1];
+            [enc setBuffer:Y_bf offset:y_bf_off atIndex:2];
+            [enc setBytes:&gp length:sizeof(gp) atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake((N + 31u) / 32u, (M + 31u) / 32u, 1)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            return;
+        }
         GemvParams gp{M, N, K, out_fp32 ? 1u : 0u};
+        if (N <= 128u && (K & 3u) == 0u) {
+            [enc setComputePipelineState:pso_bf16_gemv_1sg];
+            [enc setBuffer:X offset:x_off atIndex:0];
+            [enc setBuffer:W offset:w_off atIndex:1];
+            [enc setBuffer:(Y_bf ? Y_bf : b_dummy) offset:y_bf_off atIndex:2];
+            [enc setBuffer:(Y_f32 ? Y_f32 : b_dummy) offset:y_f32_off atIndex:3];
+            [enc setBytes:&gp length:sizeof(gp) atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake(N, M, 1)
+                threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            return;
+        }
         [enc setComputePipelineState:pso_bf16_gemv];
         [enc setBuffer:X offset:x_off atIndex:0];
         [enc setBuffer:W offset:w_off atIndex:1];
@@ -240,6 +297,40 @@ struct Inkling2Model::Impl {
         [enc setBytes:&gp length:sizeof(gp) atIndex:4];
         [enc dispatchThreadgroups:MTLSizeMake((N + 3u) / 4u, M, 1)
             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    }
+
+    void encode_linear_fp8(id<MTLComputeCommandEncoder> enc,
+                           id<MTLBuffer> X, size_t x_off,
+                           id<MTLBuffer> W8, size_t w8_off,
+                           id<MTLBuffer> Wsc, size_t wsc_off,
+                           id<MTLBuffer> Y_bf, size_t y_bf_off,
+                           id<MTLBuffer> Y_f32, size_t y_f32_off,
+                           uint32_t M, uint32_t N, uint32_t K, bool out_fp32)
+    {
+        GemvParams gp{M, N, K, out_fp32 ? 1u : 0u};
+        [enc setComputePipelineState:pso_fp8_gemv];
+        [enc setBuffer:X offset:x_off atIndex:0];
+        [enc setBuffer:W8 offset:w8_off atIndex:1];
+        [enc setBuffer:Wsc offset:wsc_off atIndex:2];
+        [enc setBuffer:(Y_bf ? Y_bf : b_dummy) offset:y_bf_off atIndex:3];
+        [enc setBuffer:(Y_f32 ? Y_f32 : b_dummy) offset:y_f32_off atIndex:4];
+        [enc setBytes:&gp length:sizeof(gp) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake((N + 3u) / 4u, M, 1)
+            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    }
+
+    void quantize_rowwise_fp8(id<MTLComputeCommandEncoder> enc,
+                              id<MTLBuffer> W_bf16, id<MTLBuffer> W_fp8, id<MTLBuffer> W_sc,
+                              uint32_t N, uint32_t K)
+    {
+        QuantParams qp{N, K};
+        [enc setComputePipelineState:pso_quant_fp8];
+        [enc setBuffer:W_bf16 offset:0 atIndex:0];
+        [enc setBuffer:W_fp8 offset:0 atIndex:1];
+        [enc setBuffer:W_sc offset:0 atIndex:2];
+        [enc setBytes:&qp length:sizeof(qp) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(N, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     }
 
     void encode_attn_res(id<MTLComputeCommandEncoder> enc,
@@ -286,21 +377,44 @@ struct Inkling2Model::Impl {
         encode_linear_bf16(enc, b_pair, 0, lw.ctrl_down[s], 0, b_ctrl_h, 0, nil, 0, T, rank, 2u * D, false);
 
         CtrlParams cp{T, D, rank, eps};
-        [enc setComputePipelineState:pso_fused_ctrl];
-        [enc setBuffer:b_ctrl_h offset:0 atIndex:0];
-        [enc setBuffer:lw.ctrl_gain[s] offset:0 atIndex:1];
-        [enc setBuffer:lw.ctrl_forget[s] offset:0 atIndex:2];
-        [enc setBuffer:dest offset:dest_off atIndex:3];
-        [enc setBuffer:msg offset:msg_off atIndex:4];
-        [enc setBuffer:norm_w offset:nw_off atIndex:5];
-        [enc setBuffer:out offset:out_off atIndex:6];
-        [enc setBytes:&cp length:sizeof(cp) atIndex:7];
-        [enc dispatchThreadgroups:MTLSizeMake(T, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        if (T <= 8u && rank == 64u) {
+            [enc setComputePipelineState:pso_ctrl_gf_small_t];
+            [enc setBuffer:b_ctrl_h offset:0 atIndex:0];
+            [enc setBuffer:lw.ctrl_gain[s] offset:0 atIndex:1];
+            [enc setBuffer:lw.ctrl_forget[s] offset:0 atIndex:2];
+            [enc setBuffer:dest offset:dest_off atIndex:3];
+            [enc setBuffer:msg offset:msg_off atIndex:4];
+            [enc setBuffer:b_ctrl_tmp offset:0 atIndex:5];
+            [enc setBytes:&cp length:sizeof(cp) atIndex:6];
+            [enc dispatchThreadgroups:MTLSizeMake((D + 3u) / 4u, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+            RmsParams nrp{T, D, eps};
+            [enc setComputePipelineState:pso_fp32_rmsnorm];
+            [enc setBuffer:b_ctrl_tmp offset:0 atIndex:0];
+            [enc setBuffer:norm_w offset:nw_off atIndex:1];
+            [enc setBuffer:out offset:out_off atIndex:2];
+            [enc setBytes:&nrp length:sizeof(nrp) atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake(T, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        } else {
+            [enc setComputePipelineState:pso_fused_ctrl];
+            [enc setBuffer:b_ctrl_h offset:0 atIndex:0];
+            [enc setBuffer:lw.ctrl_gain[s] offset:0 atIndex:1];
+            [enc setBuffer:lw.ctrl_forget[s] offset:0 atIndex:2];
+            [enc setBuffer:dest offset:dest_off atIndex:3];
+            [enc setBuffer:msg offset:msg_off atIndex:4];
+            [enc setBuffer:norm_w offset:nw_off atIndex:5];
+            [enc setBuffer:out offset:out_off atIndex:6];
+            [enc setBytes:&cp length:sizeof(cp) atIndex:7];
+            [enc dispatchThreadgroups:MTLSizeMake(T, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        }
     }
 
     void forward_internal(const InklingConfig& cfg, int max_batch_tokens,
-                          const int32_t* h_tokens, int T, int start_pos, int slot_id, bool do_argmax)
+                          const int32_t* h_tokens, int T, int start_pos, int slot_id, bool do_argmax,
+                          bool profile_stages)
     {
         if (T <= 0 || T > max_batch_tokens) {
             throw std::runtime_error("Invalid T for Metal forward_internal");
@@ -318,6 +432,15 @@ struct Inkling2Model::Impl {
         id<MTLCommandBuffer> cb = [queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
 
+        auto flush_stage = [&](double& acc) {
+            if (!profile_stages) return;
+            [enc endEncoding];
+            commit_and_wait(cb);
+            acc += (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
+            cb = [queue commandBuffer];
+            enc = [cb computeCommandEncoder];
+        };
+
         RmsParams erp{(uint32_t)T, D, cfg.rms_norm_eps};
         [enc setComputePipelineState:pso_embed_norm];
         [enc setBuffer:b_tokens offset:0 atIndex:0];
@@ -329,11 +452,12 @@ struct Inkling2Model::Impl {
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 
         auto blit_copy = [&](id<MTLBuffer> src, size_t src_off, id<MTLBuffer> dst, size_t dst_off, size_t nbytes) {
-            [enc endEncoding];
-            id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
-            [blit copyFromBuffer:src sourceOffset:src_off toBuffer:dst destinationOffset:dst_off size:nbytes];
-            [blit endEncoding];
-            enc = [cb computeCommandEncoder];
+            uint32_t n_elem = (uint32_t)(nbytes / 2);
+            [enc setComputePipelineState:pso_copy_bf16];
+            [enc setBuffer:src offset:src_off atIndex:0];
+            [enc setBuffer:dst offset:dst_off atIndex:1];
+            [enc setBytes:&n_elem length:sizeof(n_elem) atIndex:2];
+            [enc dispatchThreads:MTLSizeMake(n_elem, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         };
 
         int num_blocks = 0;
@@ -426,8 +550,14 @@ struct Inkling2Model::Impl {
                 k_in_off = lw.is_local ? 0 : (size_t)T * D * 2;
                 v_in_off = lw.is_local ? 0 : (size_t)2 * T * D * 2;
             }
+            flush_stage(prof_attn_res_ctrl_ms);
 
-            encode_linear_bf16(enc, b_attn_in, q_in_off, lw.w_qrgs, 0, b_qrgs, 0, nil, 0, (uint32_t)T, qrgs_dim, D, false);
+            if (T <= 8) {
+                encode_linear_fp8(enc, b_attn_in, q_in_off, lw.w_qrgs_fp8, 0, lw.w_qrgs_sc, 0,
+                                  b_qrgs, 0, nil, 0, (uint32_t)T, qrgs_dim, D, false);
+            } else {
+                encode_linear_bf16(enc, b_attn_in, q_in_off, lw.w_qrgs, 0, b_qrgs, 0, nil, 0, (uint32_t)T, qrgs_dim, D, false);
+            }
             {
                 SplitQrgsParams sqp{(uint32_t)T, q_dim, r_dim, (uint32_t)cfg.num_attention_heads};
                 [enc setComputePipelineState:pso_split_qrgs];
@@ -442,7 +572,12 @@ struct Inkling2Model::Impl {
             }
 
             if (k_in_off == v_in_off) {
-                encode_linear_bf16(enc, b_attn_in, k_in_off, lw.w_kv, 0, b_kv_out, 0, nil, 0, (uint32_t)T, 2u * kv_dim, D, false);
+                if (T <= 8) {
+                    encode_linear_fp8(enc, b_attn_in, k_in_off, lw.w_kv_fp8, 0, lw.w_kv_sc, 0,
+                                      b_kv_out, 0, nil, 0, (uint32_t)T, 2u * kv_dim, D, false);
+                } else {
+                    encode_linear_bf16(enc, b_attn_in, k_in_off, lw.w_kv, 0, b_kv_out, 0, nil, 0, (uint32_t)T, 2u * kv_dim, D, false);
+                }
                 SplitKvParams skp{(uint32_t)T, kv_dim};
                 [enc setComputePipelineState:pso_split_kv];
                 [enc setBuffer:b_kv_out offset:0 atIndex:0];
@@ -452,11 +587,20 @@ struct Inkling2Model::Impl {
                 [enc dispatchThreads:MTLSizeMake(2u * kv_dim, (uint32_t)T, 1)
                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             } else {
-                encode_linear_bf16(enc, b_attn_in, k_in_off, lw.w_kv, 0, b_K, 0, nil, 0, (uint32_t)T, kv_dim, D, false);
-                encode_linear_bf16(enc, b_attn_in, v_in_off, lw.w_kv, (size_t)kv_dim * D * 2, b_V, 0, nil, 0, (uint32_t)T, kv_dim, D, false);
+                if (T <= 8) {
+                    encode_linear_fp8(enc, b_attn_in, k_in_off, lw.w_kv_fp8, 0, lw.w_kv_sc, 0,
+                                      b_K, 0, nil, 0, (uint32_t)T, kv_dim, D, false);
+                    encode_linear_fp8(enc, b_attn_in, v_in_off, lw.w_kv_fp8, (size_t)kv_dim * D, lw.w_kv_sc, (size_t)kv_dim * sizeof(float),
+                                      b_V, 0, nil, 0, (uint32_t)T, kv_dim, D, false);
+                } else {
+                    encode_linear_bf16(enc, b_attn_in, k_in_off, lw.w_kv, 0, b_K, 0, nil, 0, (uint32_t)T, kv_dim, D, false);
+                    encode_linear_bf16(enc, b_attn_in, v_in_off, lw.w_kv, (size_t)kv_dim * D * 2, b_V, 0, nil, 0, (uint32_t)T, kv_dim, D, false);
+                }
             }
+            flush_stage(prof_dense_proj_ms);
 
-            size_t kv_slot_off = (size_t)slot_id * (size_t)vc.cap * kv_dim * 2;
+            size_t kv_slot_off = (size_t)slot_id * (size_t)vc.cap * kv_dim * (vc.is_local ? 2 : 1);
+            size_t sc_slot_off = (size_t)slot_id * (size_t)vc.cap * (size_t)cfg.num_key_value_heads * sizeof(float);
             size_t k_cs_off = (size_t)slot_id * 3 * kv_dim * 2;
             size_t d_cs_off = (size_t)slot_id * 3 * D * 2;
 
@@ -526,14 +670,27 @@ struct Inkling2Model::Impl {
                     (uint32_t)cfg.num_key_value_heads, (uint32_t)cfg.head_dim,
                     cfg.qk_l2_clip_threshold, cfg.rms_norm_eps
                 };
-                [enc setComputePipelineState:pso_attn_prep_kv];
-                [enc setBuffer:b_K_conv offset:0 atIndex:0];
-                [enc setBuffer:b_V_conv offset:0 atIndex:1];
-                [enc setBuffer:vc.k_cache offset:kv_slot_off atIndex:2];
-                [enc setBuffer:vc.v_cache offset:kv_slot_off atIndex:3];
-                [enc setBytes:&kvp length:sizeof(kvp) atIndex:4];
-                [enc dispatchThreadgroups:MTLSizeMake((uint32_t)cfg.num_key_value_heads, (uint32_t)T, 1)
-                    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                if (vc.is_local) {
+                    [enc setComputePipelineState:pso_attn_prep_kv];
+                    [enc setBuffer:b_K_conv offset:0 atIndex:0];
+                    [enc setBuffer:b_V_conv offset:0 atIndex:1];
+                    [enc setBuffer:vc.k_cache offset:kv_slot_off atIndex:2];
+                    [enc setBuffer:vc.v_cache offset:kv_slot_off atIndex:3];
+                    [enc setBytes:&kvp length:sizeof(kvp) atIndex:4];
+                    [enc dispatchThreadgroups:MTLSizeMake((uint32_t)cfg.num_key_value_heads, (uint32_t)T, 1)
+                        threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                } else {
+                    [enc setComputePipelineState:pso_attn_prep_kv_fp8];
+                    [enc setBuffer:b_K_conv offset:0 atIndex:0];
+                    [enc setBuffer:b_V_conv offset:0 atIndex:1];
+                    [enc setBuffer:vc.k_cache_fp8 offset:kv_slot_off atIndex:2];
+                    [enc setBuffer:vc.v_cache_fp8 offset:kv_slot_off atIndex:3];
+                    [enc setBuffer:vc.k_scale_fp8 offset:sc_slot_off atIndex:4];
+                    [enc setBuffer:vc.v_scale_fp8 offset:sc_slot_off atIndex:5];
+                    [enc setBytes:&kvp length:sizeof(kvp) atIndex:6];
+                    [enc dispatchThreadgroups:MTLSizeMake((uint32_t)cfg.num_key_value_heads, (uint32_t)T, 1)
+                        threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                }
             }
 
             {
@@ -553,20 +710,42 @@ struct Inkling2Model::Impl {
                     (uint32_t)cfg.sliding_window_size, (uint32_t)cfg.num_attention_heads,
                     (uint32_t)cfg.num_key_value_heads, (uint32_t)cfg.head_dim, (uint32_t)cfg.rel_extent
                 };
-                [enc setComputePipelineState:pso_attention];
-                [enc setBuffer:b_Q offset:0 atIndex:0];
-                [enc setBuffer:vc.k_cache offset:kv_slot_off atIndex:1];
-                [enc setBuffer:vc.v_cache offset:kv_slot_off atIndex:2];
-                [enc setBuffer:b_rel_logits offset:0 atIndex:3];
-                [enc setBuffer:b_gate offset:0 atIndex:4];
-                [enc setBuffer:b_sinks offset:0 atIndex:5];
-                [enc setBuffer:b_attn_raw offset:0 atIndex:6];
-                [enc setBytes:&ap length:sizeof(ap) atIndex:7];
-                [enc dispatchThreadgroups:MTLSizeMake((uint32_t)cfg.num_attention_heads, (uint32_t)T, 1)
-                    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                if (vc.is_local) {
+                    [enc setComputePipelineState:pso_attention];
+                    [enc setBuffer:b_Q offset:0 atIndex:0];
+                    [enc setBuffer:vc.k_cache offset:kv_slot_off atIndex:1];
+                    [enc setBuffer:vc.v_cache offset:kv_slot_off atIndex:2];
+                    [enc setBuffer:b_rel_logits offset:0 atIndex:3];
+                    [enc setBuffer:b_gate offset:0 atIndex:4];
+                    [enc setBuffer:b_sinks offset:0 atIndex:5];
+                    [enc setBuffer:b_attn_raw offset:0 atIndex:6];
+                    [enc setBytes:&ap length:sizeof(ap) atIndex:7];
+                    [enc dispatchThreadgroups:MTLSizeMake((uint32_t)cfg.num_attention_heads, (uint32_t)T, 1)
+                        threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                } else {
+                    [enc setComputePipelineState:pso_attention_fp8];
+                    [enc setBuffer:b_Q offset:0 atIndex:0];
+                    [enc setBuffer:vc.k_cache_fp8 offset:kv_slot_off atIndex:1];
+                    [enc setBuffer:vc.v_cache_fp8 offset:kv_slot_off atIndex:2];
+                    [enc setBuffer:vc.k_scale_fp8 offset:sc_slot_off atIndex:3];
+                    [enc setBuffer:vc.v_scale_fp8 offset:sc_slot_off atIndex:4];
+                    [enc setBuffer:b_rel_logits offset:0 atIndex:5];
+                    [enc setBuffer:b_gate offset:0 atIndex:6];
+                    [enc setBuffer:b_sinks offset:0 atIndex:7];
+                    [enc setBuffer:b_attn_raw offset:0 atIndex:8];
+                    [enc setBytes:&ap length:sizeof(ap) atIndex:9];
+                    [enc dispatchThreadgroups:MTLSizeMake((uint32_t)cfg.num_attention_heads, (uint32_t)T, 1)
+                        threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                }
             }
+            flush_stage(prof_attn_sconv_ms);
 
-            encode_linear_bf16(enc, b_attn_raw, 0, lw.wo, 0, b_attn_proj, 0, nil, 0, (uint32_t)T, D, q_dim, false);
+            if (T <= 8) {
+                encode_linear_fp8(enc, b_attn_raw, 0, lw.wo_fp8, 0, lw.wo_sc, 0, b_attn_proj, 0, nil, 0, (uint32_t)T, D, q_dim, false);
+            } else {
+                encode_linear_bf16(enc, b_attn_raw, 0, lw.wo, 0, b_attn_proj, 0, nil, 0, (uint32_t)T, D, q_dim, false);
+            }
+            flush_stage(prof_dense_proj_ms);
 
             {
                 SconvStaticParams sp{(uint32_t)T, D, 0u};
@@ -579,6 +758,7 @@ struct Inkling2Model::Impl {
                 [enc setBytes:&sp length:sizeof(sp) atIndex:5];
                 [enc dispatchThreads:MTLSizeMake(D, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             }
+            flush_stage(prof_attn_sconv_ms);
 
             bool first = (i % cfg.n_layers_per_attn_res_block == 0);
             uint32_t mlp_n_stack = (uint32_t)(num_blocks + (first ? 1 : 0));
@@ -601,6 +781,7 @@ struct Inkling2Model::Impl {
                                 lw.mlp_norm, 0, b_mlp_in, 0, nil, 0,
                                 (uint32_t)T, D, cfg.rms_norm_eps);
             }
+            flush_stage(prof_attn_res_ctrl_ms);
 
             {
                 RouterParams rp{(uint32_t)T, D, (uint32_t)cfg.n_routed_experts, (uint32_t)cfg.num_experts_per_tok, cfg.route_scale};
@@ -609,8 +790,8 @@ struct Inkling2Model::Impl {
                 [enc setBuffer:lw.gate_weight offset:0 atIndex:1];
                 [enc setBuffer:b_router_logits offset:0 atIndex:2];
                 [enc setBytes:&rp length:sizeof(rp) atIndex:3];
-                [enc dispatchThreadgroups:MTLSizeMake((rp.E + 3u) / 4u, (uint32_t)T, 1)
-                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                [enc dispatchThreadgroups:MTLSizeMake(rp.E, (uint32_t)T, 1)
+                    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 
                 [enc setComputePipelineState:pso_router_topk];
                 [enc setBuffer:b_router_logits offset:0 atIndex:0];
@@ -619,8 +800,9 @@ struct Inkling2Model::Impl {
                 [enc setBuffer:b_topk_weights offset:0 atIndex:3];
                 [enc setBytes:&rp length:sizeof(rp) atIndex:4];
                 [enc dispatchThreadgroups:MTLSizeMake((uint32_t)T, 1, 1)
-                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
             }
+            flush_stage(prof_router_ms);
 
             {
                 MoeParams mp{(uint32_t)T, D, (uint32_t)cfg.intermediate_size, (uint32_t)cfg.num_experts_per_tok,
@@ -646,6 +828,7 @@ struct Inkling2Model::Impl {
                     [enc setBytes:&mp length:sizeof(mp) atIndex:5];
                     [enc dispatchThreadgroups:MTLSizeMake((D + 3u) / 4u, mp.T, 1)
                         threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                    flush_stage(prof_moe_mxfp8_ms);
                 } else {
                     [enc setComputePipelineState:pso_moe_nvfp4_w13];
                     [enc setBuffer:b_mlp_in offset:0 atIndex:0];
@@ -671,6 +854,7 @@ struct Inkling2Model::Impl {
                     [enc setBytes:&mp length:sizeof(mp) atIndex:7];
                     [enc dispatchThreadgroups:MTLSizeMake((D + 3u) / 4u, mp.T, 1)
                         threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                    flush_stage(prof_moe_nvfp4_ms);
                 }
             }
 
@@ -717,10 +901,11 @@ struct Inkling2Model::Impl {
                         output_query, 0, 1,
                         final_norm_w, 0, b_mlp_in, 0, nil, 0,
                         (uint32_t)T, D, cfg.rms_norm_eps);
+        flush_stage(prof_attn_res_ctrl_ms);
 
         size_t last_tok_off = (size_t)(T - 1) * D * 2;
-        encode_linear_bf16(enc, b_mlp_in, last_tok_off, unembed_w, 0, nil, 0, b_logits, 0,
-                           1u, (uint32_t)cfg.unpadded_vocab_size, D, true);
+        encode_linear_fp8(enc, b_mlp_in, last_tok_off, unembed_fp8, 0, unembed_sc, 0, nil, 0, b_logits, 0,
+                          1u, (uint32_t)cfg.unpadded_vocab_size, D, true);
 
         if (do_argmax) {
             ArgmaxParams amp{(uint32_t)cfg.unpadded_vocab_size, cfg.final_logit_softcapping};
@@ -733,6 +918,10 @@ struct Inkling2Model::Impl {
 
         [enc endEncoding];
         commit_and_wait(cb);
+        if (profile_stages) {
+            prof_lm_head_ms += (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
+            prof_steps += 1;
+        }
     }
 };
 
@@ -751,6 +940,10 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
 
         impl_->device = MTLCreateSystemDefaultDevice();
         if (!impl_->device) throw std::runtime_error("No Apple Metal device available");
+        impl_->gpu_ws_gib = (double)impl_->device.recommendedMaxWorkingSetSize / (1024.0 * 1024.0 * 1024.0);
+        impl_->gpu_max_tg = (uint32_t)impl_->device.maxThreadsPerThreadgroup.width;
+        impl_->gpu_is_apple9 = [impl_->device supportsFamily:MTLGPUFamilyApple9];
+        impl_->gpu_low_mem = (impl_->gpu_ws_gib <= 24.0);
         impl_->queue = [impl_->device newCommandQueue];
 
         NSError* err = nil;
@@ -775,17 +968,22 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
         impl_->pso_embed_norm = impl_->make_pso("embed_norm_kernel");
         impl_->pso_rmsnorm = impl_->make_pso("rmsnorm_kernel");
         impl_->pso_add_bf16 = impl_->make_pso("add_bf16_kernel");
+        impl_->pso_copy_bf16 = impl_->make_pso("copy_bf16_kernel");
         impl_->pso_split_qrgs = impl_->make_pso("split_qrgs_kernel");
         impl_->pso_split_kv = impl_->make_pso("split_kv_kernel");
         impl_->pso_attn_res = impl_->make_pso("attn_res_kernel");
         impl_->pso_pair_rms_norm = impl_->make_pso("pair_rms_norm_kernel");
         impl_->pso_fused_ctrl = impl_->make_pso("fused_ctrl_blend_rmsnorm_kernel");
+        impl_->pso_ctrl_gf_small_t = impl_->make_pso("ctrl_gf_blend_small_t_kernel");
+        impl_->pso_fp32_rmsnorm = impl_->make_pso("fp32_rmsnorm_to_bf16_kernel");
         impl_->pso_sconv_static = impl_->make_pso("sconv_static_kernel");
         impl_->pso_sconv_dynamic = impl_->make_pso("sconv_dynamic_kernel");
         impl_->pso_attn_prep_qr = impl_->make_pso("attn_prep_q_r_kernel");
         impl_->pso_attn_prep_kv = impl_->make_pso("attn_prep_kv_kernel");
+        impl_->pso_attn_prep_kv_fp8 = impl_->make_pso("attn_prep_kv_fp8_kernel");
         impl_->pso_rel_matmul = impl_->make_pso("rel_logits_matmul_kernel");
         impl_->pso_attention = impl_->make_pso("attention_kernel");
+        impl_->pso_attention_fp8 = impl_->make_pso("attention_fp8_kernel");
         impl_->pso_router_logits = impl_->make_pso("moe_router_logits_kernel");
         impl_->pso_router_topk = impl_->make_pso("moe_router_topk_kernel");
         impl_->pso_moe_nvfp4_w13 = impl_->make_pso("moe_nvfp4_w13_kernel");
@@ -793,6 +991,10 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
         impl_->pso_moe_mxfp8_w13 = impl_->make_pso("moe_mxfp8_w13_kernel");
         impl_->pso_moe_mxfp8_w2 = impl_->make_pso("moe_mxfp8_w2_kernel");
         impl_->pso_bf16_gemv = impl_->make_pso("bf16_gemv_kernel");
+        impl_->pso_bf16_gemv_1sg = impl_->make_pso("bf16_gemv_1sg_kernel");
+        impl_->pso_quant_fp8 = impl_->make_pso("quantize_bf16_to_fp8_rowwise_kernel");
+        impl_->pso_fp8_gemv = impl_->make_pso("fp8_gemv_kernel");
+        impl_->pso_bf16_gemm_tiled = impl_->make_pso("bf16_gemm_tiled_kernel");
         impl_->pso_softcap_argmax = impl_->make_pso("softcap_argmax_kernel");
 
         impl_->b_dummy = impl_->alloc_shared(64);
@@ -800,6 +1002,8 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
         impl_->embed_norm_w = impl_->load_tensor(st, "model.llm.embed_norm.weight");
         impl_->final_norm_w = impl_->load_tensor(st, "model.llm.norm.weight");
         impl_->unembed_w = impl_->load_tensor(st, "model.llm.unembed.weight");
+        impl_->unembed_fp8 = impl_->alloc_shared((size_t)cfg.unpadded_vocab_size * cfg.hidden_size);
+        impl_->unembed_sc = impl_->alloc_shared((size_t)cfg.unpadded_vocab_size * sizeof(float));
 
         float inv_sqrt_d = 1.0f / std::sqrt((float)cfg.hidden_size);
         auto load_scaled_query = [&](const std::string& name) -> id<MTLBuffer> {
@@ -885,6 +1089,12 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
             st.read_into(p + "attn.wv_dv.weight", kvbase + (size_t)kv_dim * D * 2, (size_t)kv_dim * D * 2);
 
             lw.wo = impl_->load_tensor(st, p + "attn.wo_ud.weight");
+            lw.w_qrgs_fp8 = impl_->alloc_shared((size_t)qrgs_dim * D);
+            lw.w_qrgs_sc = impl_->alloc_shared((size_t)qrgs_dim * sizeof(float));
+            lw.w_kv_fp8 = impl_->alloc_shared((size_t)2 * kv_dim * D);
+            lw.w_kv_sc = impl_->alloc_shared((size_t)2 * kv_dim * sizeof(float));
+            lw.wo_fp8 = impl_->alloc_shared((size_t)D * q_dim);
+            lw.wo_sc = impl_->alloc_shared((size_t)D * sizeof(float));
             lw.q_clip_scale = impl_->load_tensor(st, p + "attn.q_l2_clip.scale");
             lw.rel_clip_scale = impl_->load_tensor(st, p + "attn.rel_l2_clip.scale");
             lw.rel_proj = impl_->load_tensor(st, p + "attn.rel_logits_proj.proj");
@@ -940,10 +1150,20 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
             auto& vc = impl_->caches[v];
             vc.is_local = cfg.is_local(lid);
             vc.cap = vc.is_local ? (cfg.sliding_window_size + max_batch_tokens) : max_seq_len;
-            size_t kv_sz = (size_t)max_slots * (size_t)vc.cap * kv_dim * 2;
-            vc.k_cache = impl_->alloc_shared(kv_sz);
-            vc.v_cache = impl_->alloc_shared(kv_sz);
-            kv_bytes_total += 2 * kv_sz;
+            if (vc.is_local) {
+                size_t kv_sz = (size_t)max_slots * (size_t)vc.cap * kv_dim * 2;
+                vc.k_cache = impl_->alloc_shared(kv_sz);
+                vc.v_cache = impl_->alloc_shared(kv_sz);
+                kv_bytes_total += 2 * kv_sz;
+            } else {
+                size_t kv_fp8_sz = (size_t)max_slots * (size_t)vc.cap * kv_dim;
+                size_t sc_sz = (size_t)max_slots * (size_t)vc.cap * (size_t)cfg.num_key_value_heads * sizeof(float);
+                vc.k_cache_fp8 = impl_->alloc_shared(kv_fp8_sz);
+                vc.v_cache_fp8 = impl_->alloc_shared(kv_fp8_sz);
+                vc.k_scale_fp8 = impl_->alloc_shared(sc_sz);
+                vc.v_scale_fp8 = impl_->alloc_shared(sc_sz);
+                kv_bytes_total += 2 * kv_fp8_sz + 2 * sc_sz;
+            }
 
             vc.k_conv_state = impl_->alloc_shared((size_t)max_slots * 3 * kv_dim * 2);
             vc.v_conv_state = impl_->alloc_shared((size_t)max_slots * 3 * kv_dim * 2);
@@ -951,6 +1171,7 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
             vc.mlp_conv_state = impl_->alloc_shared((size_t)max_slots * 3 * D * 2);
 
             if (vc.is_local) {
+                size_t kv_sz = (size_t)max_slots * (size_t)vc.cap * kv_dim * 2;
                 vc.local_k_prefill_snap = impl_->alloc_shared(kv_sz);
                 vc.local_v_prefill_snap = impl_->alloc_shared(kv_sz);
                 kv_bytes_total += 2 * kv_sz;
@@ -973,6 +1194,7 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
         impl_->b_mlp_in = impl_->alloc_shared((size_t)T * D * 2);
         impl_->b_pair = impl_->alloc_shared((size_t)T * 2 * D * 2);
         impl_->b_ctrl_h = impl_->alloc_shared((size_t)T * cfg.loop_gate_rank * 2);
+        impl_->b_ctrl_tmp = impl_->alloc_shared((size_t)8 * D * sizeof(float));
         impl_->b_qrgs = impl_->alloc_shared((size_t)T * qrgs_dim * 2);
         impl_->b_kv_out = impl_->alloc_shared((size_t)T * 2 * kv_dim * 2);
         impl_->b_Q = impl_->alloc_shared((size_t)T * q_dim * 2);
@@ -996,6 +1218,21 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
         impl_->b_moe_act = impl_->alloc_shared((size_t)T * cfg.num_experts_per_tok * cfg.intermediate_size * sizeof(float));
         impl_->b_logits = impl_->alloc_shared((size_t)cfg.vocab_size * sizeof(float));
         impl_->b_out_token = impl_->alloc_shared(16 * sizeof(int32_t));
+
+        {
+            id<MTLCommandBuffer> qcb = [impl_->queue commandBuffer];
+            id<MTLComputeCommandEncoder> qenc = [qcb computeCommandEncoder];
+            impl_->quantize_rowwise_fp8(qenc, impl_->unembed_w, impl_->unembed_fp8, impl_->unembed_sc,
+                                        (uint32_t)cfg.unpadded_vocab_size, (uint32_t)D);
+            for (int i = 0; i < cfg.num_hidden_layers; ++i) {
+                auto& lw = impl_->layers[i];
+                impl_->quantize_rowwise_fp8(qenc, lw.w_qrgs, lw.w_qrgs_fp8, lw.w_qrgs_sc, (uint32_t)qrgs_dim, (uint32_t)D);
+                impl_->quantize_rowwise_fp8(qenc, lw.w_kv, lw.w_kv_fp8, lw.w_kv_sc, (uint32_t)(2 * kv_dim), (uint32_t)D);
+                impl_->quantize_rowwise_fp8(qenc, lw.wo, lw.wo_fp8, lw.wo_sc, (uint32_t)D, (uint32_t)q_dim);
+            }
+            [qenc endEncoding];
+            impl_->commit_and_wait(qcb);
+        }
 
         for (int s = 0; s < max_slots; ++s) reset_cache(s);
 
@@ -1070,7 +1307,7 @@ void Inkling2Model::restore_prefill_snapshot(int slot_id) {
 
 int32_t Inkling2Model::forward_and_greedy(const int32_t* h_tokens, int T, int start_pos, int slot_id) {
     @autoreleasepool {
-        impl_->forward_internal(cfg, max_batch_tokens, h_tokens, T, start_pos, slot_id, true);
+        impl_->forward_internal(cfg, max_batch_tokens, h_tokens, T, start_pos, slot_id, true, profile_stages);
         return static_cast<const int32_t*>(impl_->b_out_token.contents)[0];
     }
 }
@@ -1114,13 +1351,39 @@ void Inkling2Model::draft_tokens(int32_t, int, int, int32_t*, int) {
 
 void Inkling2Model::forward_logits(const int32_t* h_tokens, int T, int start_pos, std::vector<float>& h_logits, int slot_id) {
     @autoreleasepool {
-        impl_->forward_internal(cfg, max_batch_tokens, h_tokens, T, start_pos, slot_id, true);
+        impl_->forward_internal(cfg, max_batch_tokens, h_tokens, T, start_pos, slot_id, true, profile_stages);
         h_logits.resize(cfg.unpadded_vocab_size);
         memcpy(h_logits.data(), impl_->b_logits.contents, (size_t)cfg.unpadded_vocab_size * sizeof(float));
     }
 }
 
-void Inkling2Model::reset_profile() {}
-void Inkling2Model::print_profile() const {}
+void Inkling2Model::reset_profile() {
+    impl_->prof_attn_res_ctrl_ms = 0.0;
+    impl_->prof_dense_proj_ms = 0.0;
+    impl_->prof_attn_sconv_ms = 0.0;
+    impl_->prof_router_ms = 0.0;
+    impl_->prof_moe_nvfp4_ms = 0.0;
+    impl_->prof_moe_mxfp8_ms = 0.0;
+    impl_->prof_lm_head_ms = 0.0;
+    impl_->prof_steps = 0;
+}
+
+void Inkling2Model::print_profile() const {
+    if (impl_->prof_steps == 0) return;
+    double n = (double)impl_->prof_steps;
+    double tot = (impl_->prof_attn_res_ctrl_ms + impl_->prof_dense_proj_ms + impl_->prof_attn_sconv_ms +
+                  impl_->prof_router_ms + impl_->prof_moe_nvfp4_ms + impl_->prof_moe_mxfp8_ms + impl_->prof_lm_head_ms) / n;
+    fprintf(stderr, "\n=== METAL STAGE PROFILE (avg over %d steps, gpu_total=%.2f ms/tok) ===\n", impl_->prof_steps, tot);
+    auto row = [&](const char* name, double ms) {
+        fprintf(stderr, "  %-22s: %6.2f ms (%5.1f%%)\n", name, ms / n, 100.0 * (ms / n) / tot);
+    };
+    row("AttnRes + LoopCtrl", impl_->prof_attn_res_ctrl_ms);
+    row("Dense FP8 Projs",    impl_->prof_dense_proj_ms);
+    row("Attention + SConv",  impl_->prof_attn_sconv_ms);
+    row("MoE Router",         impl_->prof_router_ms);
+    row("MoE NVFP4 (44x)",    impl_->prof_moe_nvfp4_ms);
+    row("MoE MXFP8 (4x)",     impl_->prof_moe_mxfp8_ms);
+    row("LM Head + Sample",   impl_->prof_lm_head_ms);
+}
 
 }

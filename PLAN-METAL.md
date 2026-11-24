@@ -16,3 +16,4 @@
 |---|---|---|---:|---|
 | `m00-hw-probe` | Story 1: M5 Max hardware probe (`bench_hw/hw_probe_metal.mm`) | 477.17 GB/s copy, 465.69 GB/s read, 59.68 TFLOPS FP16, 12.82 TFLOPS untiled BF16 | — | **Locked** |
 | `m01-baseline` | Story 3: Metal v1 full 48-visit forward (`MTLResourceStorageModeShared`, `-fno-fast-math`) | Load 1.35 s; Canary `323` PASS; Tool `get_weather` PASS; SSE **33.17** code / **33.31** prose tok/s (TTFT 211 ms) | 38.7% (BF16) | **Baseline** |
+| `m02-story4` | Story 4: W8A16 FP8 dense+LM head, vectorized NVFP4 MoE, multi-core loop ctrl, parallel `simd_max` router, single compute encoder, FP8 global KV, tiled BF16 GEMM | Load 1.25 s; Canary `323` PASS; Tool PASS; 14.5K Needle **3/3 exact PASS**; CLI **55.62 tok/s**; SSE **48.75** code / **48.87** prose (+47%, beats `llama.cpp` 41.0) | 43.1% (W8A16) | **Accepted** |
