@@ -1,4 +1,7 @@
 #pragma once
+#ifdef WARPGRID_METAL
+#include "metal/model_metal.hpp"
+#else
 #include "config.hpp"
 #include "dspark.hpp"
 #include "safetensors.hpp"
@@ -278,7 +281,14 @@ public:
     // and store context KV for `[aux_tok_offset .. aux_tok_offset + count - 1]` into dspark slot_id
     void commit_dspark_context(int count, int start_pos, int slot_id = 0, int aux_tok_offset = 0);
 
-    // Forward and copy FP32 softcapped logits [unpadded_vocab_size] to host for sampling
+    int max_dspark_slots() const { return dspark.max_dspark_slots; }
+
+    void draft_tokens(int32_t anchor_tok, int anchor_pos, int num_draft, int32_t* h_out_drafts, int slot_id = 0) {
+        dspark.draft_tokens(anchor_tok, anchor_pos,
+                            d_last_aux + (int64_t)slot_id * 4 * cfg.hidden_size,
+                            cfg.hidden_size, num_draft, h_out_drafts, slot_id);
+    }
+
     void forward_logits(const int32_t* h_tokens, int T, int start_pos, std::vector<float>& h_logits, int slot_id = 0);
 
 private:
@@ -296,4 +306,5 @@ private:
     void forward_batch_verify_internal(int B, int L);
 };
 
-} // namespace ink
+}
+#endif

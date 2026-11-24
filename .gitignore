@@ -2,7 +2,8 @@ warpgrid
 *.o
 *.air
 *.metallib
-src/metal/kernels_embed.hpp
+src/metal/kernels_metallib_embed.hpp
+src/metal/kernels_source_embed.hpp
 bench_hw/hw_probe_metal
 tests/test_host
 tests/test_metal_kernels

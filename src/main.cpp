@@ -120,7 +120,7 @@ int main(int argc, char** argv) {
                     if (cur_k <= 0) break;
 
                     auto s0 = std::chrono::steady_clock::now();
-                    model.dspark.draft_tokens(next_tok, pos, model.d_last_aux, model.cfg.hidden_size, cur_k, drafts);
+                    model.draft_tokens(next_tok, pos, cur_k, drafts, 0);
                     auto s1 = std::chrono::steady_clock::now();
                     verify_in[0] = next_tok;
                     for (int j = 0; j < cur_k; ++j) verify_in[j + 1] = drafts[j];

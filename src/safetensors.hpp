@@ -1,6 +1,8 @@
 #pragma once
 #include "json.hpp"
+#ifndef WARPGRID_METAL
 #include <cuda_runtime.h>
+#endif
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -22,13 +24,17 @@ class SafetensorsFile {
     int fd_ = -1;
     size_t data_base_ = 0;
     std::unordered_map<std::string, TensorMeta> meta_;
+#ifndef WARPGRID_METAL
     std::vector<void*> gpu_allocs_;
     std::unordered_map<std::string, void*> gpu_ptrs_;
+#endif
 
 public:
     SafetensorsFile() = default;
     ~SafetensorsFile() {
+#ifndef WARPGRID_METAL
         for (void* p : gpu_allocs_) cudaFree(p);
+#endif
         if (fd_ >= 0) close(fd_);
     }
     SafetensorsFile(const SafetensorsFile&) = delete;
@@ -68,7 +74,7 @@ public:
         return it->second;
     }
 
-    // Load a single tensor to GPU via eager pread + cudaMemcpy (avoids slow mmap)
+#ifndef WARPGRID_METAL
     void* load_to_gpu(const std::string& name, std::vector<uint8_t>& host_scratch) {
         auto it = gpu_ptrs_.find(name);
         if (it != gpu_ptrs_.end()) return it->second;
@@ -94,17 +100,26 @@ public:
         }
         return d_ptr;
     }
+#endif
 
-    // Load a single small tensor to host vector
-    void load_to_host(const std::string& name, std::vector<uint8_t>& out) {
+    void read_into(const std::string& name, void* dst, size_t dst_bytes) const {
         const auto& m = info(name);
-        out.resize(m.nbytes);
+        if (dst_bytes < m.nbytes) {
+            throw std::runtime_error("Destination buffer too small for " + name);
+        }
+        uint8_t* out = static_cast<uint8_t*>(dst);
         size_t got = 0;
         while (got < m.nbytes) {
-            ssize_t r = ::pread(fd_, out.data() + got, m.nbytes - got, (off_t)(data_base_ + m.offset + got));
+            ssize_t r = ::pread(fd_, out + got, m.nbytes - got, (off_t)(data_base_ + m.offset + got));
             if (r <= 0) throw std::runtime_error("pread failed for " + name);
             got += (size_t)r;
         }
+    }
+
+    void load_to_host(const std::string& name, std::vector<uint8_t>& out) const {
+        const auto& m = info(name);
+        out.resize(m.nbytes);
+        read_into(name, out.data(), out.size());
     }
 
     const std::unordered_map<std::string, TensorMeta>& all_meta() const { return meta_; }

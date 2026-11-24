@@ -9,6 +9,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <csignal>
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -74,7 +75,12 @@ class OpenAIServer {
     static bool send_all(int fd, const std::string& data) {
         size_t sent = 0;
         while (sent < data.size()) {
-            ssize_t n = ::send(fd, data.data() + sent, data.size() - sent, MSG_NOSIGNAL);
+#ifdef MSG_NOSIGNAL
+            int flags = MSG_NOSIGNAL;
+#else
+            int flags = 0;
+#endif
+            ssize_t n = ::send(fd, data.data() + sent, data.size() - sent, flags);
             if (n <= 0) return false;
             sent += (size_t)n;
         }
@@ -210,7 +216,7 @@ class OpenAIServer {
                     } else {
                         first_tok = model_.forward_and_greedy(r->prompt_ids.data() + p, n, p, r->slot_id);
                     }
-                    if (r->slot_id < model_.dspark.max_dspark_slots && model_.draft_k > 0 && r->cached_tokens == 0) {
+                    if (r->slot_id < model_.max_dspark_slots() && model_.draft_k > 0 && r->cached_tokens == 0) {
                         model_.commit_dspark_context(n, p, r->slot_id);
                         r->dspark_ready = true;
                     }
@@ -262,7 +268,7 @@ class OpenAIServer {
                     continue;
                 }
                 int32_t drafts[8], verify_in[8], verify_out[8];
-                model_.dspark.draft_tokens(r->last_tok, r->pos, model_.d_last_aux, model_.cfg.hidden_size, cur_k, drafts);
+                model_.draft_tokens(r->last_tok, r->pos, cur_k, drafts, 0);
                 verify_in[0] = r->last_tok;
                 for (int j = 0; j < cur_k; ++j) verify_in[j + 1] = drafts[j];
                 model_.forward_verify_greedy(verify_in, cur_k + 1, r->pos, verify_out);
@@ -313,7 +319,7 @@ class OpenAIServer {
                 int min_rem = 1000000;
                 for (int b = 0; b < B; ++b) {
                     auto& r = active[b];
-                    if (r->cancelled || r->slot_id >= model_.dspark.max_dspark_slots ||
+                    if (r->cancelled || r->slot_id >= model_.max_dspark_slots() ||
                         !r->dspark_ready || r->temperature > 0.0f) {
                         all_ds = false;
                         break;
@@ -323,7 +329,6 @@ class OpenAIServer {
                 int batch_k = std::min(3, std::min(model_.draft_k, min_rem));
                 if (all_ds && batch_k >= 1) {
                     int L = batch_k + 1;
-                    int D = model_.cfg.hidden_size;
                     int32_t drafts[8][8];
                     int32_t verify_in[16], verify_out[16];
                     int32_t h_slots[8], h_pos[8];
@@ -331,10 +336,7 @@ class OpenAIServer {
                         auto& r = active[b];
                         h_slots[b] = r->slot_id;
                         h_pos[b] = r->pos;
-                        model_.dspark.draft_tokens(
-                            r->last_tok, r->pos,
-                            model_.d_last_aux + (int64_t)r->slot_id * 4 * D, D,
-                            batch_k, drafts[b], r->slot_id);
+                        model_.draft_tokens(r->last_tok, r->pos, batch_k, drafts[b], r->slot_id);
                         verify_in[b * L + 0] = r->last_tok;
                         for (int j = 0; j < batch_k; ++j) verify_in[b * L + j + 1] = drafts[b][j];
                     }
@@ -621,6 +623,7 @@ public:
     }
 
     void run() {
+        std::signal(SIGPIPE, SIG_IGN);
         worker_ = std::thread(&OpenAIServer::worker_loop, this);
         int sfd = ::socket(AF_INET, SOCK_STREAM, 0);
         int opt = 1;
@@ -638,6 +641,10 @@ public:
         while (true) {
             int cfd = ::accept(sfd, nullptr, nullptr);
             if (cfd < 0) continue;
+#ifdef SO_NOSIGPIPE
+            int nosig = 1;
+            ::setsockopt(cfd, SOL_SOCKET, SO_NOSIGPIPE, &nosig, sizeof(nosig));
+#endif
             std::thread(&OpenAIServer::handle_client, this, cfd).detach();
         }
     }

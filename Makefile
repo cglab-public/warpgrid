@@ -1,15 +1,76 @@
+UNAME_S := $(shell uname -s)
+TARGET := warpgrid
+COMMON_HDRS := src/config.hpp src/json.hpp src/safetensors.hpp src/model.hpp src/tokenizer.hpp src/server.hpp
+
+ifeq ($(UNAME_S),Darwin)
+CXX := clang++
+CXXFLAGS := -O3 -std=c++20 -Wall -Wno-unused-function -DWARPGRID_METAL
+OBJCXXFLAGS := $(CXXFLAGS) -fobjc-arc
+LDFLAGS := -framework Metal -framework MetalPerformanceShaders -framework Foundation -lpthread
+
+HAS_METAL_CLI := $(shell xcrun -sdk macosx metal --version >/dev/null 2>&1 && echo 1 || echo 0)
+
+all: $(TARGET)
+
+ifeq ($(HAS_METAL_CLI),1)
+CXXFLAGS += -DWARPGRID_METAL_PRECOMPILED
+OBJCXXFLAGS += -DWARPGRID_METAL_PRECOMPILED
+METAL_EMBED_HDR := src/metal/kernels_metallib_embed.hpp
+
+src/metal/kernels.air: src/metal/kernels.metal
+	xcrun -sdk macosx metal -std=metal3.1 -O2 -c src/metal/kernels.metal -o src/metal/kernels.air
+
+src/metal/kernels.metallib: src/metal/kernels.air
+	xcrun -sdk macosx metallib src/metal/kernels.air -o src/metal/kernels.metallib
+
+src/metal/kernels_metallib_embed.hpp: src/metal/kernels.metallib
+	xxd -i src/metal/kernels.metallib | sed -e 's/unsigned char .*=/static const unsigned char kMetalLibBytes[] =/' -e 's/unsigned int .*=/static const unsigned int kMetalLibLen =/' > src/metal/kernels_metallib_embed.hpp
+else
+METAL_EMBED_HDR := src/metal/kernels_source_embed.hpp
+
+src/metal/kernels_source_embed.hpp: src/metal/kernels.metal
+	xxd -i src/metal/kernels.metal | sed -e 's/unsigned char .*=/static const unsigned char kMetalSourceBytes[] =/' -e 's/unsigned int .*=/static const unsigned int kMetalSourceLen =/' > src/metal/kernels_source_embed.hpp
+endif
+
+src/main.o: src/main.cpp $(COMMON_HDRS) src/metal/model_metal.hpp
+	$(CXX) $(CXXFLAGS) -c src/main.cpp -o src/main.o
+
+src/metal/model_metal.o: src/metal/model_metal.mm src/metal/model_metal.hpp $(METAL_EMBED_HDR) $(COMMON_HDRS)
+	$(CXX) $(OBJCXXFLAGS) -c src/metal/model_metal.mm -o src/metal/model_metal.o
+
+$(TARGET): src/main.o src/metal/model_metal.o
+	$(CXX) src/main.o src/metal/model_metal.o -o $(TARGET) $(LDFLAGS)
+
+tests/test_host: tests/test_host.cpp src/config.hpp src/json.hpp src/safetensors.hpp src/tokenizer.hpp
+	$(CXX) $(CXXFLAGS) tests/test_host.cpp -o tests/test_host
+
+test: tests/test_host
+	./tests/test_host
+
+clean:
+	rm -f $(TARGET) src/main.o src/metal/model_metal.o src/metal/kernels.air src/metal/kernels.metallib src/metal/kernels_metallib_embed.hpp src/metal/kernels_source_embed.hpp tests/test_host
+
+else
 NVCC ?= /usr/local/cuda/bin/nvcc
 ARCH ?= sm_121a
 CXXFLAGS := -O3 -std=c++20 -Xcompiler -pthread -Xcompiler -Wall -Xcompiler -Wno-unused-function -lineinfo
 LDFLAGS := -lcublas -lcublasLt -lpthread
 
 SRCS := src/main.cpp src/model.cu src/kernels.cu src/dspark.cu
-TARGET := warpgrid
 
 all: $(TARGET)
 
-$(TARGET): $(SRCS) src/config.hpp src/json.hpp src/safetensors.hpp src/kernels.cuh src/model.hpp src/dspark.hpp src/tokenizer.hpp src/server.hpp
+$(TARGET): $(SRCS) $(COMMON_HDRS) src/kernels.cuh src/dspark.hpp
 	$(NVCC) $(CXXFLAGS) -gencode arch=compute_121a,code=sm_121a $(SRCS) -o $(TARGET) $(LDFLAGS)
 
+tests/test_host: tests/test_host.cpp src/config.hpp src/json.hpp src/safetensors.hpp src/tokenizer.hpp
+	g++ -O3 -std=c++20 -Wall -DWARPGRID_METAL tests/test_host.cpp -o tests/test_host
+
+test: tests/test_host
+	./tests/test_host
+
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGET) tests/test_host
+endif
+
+.PHONY: all test clean
