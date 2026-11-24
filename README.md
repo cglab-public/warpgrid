@@ -73,6 +73,7 @@ Measured end-to-end over the live OpenAI-compatible HTTP/SSE server (`./warpgrid
 | **14.5K Needle-in-a-Haystack** | — | — | — | **443.3** prefill / **53.06** decode | **3/3 exact PASS** (Split-K FP8 attn) |
 | **132K Needle-in-a-Haystack** | — | — | — | **233.6** prefill / **18.8** decode | **3/3 exact PASS**, **860.9 ms** warm (**656.9×**) |
 | **Parallel Ladder (`c=1..8`)** | — | — | — | **68.81** (`c=1`) → **74.92 agg** (`c=8`) | Batched continuous decode |
+| **Apple M4 Mac mini (16 GB, `Q2_G64`)** | 16.1 tok/s (`IQ2_XXS`) | — | — | **21.69** raw / **26.70** DFlash 2 | **+35% raw / +66% DFlash 2** vs `llama.cpp`, 16/16 tests PASS |
 
 ---
 

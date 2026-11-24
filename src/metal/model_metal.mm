@@ -122,6 +122,7 @@ struct MetalLayerWeights {
     bool is_local = true;
     bool is_loop_core = false;
     bool is_mxfp8 = false;
+    bool is_q2 = false;
 
     id<MTLBuffer> attn_norm = nil;
     id<MTLBuffer> mlp_norm = nil;
@@ -155,10 +156,12 @@ struct MetalLayerWeights {
 
     id<MTLBuffer> w13_weight = nil;
     id<MTLBuffer> w13_scale = nil;
+    id<MTLBuffer> w13_min = nil;
     id<MTLBuffer> w13_amax = nil;
     id<MTLBuffer> w13_denom = nil;
     id<MTLBuffer> w2_weight = nil;
     id<MTLBuffer> w2_scale = nil;
+    id<MTLBuffer> w2_min = nil;
     id<MTLBuffer> w2_amax = nil;
     id<MTLBuffer> w2_denom = nil;
 };
@@ -233,6 +236,10 @@ struct Inkling2Model::Impl {
     id<MTLComputePipelineState> pso_moe_mxfp8_w2_grp = nil;
     id<MTLComputePipelineState> pso_moe_mxfp8_w13_dedup = nil;
     id<MTLComputePipelineState> pso_moe_mxfp8_w2_dedup = nil;
+    id<MTLComputePipelineState> pso_moe_q2_w13 = nil;
+    id<MTLComputePipelineState> pso_moe_q2_w2 = nil;
+    id<MTLComputePipelineState> pso_moe_q2_w13_dedup = nil;
+    id<MTLComputePipelineState> pso_moe_q2_w2_dedup = nil;
     id<MTLComputePipelineState> pso_bf16_gemv = nil;
     id<MTLComputePipelineState> pso_bf16_gemv_1sg = nil;
     id<MTLComputePipelineState> pso_quant_fp8 = nil;
@@ -1130,7 +1137,71 @@ struct Inkling2Model::Impl {
             {
                 MoeParams mp{(uint32_t)T, D, (uint32_t)cfg.intermediate_size, (uint32_t)cfg.num_experts_per_tok,
                              cfg.mlp_gate_softcap, cfg.mlp_up_softcap};
-                if (lw.is_mxfp8 && T >= 16) {
+                if (lw.is_q2 && T >= 2) {
+                    MoeGroupParams gp{(uint32_t)(T * cfg.num_experts_per_tok), (uint32_t)cfg.n_routed_experts};
+                    [enc setComputePipelineState:pso_moe_group];
+                    [enc setBuffer:b_topk_ids offset:0 atIndex:0];
+                    [enc setBuffer:b_moe_offsets offset:0 atIndex:1];
+                    [enc setBuffer:b_moe_sorted_tk offset:0 atIndex:2];
+                    [enc setBytes:&gp length:sizeof(gp) atIndex:3];
+                    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+                    [enc setComputePipelineState:pso_moe_q2_w13_dedup];
+                    [enc setBuffer:b_mlp_in offset:0 atIndex:0];
+                    [enc setBuffer:b_topk_weights offset:0 atIndex:1];
+                    [enc setBuffer:b_moe_offsets offset:0 atIndex:2];
+                    [enc setBuffer:b_moe_sorted_tk offset:0 atIndex:3];
+                    [enc setBuffer:lw.w13_weight offset:0 atIndex:4];
+                    [enc setBuffer:lw.w13_scale offset:0 atIndex:5];
+                    [enc setBuffer:lw.w13_min offset:0 atIndex:6];
+                    [enc setBuffer:b_moe_act offset:0 atIndex:7];
+                    [enc setBytes:&mp length:sizeof(mp) atIndex:8];
+                    [enc dispatchThreadgroups:MTLSizeMake((mp.inter + 3u) / 4u, (uint32_t)cfg.n_routed_experts, 1)
+                        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+                    [enc setComputePipelineState:pso_moe_q2_w2_dedup];
+                    [enc setBuffer:b_moe_act offset:0 atIndex:0];
+                    [enc setBuffer:b_moe_offsets offset:0 atIndex:1];
+                    [enc setBuffer:b_moe_sorted_tk offset:0 atIndex:2];
+                    [enc setBuffer:lw.w2_weight offset:0 atIndex:3];
+                    [enc setBuffer:lw.w2_scale offset:0 atIndex:4];
+                    [enc setBuffer:lw.w2_min offset:0 atIndex:5];
+                    [enc setBuffer:b_moe_w2_out offset:0 atIndex:6];
+                    [enc setBytes:&mp length:sizeof(mp) atIndex:7];
+                    [enc dispatchThreadgroups:MTLSizeMake((D + 3u) / 4u, (uint32_t)cfg.n_routed_experts, 1)
+                        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+                    [enc setComputePipelineState:pso_moe_reduce_k];
+                    [enc setBuffer:b_moe_w2_out offset:0 atIndex:0];
+                    [enc setBuffer:b_mlp_raw offset:0 atIndex:1];
+                    [enc setBytes:&mp length:sizeof(mp) atIndex:2];
+                    [enc dispatchThreads:MTLSizeMake(D, mp.T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    flush_stage(prof_moe_nvfp4_ms);
+                } else if (lw.is_q2) {
+                    [enc setComputePipelineState:pso_moe_q2_w13];
+                    [enc setBuffer:b_mlp_in offset:0 atIndex:0];
+                    [enc setBuffer:b_topk_ids offset:0 atIndex:1];
+                    [enc setBuffer:b_topk_weights offset:0 atIndex:2];
+                    [enc setBuffer:lw.w13_weight offset:0 atIndex:3];
+                    [enc setBuffer:lw.w13_scale offset:0 atIndex:4];
+                    [enc setBuffer:lw.w13_min offset:0 atIndex:5];
+                    [enc setBuffer:b_moe_act offset:0 atIndex:6];
+                    [enc setBytes:&mp length:sizeof(mp) atIndex:7];
+                    [enc dispatchThreadgroups:MTLSizeMake((mp.inter + 3u) / 4u, mp.T * mp.K, 1)
+                        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+                    [enc setComputePipelineState:pso_moe_q2_w2];
+                    [enc setBuffer:b_moe_act offset:0 atIndex:0];
+                    [enc setBuffer:b_topk_ids offset:0 atIndex:1];
+                    [enc setBuffer:lw.w2_weight offset:0 atIndex:2];
+                    [enc setBuffer:lw.w2_scale offset:0 atIndex:3];
+                    [enc setBuffer:lw.w2_min offset:0 atIndex:4];
+                    [enc setBuffer:b_mlp_raw offset:0 atIndex:5];
+                    [enc setBytes:&mp length:sizeof(mp) atIndex:6];
+                    [enc dispatchThreadgroups:MTLSizeMake((D + 3u) / 4u, mp.T, 1)
+                        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                    flush_stage(prof_moe_nvfp4_ms);
+                } else if (lw.is_mxfp8 && T >= 16) {
                     MoeGroupParams gp{(uint32_t)(T * cfg.num_experts_per_tok), (uint32_t)cfg.n_routed_experts};
                     [enc setComputePipelineState:pso_moe_group];
                     [enc setBuffer:b_topk_ids offset:0 atIndex:0];
@@ -2300,6 +2371,10 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
         impl_->pso_df2_conv = impl_->make_pso("dflash2_grouped_dyn_conv_kernel");
         impl_->pso_df2_attn = impl_->make_pso("dflash2_block_attn_kernel");
         impl_->pso_df2_topk16 = impl_->make_pso("dflash2_topk16_kernel");
+        impl_->pso_moe_q2_w13 = impl_->make_pso("moe_q2_w13_kernel");
+        impl_->pso_moe_q2_w2 = impl_->make_pso("moe_q2_w2_kernel");
+        impl_->pso_moe_q2_w13_dedup = impl_->make_pso("moe_q2_w13_dedup_kernel");
+        impl_->pso_moe_q2_w2_dedup = impl_->make_pso("moe_q2_w2_dedup_kernel");
 
         impl_->b_dummy = impl_->alloc_shared(64);
         impl_->embed_w = impl_->load_tensor(st, "model.llm.embed.weight");
@@ -2428,16 +2503,26 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
             lw.gate_weight = impl_->load_tensor(st, p + "mlp.gate.weight");
             lw.gate_bias = impl_->load_tensor(st, p + "mlp.gate.bias");
 
-            lw.is_mxfp8 = (st.info(p + "mlp.experts.w13_weight").dtype == "F8_E4M3");
-            lw.w13_weight = impl_->load_tensor(st, p + "mlp.experts.w13_weight");
-            lw.w13_scale = impl_->load_tensor(st, p + "mlp.experts.w13_weight_scale");
-            lw.w2_weight = impl_->load_tensor(st, p + "mlp.experts.w2_weight");
-            lw.w2_scale = impl_->load_tensor(st, p + "mlp.experts.w2_weight_scale");
-            if (!lw.is_mxfp8) {
-                lw.w13_amax = impl_->load_tensor(st, p + "mlp.experts.w13_weight_amax");
-                lw.w13_denom = impl_->load_tensor(st, p + "mlp.experts.w13_weight_outer_scale_denominator");
-                lw.w2_amax = impl_->load_tensor(st, p + "mlp.experts.w2_weight_amax");
-                lw.w2_denom = impl_->load_tensor(st, p + "mlp.experts.w2_weight_outer_scale_denominator");
+            lw.is_q2 = st.has(p + "mlp.experts.w13_q2_weight");
+            if (lw.is_q2) {
+                lw.w13_weight = impl_->load_tensor(st, p + "mlp.experts.w13_q2_weight");
+                lw.w13_scale = impl_->load_tensor(st, p + "mlp.experts.w13_q2_scale");
+                lw.w13_min = impl_->load_tensor(st, p + "mlp.experts.w13_q2_min");
+                lw.w2_weight = impl_->load_tensor(st, p + "mlp.experts.w2_q2_weight");
+                lw.w2_scale = impl_->load_tensor(st, p + "mlp.experts.w2_q2_scale");
+                lw.w2_min = impl_->load_tensor(st, p + "mlp.experts.w2_q2_min");
+            } else {
+                lw.is_mxfp8 = (st.info(p + "mlp.experts.w13_weight").dtype == "F8_E4M3");
+                lw.w13_weight = impl_->load_tensor(st, p + "mlp.experts.w13_weight");
+                lw.w13_scale = impl_->load_tensor(st, p + "mlp.experts.w13_weight_scale");
+                lw.w2_weight = impl_->load_tensor(st, p + "mlp.experts.w2_weight");
+                lw.w2_scale = impl_->load_tensor(st, p + "mlp.experts.w2_weight_scale");
+                if (!lw.is_mxfp8) {
+                    lw.w13_amax = impl_->load_tensor(st, p + "mlp.experts.w13_weight_amax");
+                    lw.w13_denom = impl_->load_tensor(st, p + "mlp.experts.w13_weight_outer_scale_denominator");
+                    lw.w2_amax = impl_->load_tensor(st, p + "mlp.experts.w2_weight_amax");
+                    lw.w2_denom = impl_->load_tensor(st, p + "mlp.experts.w2_weight_outer_scale_denominator");
+                }
             }
         }
 
@@ -2566,6 +2651,7 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
         } else if (draft_k > 0) {
             impl_->load_dspark(model_dir, cfg, max_seq_len, max_batch_tokens, draft_vocab_file, n_ds_slots);
         }
+        impl_->unembed_w = nil;
     }
 }
 

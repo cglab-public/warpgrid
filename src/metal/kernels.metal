@@ -3549,3 +3549,301 @@ kernel void moe_mxfp8_w2_dedup_kernel(
     }
 }
 
+kernel void moe_q2_w13_kernel(
+    device const bfloat* x         [[buffer(0)]],
+    device const int* topk_ids     [[buffer(1)]],
+    device const float* topk_wts   [[buffer(2)]],
+    device const uchar* w13_u8     [[buffer(3)]],
+    device const half* w13_scale   [[buffer(4)]],
+    device const half* w13_min     [[buffer(5)]],
+    device float* act_out          [[buffer(6)]],
+    constant MoeParams& p          [[buffer(7)]],
+    uint2 tgid                     [[threadgroup_position_in_grid]],
+    uint sg_id                     [[simdgroup_index_in_threadgroup]],
+    uint lane                      [[thread_index_in_simdgroup]])
+{
+    uint tk = tgid.y;
+    uint t = tk / p.K;
+    int expert = topk_ids[tk];
+    float gamma = topk_wts[tk];
+
+    uint j = tgid.x * 4u + sg_id;
+    if (j >= p.inter) return;
+
+    long q_D = long(p.D / 4u);
+    long g_D = long(p.D / 64u);
+    uint n_hg = p.D / 32u;
+    long exp_base = long(expert) * long(2u * p.inter);
+    long row_g = exp_base + long(2u * j);
+    long row_u = row_g + 1L;
+
+    device const uint2* wg2 = reinterpret_cast<device const uint2*>(w13_u8 + row_g * q_D);
+    device const uint2* wu2 = reinterpret_cast<device const uint2*>(w13_u8 + row_u * q_D);
+    device const half* sg = w13_scale + row_g * g_D;
+    device const half* mg = w13_min + row_g * g_D;
+    device const half* su = w13_scale + row_u * g_D;
+    device const half* mu = w13_min + row_u * g_D;
+    device const bfloat4* xr4 = reinterpret_cast<device const bfloat4*>(x + long(t) * long(p.D));
+
+    float acc_g = 0.0f;
+    float acc_u = 0.0f;
+    for (uint hg = lane; hg < n_hg; hg += 32u) {
+        uint grp = hg >> 1;
+        float scg = float(sg[grp]), mng = float(mg[grp]);
+        float scu = float(su[grp]), mnu = float(mu[grp]);
+        uint2 bg = wg2[hg];
+        uint2 bu = wu2[hg];
+        float qg_x = 0.0f, qu_x = 0.0f, sx = 0.0f;
+        for (uint h = 0u; h < 2u; ++h) {
+            uint pg = (h == 0u) ? bg.x : bg.y;
+            uint pu = (h == 0u) ? bu.x : bu.y;
+            for (uint q = 0u; q < 4u; ++q) {
+                float4 xv = float4(xr4[hg * 8u + h * 4u + q]);
+                uint bgb = (pg >> (q * 8u)) & 0xFFu;
+                uint bub = (pu >> (q * 8u)) & 0xFFu;
+                float4 fg = float4(float(bgb & 3u), float((bgb >> 2) & 3u), float((bgb >> 4) & 3u), float((bgb >> 6) & 3u));
+                float4 fu = float4(float(bub & 3u), float((bub >> 2) & 3u), float((bub >> 4) & 3u), float((bub >> 6) & 3u));
+                qg_x += dot(fg, xv);
+                qu_x += dot(fu, xv);
+                sx += (xv.x + xv.y + xv.z + xv.w);
+            }
+        }
+        acc_g = fma(qg_x, scg, fma(sx, mng, acc_g));
+        acc_u = fma(qu_x, scu, fma(sx, mnu, acc_u));
+    }
+    acc_g = simd_sum(acc_g);
+    acc_u = simd_sum(acc_u);
+    if (lane == 0u) {
+        float sig = 1.0f / (1.0f + exp(-acc_g));
+        float gc = safe_tanh(acc_g / p.gate_cap) * p.gate_cap;
+        float uc = safe_tanh(acc_u / p.up_cap) * p.up_cap;
+        act_out[long(tk) * long(p.inter) + long(j)] = float(bfloat((gc * sig * uc) * gamma));
+    }
+}
+
+kernel void moe_q2_w2_kernel(
+    device const float* act_in     [[buffer(0)]],
+    device const int* topk_ids     [[buffer(1)]],
+    device const uchar* w2_u8      [[buffer(2)]],
+    device const half* w2_scale    [[buffer(3)]],
+    device const half* w2_min      [[buffer(4)]],
+    device bfloat* out             [[buffer(5)]],
+    constant MoeParams& p          [[buffer(6)]],
+    uint2 tgid                     [[threadgroup_position_in_grid]],
+    uint sg_id                     [[simdgroup_index_in_threadgroup]],
+    uint lane                      [[thread_index_in_simdgroup]])
+{
+    uint t = tgid.y;
+    uint d = tgid.x * 4u + sg_id;
+    if (d >= p.D) return;
+
+    long q_I = long(p.inter / 4u);
+    long g_I = long(p.inter / 64u);
+    uint n_hg = p.inter / 32u;
+
+    float total = 0.0f;
+    for (uint k = 0u; k < p.K; ++k) {
+        uint tk = t * p.K + k;
+        int expert = topk_ids[tk];
+        long row_idx = long(expert) * long(p.D) + long(d);
+        device const uint2* w2_2 = reinterpret_cast<device const uint2*>(w2_u8 + row_idx * q_I);
+        device const half* s2r = w2_scale + row_idx * g_I;
+        device const half* m2r = w2_min + row_idx * g_I;
+        device const float4* ar4 = reinterpret_cast<device const float4*>(act_in + long(tk) * long(p.inter));
+
+        float acc = 0.0f;
+        for (uint hg = lane; hg < n_hg; hg += 32u) {
+            uint grp = hg >> 1;
+            float sc = float(s2r[grp]), mn = float(m2r[grp]);
+            uint2 bw = w2_2[hg];
+            float qa = 0.0f, sa = 0.0f;
+            for (uint h = 0u; h < 2u; ++h) {
+                uint pw = (h == 0u) ? bw.x : bw.y;
+                for (uint q = 0u; q < 4u; ++q) {
+                    float4 av = ar4[hg * 8u + h * 4u + q];
+                    uint b = (pw >> (q * 8u)) & 0xFFu;
+                    float4 fw = float4(float(b & 3u), float((b >> 2) & 3u), float((b >> 4) & 3u), float((b >> 6) & 3u));
+                    qa += dot(fw, av);
+                    sa += (av.x + av.y + av.z + av.w);
+                }
+            }
+            acc = fma(qa, sc, fma(sa, mn, acc));
+        }
+        acc = simd_sum(acc);
+        if (lane == 0u) total += acc;
+    }
+    if (lane == 0u) out[long(t) * long(p.D) + long(d)] = bfloat(total);
+}
+
+kernel void moe_q2_w13_dedup_kernel(
+    device const bfloat* x         [[buffer(0)]],
+    device const float* topk_wts   [[buffer(1)]],
+    device const uint* offsets     [[buffer(2)]],
+    device const uint* sorted_tk   [[buffer(3)]],
+    device const uchar* w13_u8     [[buffer(4)]],
+    device const half* w13_scale   [[buffer(5)]],
+    device const half* w13_min     [[buffer(6)]],
+    device float* act_out          [[buffer(7)]],
+    constant MoeParams& p          [[buffer(8)]],
+    uint2 tgid                     [[threadgroup_position_in_grid]],
+    uint sg_id                     [[simdgroup_index_in_threadgroup]],
+    uint lane                      [[thread_index_in_simdgroup]])
+{
+    uint expert = tgid.y;
+    uint j = tgid.x * 4u + sg_id;
+    if (j >= p.inter) return;
+    uint s0 = offsets[expert];
+    uint s1 = offsets[expert + 1u];
+    if (s0 >= s1) return;
+
+    long q_D = long(p.D / 4u);
+    long g_D = long(p.D / 64u);
+    uint n_hg = p.D / 32u;
+    long exp_base = long(expert) * long(2u * p.inter);
+    long row_g = exp_base + long(2u * j);
+    long row_u = row_g + 1L;
+
+    device const uint2* wg2 = reinterpret_cast<device const uint2*>(w13_u8 + row_g * q_D);
+    device const uint2* wu2 = reinterpret_cast<device const uint2*>(w13_u8 + row_u * q_D);
+    device const half* sg = w13_scale + row_g * g_D;
+    device const half* mg = w13_min + row_g * g_D;
+    device const half* su = w13_scale + row_u * g_D;
+    device const half* mu = w13_min + row_u * g_D;
+
+    for (uint idx = s0; idx < s1; idx += 4u) {
+        uint n = min(4u, s1 - idx);
+        uint tk0 = sorted_tk[idx];
+        uint tk1 = (n > 1u) ? sorted_tk[idx + 1u] : tk0;
+        uint tk2 = (n > 2u) ? sorted_tk[idx + 2u] : tk0;
+        uint tk3 = (n > 3u) ? sorted_tk[idx + 3u] : tk0;
+        device const bfloat4* x0 = reinterpret_cast<device const bfloat4*>(x + long(tk0 / p.K) * long(p.D));
+        device const bfloat4* x1 = reinterpret_cast<device const bfloat4*>(x + long(tk1 / p.K) * long(p.D));
+        device const bfloat4* x2 = reinterpret_cast<device const bfloat4*>(x + long(tk2 / p.K) * long(p.D));
+        device const bfloat4* x3 = reinterpret_cast<device const bfloat4*>(x + long(tk3 / p.K) * long(p.D));
+
+        float ag0 = 0.0f, ag1 = 0.0f, ag2 = 0.0f, ag3 = 0.0f;
+        float au0 = 0.0f, au1 = 0.0f, au2 = 0.0f, au3 = 0.0f;
+        for (uint hg = lane; hg < n_hg; hg += 32u) {
+            uint grp = hg >> 1;
+            float scg = float(sg[grp]), mng = float(mg[grp]);
+            float scu = float(su[grp]), mnu = float(mu[grp]);
+            uint2 bg = wg2[hg];
+            uint2 bu = wu2[hg];
+            float qg0 = 0.0f, qg1 = 0.0f, qg2 = 0.0f, qg3 = 0.0f;
+            float qu0 = 0.0f, qu1 = 0.0f, qu2 = 0.0f, qu3 = 0.0f;
+            float sx0 = 0.0f, sx1 = 0.0f, sx2 = 0.0f, sx3 = 0.0f;
+            for (uint h = 0u; h < 2u; ++h) {
+                uint pg = (h == 0u) ? bg.x : bg.y;
+                uint pu = (h == 0u) ? bu.x : bu.y;
+                for (uint q = 0u; q < 4u; ++q) {
+                    uint off = hg * 8u + h * 4u + q;
+                    uint bgb = (pg >> (q * 8u)) & 0xFFu;
+                    uint bub = (pu >> (q * 8u)) & 0xFFu;
+                    float4 fg = float4(float(bgb & 3u), float((bgb >> 2) & 3u), float((bgb >> 4) & 3u), float((bgb >> 6) & 3u));
+                    float4 fu = float4(float(bub & 3u), float((bub >> 2) & 3u), float((bub >> 4) & 3u), float((bub >> 6) & 3u));
+                    float4 v0 = float4(x0[off]);
+                    qg0 += dot(fg, v0); qu0 += dot(fu, v0); sx0 += (v0.x + v0.y + v0.z + v0.w);
+                    if (n > 1u) { float4 v1 = float4(x1[off]); qg1 += dot(fg, v1); qu1 += dot(fu, v1); sx1 += (v1.x + v1.y + v1.z + v1.w); }
+                    if (n > 2u) { float4 v2 = float4(x2[off]); qg2 += dot(fg, v2); qu2 += dot(fu, v2); sx2 += (v2.x + v2.y + v2.z + v2.w); }
+                    if (n > 3u) { float4 v3 = float4(x3[off]); qg3 += dot(fg, v3); qu3 += dot(fu, v3); sx3 += (v3.x + v3.y + v3.z + v3.w); }
+                }
+            }
+            ag0 = fma(qg0, scg, fma(sx0, mng, ag0)); au0 = fma(qu0, scu, fma(sx0, mnu, au0));
+            if (n > 1u) { ag1 = fma(qg1, scg, fma(sx1, mng, ag1)); au1 = fma(qu1, scu, fma(sx1, mnu, au1)); }
+            if (n > 2u) { ag2 = fma(qg2, scg, fma(sx2, mng, ag2)); au2 = fma(qu2, scu, fma(sx2, mnu, au2)); }
+            if (n > 3u) { ag3 = fma(qg3, scg, fma(sx3, mng, ag3)); au3 = fma(qu3, scu, fma(sx3, mnu, au3)); }
+        }
+        ag0 = simd_sum(ag0); au0 = simd_sum(au0);
+        if (n > 1u) { ag1 = simd_sum(ag1); au1 = simd_sum(au1); }
+        if (n > 2u) { ag2 = simd_sum(ag2); au2 = simd_sum(au2); }
+        if (n > 3u) { ag3 = simd_sum(ag3); au3 = simd_sum(au3); }
+        if (lane == 0u) {
+            uint tks[4] = {tk0, tk1, tk2, tk3};
+            float gs[4] = {ag0, ag1, ag2, ag3};
+            float us[4] = {au0, au1, au2, au3};
+            for (uint qi = 0u; qi < n; ++qi) {
+                float sig = 1.0f / (1.0f + exp(-gs[qi]));
+                float gc = safe_tanh(gs[qi] / p.gate_cap) * p.gate_cap;
+                float uc = safe_tanh(us[qi] / p.up_cap) * p.up_cap;
+                act_out[long(tks[qi]) * long(p.inter) + long(j)] = float(bfloat((gc * sig * uc) * topk_wts[tks[qi]]));
+            }
+        }
+    }
+}
+
+kernel void moe_q2_w2_dedup_kernel(
+    device const float* act_in     [[buffer(0)]],
+    device const uint* offsets     [[buffer(1)]],
+    device const uint* sorted_tk   [[buffer(2)]],
+    device const uchar* w2_u8      [[buffer(3)]],
+    device const half* w2_scale    [[buffer(4)]],
+    device const half* w2_min      [[buffer(5)]],
+    device bfloat* w2_out          [[buffer(6)]],
+    constant MoeParams& p          [[buffer(7)]],
+    uint2 tgid                     [[threadgroup_position_in_grid]],
+    uint sg_id                     [[simdgroup_index_in_threadgroup]],
+    uint lane                      [[thread_index_in_simdgroup]])
+{
+    uint expert = tgid.y;
+    uint d = tgid.x * 4u + sg_id;
+    if (d >= p.D) return;
+    uint s0 = offsets[expert];
+    uint s1 = offsets[expert + 1u];
+    if (s0 >= s1) return;
+
+    long q_I = long(p.inter / 4u);
+    long g_I = long(p.inter / 64u);
+    uint n_hg = p.inter / 32u;
+    long row_idx = long(expert) * long(p.D) + long(d);
+    device const uint2* w2_2 = reinterpret_cast<device const uint2*>(w2_u8 + row_idx * q_I);
+    device const half* s2r = w2_scale + row_idx * g_I;
+    device const half* m2r = w2_min + row_idx * g_I;
+
+    for (uint idx = s0; idx < s1; idx += 4u) {
+        uint n = min(4u, s1 - idx);
+        uint tk0 = sorted_tk[idx];
+        uint tk1 = (n > 1u) ? sorted_tk[idx + 1u] : tk0;
+        uint tk2 = (n > 2u) ? sorted_tk[idx + 2u] : tk0;
+        uint tk3 = (n > 3u) ? sorted_tk[idx + 3u] : tk0;
+        device const float4* a0 = reinterpret_cast<device const float4*>(act_in + long(tk0) * long(p.inter));
+        device const float4* a1 = reinterpret_cast<device const float4*>(act_in + long(tk1) * long(p.inter));
+        device const float4* a2 = reinterpret_cast<device const float4*>(act_in + long(tk2) * long(p.inter));
+        device const float4* a3 = reinterpret_cast<device const float4*>(act_in + long(tk3) * long(p.inter));
+
+        float r0 = 0.0f, r1 = 0.0f, r2 = 0.0f, r3 = 0.0f;
+        for (uint hg = lane; hg < n_hg; hg += 32u) {
+            uint grp = hg >> 1;
+            float sc = float(s2r[grp]), mn = float(m2r[grp]);
+            uint2 bw = w2_2[hg];
+            float q0 = 0.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;
+            float s0v = 0.0f, s1v = 0.0f, s2v = 0.0f, s3v = 0.0f;
+            for (uint h = 0u; h < 2u; ++h) {
+                uint pw = (h == 0u) ? bw.x : bw.y;
+                for (uint q = 0u; q < 4u; ++q) {
+                    uint off = hg * 8u + h * 4u + q;
+                    uint b = (pw >> (q * 8u)) & 0xFFu;
+                    float4 fw = float4(float(b & 3u), float((b >> 2) & 3u), float((b >> 4) & 3u), float((b >> 6) & 3u));
+                    float4 v0 = a0[off]; q0 += dot(fw, v0); s0v += (v0.x + v0.y + v0.z + v0.w);
+                    if (n > 1u) { float4 v1 = a1[off]; q1 += dot(fw, v1); s1v += (v1.x + v1.y + v1.z + v1.w); }
+                    if (n > 2u) { float4 v2 = a2[off]; q2 += dot(fw, v2); s2v += (v2.x + v2.y + v2.z + v2.w); }
+                    if (n > 3u) { float4 v3 = a3[off]; q3 += dot(fw, v3); s3v += (v3.x + v3.y + v3.z + v3.w); }
+                }
+            }
+            r0 = fma(q0, sc, fma(s0v, mn, r0));
+            if (n > 1u) r1 = fma(q1, sc, fma(s1v, mn, r1));
+            if (n > 2u) r2 = fma(q2, sc, fma(s2v, mn, r2));
+            if (n > 3u) r3 = fma(q3, sc, fma(s3v, mn, r3));
+        }
+        r0 = simd_sum(r0);
+        if (n > 1u) r1 = simd_sum(r1);
+        if (n > 2u) r2 = simd_sum(r2);
+        if (n > 3u) r3 = simd_sum(r3);
+        if (lane == 0u) {
+            w2_out[long(tk0) * long(p.D) + long(d)] = bfloat(r0);
+            if (n > 1u) w2_out[long(tk1) * long(p.D) + long(d)] = bfloat(r1);
+            if (n > 2u) w2_out[long(tk2) * long(p.D) + long(d)] = bfloat(r2);
+            if (n > 3u) w2_out[long(tk3) * long(p.D) + long(d)] = bfloat(r3);
+        }
+    }
+}
+
