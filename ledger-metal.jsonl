@@ -1,0 +1,1 @@
+{"run_id":"m00-hw-probe","timestamp":"2026-11-24T10:25:50Z","device":"Apple M5 Max","gpu_cores":40,"ram_gib":128,"recommended_ws_gib":107.52,"bw_copy_gbs":477.17,"bw_read_gbs":465.69,"fp16_mps_tflops_8192":59.68,"bf16_sg_untiled_tflops_4096":12.82,"verdict":"locked","notes":"Baseline M5 Max hardware ceilings established; MPSMatrixMultiplication does not support BF16"}
