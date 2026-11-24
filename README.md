@@ -7,7 +7,7 @@
 </h3>
 
 <p align="center">
-  <strong>Zero Python · Zero PyTorch · Zero MLX · Native CUDA &amp; Apple Metal · 1.18s Cold Boot · DFlash 2 · 1.11M Live KV Tokens</strong>
+  <strong>Native CUDA &amp; Apple Metal · 1.18s Cold Boot · DFlash 2 · 1.11M Live KV Tokens</strong>
 </p>
 
 ---
