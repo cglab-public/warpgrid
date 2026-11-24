@@ -15,3 +15,4 @@
 | Run | Story / Lever | Measured Result | % of Ceiling | Verdict |
 |---|---|---|---:|---|
 | `m00-hw-probe` | Story 1: M5 Max hardware probe (`bench_hw/hw_probe_metal.mm`) | 477.17 GB/s copy, 465.69 GB/s read, 59.68 TFLOPS FP16, 12.82 TFLOPS untiled BF16 | — | **Locked** |
+| `m01-baseline` | Story 3: Metal v1 full 48-visit forward (`MTLResourceStorageModeShared`, `-fno-fast-math`) | Load 1.35 s; Canary `323` PASS; Tool `get_weather` PASS; SSE **33.17** code / **33.31** prose tok/s (TTFT 211 ms) | 38.7% (BF16) | **Baseline** |

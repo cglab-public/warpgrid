@@ -18,7 +18,7 @@ OBJCXXFLAGS += -DWARPGRID_METAL_PRECOMPILED
 METAL_EMBED_HDR := src/metal/kernels_metallib_embed.hpp
 
 src/metal/kernels.air: src/metal/kernels.metal
-	xcrun -sdk macosx metal -std=metal3.1 -O2 -c src/metal/kernels.metal -o src/metal/kernels.air
+	xcrun -sdk macosx metal -std=metal3.1 -O2 -fno-fast-math -c src/metal/kernels.metal -o src/metal/kernels.air
 
 src/metal/kernels.metallib: src/metal/kernels.air
 	xcrun -sdk macosx metallib src/metal/kernels.air -o src/metal/kernels.metallib
@@ -44,11 +44,15 @@ $(TARGET): src/main.o src/metal/model_metal.o
 tests/test_host: tests/test_host.cpp src/config.hpp src/json.hpp src/safetensors.hpp src/tokenizer.hpp
 	$(CXX) $(CXXFLAGS) tests/test_host.cpp -o tests/test_host
 
-test: tests/test_host
+tests/test_metal_kernels: tests/test_metal_kernels.mm $(METAL_EMBED_HDR)
+	$(CXX) $(OBJCXXFLAGS) tests/test_metal_kernels.mm -o tests/test_metal_kernels $(LDFLAGS)
+
+test: tests/test_host tests/test_metal_kernels
 	./tests/test_host
+	./tests/test_metal_kernels
 
 clean:
-	rm -f $(TARGET) src/main.o src/metal/model_metal.o src/metal/kernels.air src/metal/kernels.metallib src/metal/kernels_metallib_embed.hpp src/metal/kernels_source_embed.hpp tests/test_host
+	rm -f $(TARGET) src/main.o src/metal/model_metal.o src/metal/kernels.air src/metal/kernels.metallib src/metal/kernels_metallib_embed.hpp src/metal/kernels_source_embed.hpp tests/test_host tests/test_metal_kernels
 
 else
 NVCC ?= /usr/local/cuda/bin/nvcc
