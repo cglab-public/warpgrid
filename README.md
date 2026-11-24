@@ -7,7 +7,7 @@
 </h3>
 
 <p align="center">
-  <strong>Zero Python · Zero PyTorch · 3.8s Cold Boot · 1.11M Live KV Tokens · Beats vLLM</strong>
+  <strong>Zero Python · Zero PyTorch · Zero MLX · Native CUDA &amp; Apple Metal · 1.18s Cold Boot · DFlash 2 · 1.11M Live KV Tokens</strong>
 </p>
 
 ---
@@ -85,8 +85,11 @@ Measured end-to-end over the live OpenAI-compatible HTTP/SSE server (`./warpgrid
 - **Per-`(pos, head)` FP8 E4M3 Global KV Cache:** Cuts `8 × 136K` live KV memory from `46.5 → 30.03 GiB` (**−16.5 GiB saved**).
 - **GQA=3 Shared-KV + Shared-T Split-K Decode Attention:** Cooperatively loads `BK=32` FP8 KV tiles into SMEM once across all `T` verify warps × 3 GQA heads — cutting 132K decode KV DRAM traffic by **24×** (`24.1 tok/s` at 132K, `65.2 tok/s` at 14.5K).
 - **WMMA BF16 Tensor Core FlashAttention:** Custom GQA=3 `BK=64` Tensor Core prefill with exact relative-position logits, attention sinks, and sigmoid output gating.
-- **Full-Step CUDA Graphs:** Captured per-`T` (`1..8`) single-slot verify, per-`B` (`1..8`) parallel decode, batched `B=2` speculative verify, and graphed drafting.
-- **Exact Prefix Caching:** Per-slot end-of-prefill snapshots (local SWA ring + conv states) delivering **9.4×–246×** warm TTFT speedups and reporting `usage.prompt_tokens_details.cached_tokens`.
+- **Native DFlash 2 Block-Diffusion Drafter (CUDA & Metal):** Full 5-layer `incoai/Inkling-2-Mini-DFlash2` drafter (`--dflash2`) with 2-tap `GroupedDynamicCausalConv`, bidirectional block + SWA=2048 attention, W8A16 FP8 projections, top-16 candidate path selector, and 100% CUDA-graph capture on Blackwell (**+36% to +79%** vs DSpark; **116.5 tok/s CLI / 58.2 tok/s prose SSE** on M5 Max).
+- **2-Row/SIMDgroup W8A16 FP8 & Deduplicated Small-Batch MoE (Apple Metal):** Hits **94%** of M5 Max's `465.69 GB/s` DRAM bandwidth on the 200K LM head (`1.05 ms`), with grouped `simdgroup_matrix` MoE prefill, FlashAttention-2 FP8 prefill, Split-K FP8 decode, and runtime MSL fallback for Macs without Xcode.
+- **Compact `Q2_G64` (2.5 bpw) Native MoE Quantizer (`scripts/quantize_q2.py`):** MSE-optimal asymmetric group-64 2-bit MoE weights (`L0–L1` NVFP4 + `L2–L23` `Q2_G64`) enabling native `Inkling-2-Mini` + DFlash 2 inference on **16 GB Apple M4 Mac mini** at **21.69 raw / 26.70 DFlash 2 tok/s** (**+35% / +66%** vs `llama.cpp` `IQ2_XXS`).
+- **Full-Step CUDA Graphs:** Captured per-`T` (`1..8`) single-slot verify, per-`B` (`1..8`) parallel decode, batched `B=2` speculative verify, and graphed DSpark / DFlash 2 drafting.
+- **Exact Prefix Caching:** Per-slot end-of-prefill snapshots (local SWA ring + conv states) delivering **9.4×–656.9×** warm TTFT speedups and reporting `usage.prompt_tokens_details.cached_tokens`.
 
 ---
 
@@ -106,14 +109,21 @@ This builds a single standalone binary: `./warpgrid` (and runs the portable C++2
 ### 2. Serve (OpenAI-Compatible API)
 
 ```bash
+# Serve with DFlash 2 speculative drafting (recommended on both CUDA & Apple Metal)
 ./warpgrid \
   --model /path/to/thinkingmachines/Inkling-2-Mini \
+  --dflash2 /path/to/incoai/Inkling-2-Mini-DFlash2 \
+  --draft-k 6 \
   --port 8888 \
   --max-slots 8 \
   --max-seq-len 139264 \
-  --max-chunk 4096 \
-  --draft-k 7 \
-  --draft-vocab-file ./draft_vocab_32k.bin
+  --max-chunk 4096
+
+# Optional: quantize MoE layers to compact 2.5-bpw Q2_G64 for 16 GB Apple Silicon Macs
+uv run --with numpy python3 scripts/quantize_q2.py \
+  --src /path/to/thinkingmachines/Inkling-2-Mini \
+  --dst /path/to/Inkling-2-Mini-Q2 \
+  --keep-nvfp4-layers 0,1
 ```
 
 Endpoints:
@@ -125,16 +135,18 @@ Endpoints:
 
 | Flag | Default | Description |
 |---|---:|---|
-| `--model <dir>` | *(required)* | Hugging Face model snapshot directory |
+| `--model <dir>` | *(required)* | Hugging Face model snapshot directory (NVFP4/MXFP8 or `Q2_G64`) |
 | `--served-model-name <name>` | `Inkling-2-Mini` | Advertised model ID |
 | `--port <int>` | `8888` | HTTP listen port |
 | `--max-slots <int>` | `8` | Max concurrent continuous-batching slots (`1..8`) |
 | `--max-seq-len <int>` | `32768` | Max context length per slot (`139264` for ~136K/slot) |
 | `--max-chunk <int>` | `512` | Max prefill chunk size (`4096` recommended) |
-| `--draft-k <int>` | `0` | Max speculative draft tokens (`1..7`; `7` recommended) |
-| `--draft-vocab-file <path>` | *(empty)* | Optional pruned frequency-ranked draft vocab binary |
+| `--dflash2 <dir>` | *(empty)* | Enable native DFlash 2 drafter (`incoai/Inkling-2-Mini-DFlash2`) |
+| `--draft-k <int>` | `0` | Max speculative draft tokens (`1..7`; `6` on Metal, `7` on CUDA) |
+| `--draft-vocab-file <path>` | *(empty)* | Optional pruned frequency-ranked draft vocab binary (DSpark & CUDA DFlash 2) |
 | `--moe-group-thresh <int>` | `64` | Token threshold `T` for grouped `cuBLASLt` NVFP4 MoE |
 | `--bench` / `--bench-tokens <N>` | `false` / `128` | Run standalone single-request decode benchmark |
+| `--prompt <text>` | *(math canary)* | Custom prompt for `--bench` mode |
 | `--bench-prefill <N>` | `0` | Run synthetic `N`-token prefill benchmark |
 | `--profile` / `--no-graph` | `false` | Per-stage GPU timing breakdown |
 
@@ -142,9 +154,11 @@ Endpoints:
 
 ## Roadmap
 
-- **Apple Metal Backend (`metal-cpp`):** Clean backend abstraction so the existing portable C++20 host layer (`server.hpp`, `tokenizer.hpp`, `safetensors.hpp`, `json.hpp`) runs natively on Apple Silicon alongside CUDA.
+- ~~**Apple Metal Backend:**~~ Shipped (`src/metal/`, zero-Python/zero-MLX, M3/M4/M5 + 16 GB `Q2_G64`).
+- ~~**DFlash 2 Block-Diffusion Speculative Drafting:**~~ Shipped on both Apple Metal and NVIDIA Blackwell CUDA.
 - **Multi-Model Support:** Generalize beyond `Inkling-2-Mini` to additional NVFP4 / MoE / dense Transformer families.
 - **Paged Radix Prefix Cache & Chunked Prefill Interleaving:** Cross-slot shared system prompts and zero-stall decode during 100K+ incoming prefills.
+- **Domain-Specialized Inkling-2-Mini Fine-Tuning:** Train Inkling-2-Mini specifically for CUDA/Metal kernel engineering, low-bit quantization, and high-throughput LLM serving.
 
 ---
 
