@@ -1,0 +1,39 @@
+{
+  "name": "warpgrid",
+  "version": "r23-warpgrid-v1",
+  "hardware": "NVIDIA DGX Spark (GB10, sm_121a, 121.69 GiB unified LPDDR5X, 222.3 GB/s measured, 195.6 TFLOPS NVFP4)",
+  "model": "thinkingmachines/Inkling-2-Mini (rev ed40e7da)",
+  "command": "./warpgrid --model /home/danp/.cache/huggingface/hub/models--thinkingmachines--Inkling-2-Mini/snapshots/ed40e7da625f594fc9c4990f5f66be24873c22d7 --port 8888 --max-slots 8 --max-seq-len 139264 --max-chunk 4096 --draft-k 7 --draft-vocab-file /home/danp/warpgrid/draft_vocab_32k.bin",
+  "verified_metrics": {
+    "load_s": 3.87,
+    "capacity": "8 slots x 139,264 tokens (1.11M live KV tokens)",
+    "kv_cache_gib": 30.03,
+    "c1_code_median_tok_s": 58.84,
+    "c1_code_peak_tok_s": 62.82,
+    "c1_prose_median_tok_s": 44.20,
+    "c1_prose_peak_tok_s": 51.82,
+    "c1_ladder_user_tok_s": 65.78,
+    "c2_user_tok_s": 41.51,
+    "c2_agg_tok_s": 68.86,
+    "c4_user_tok_s": 23.86,
+    "c4_agg_tok_s": 84.85,
+    "c6_user_tok_s": 18.69,
+    "c6_agg_tok_s": 97.94,
+    "c8_user_tok_s": 16.07,
+    "c8_agg_tok_s": 110.40,
+    "prefill_14k_tok_s": 1311.3,
+    "decode_14k_tok_s": 65.20,
+    "ctx_132k_needles": "3/3 PASS",
+    "ctx_132k_prefill_tok_s": 513.3,
+    "ctx_132k_decode_tok_s": 24.1,
+    "ctx_132k_warm_ttft_ms": 1045.8,
+    "gates": {
+      "health": "PASS",
+      "models": "PASS",
+      "canary_323": "PASS",
+      "tool_call_get_weather": "PASS",
+      "needle_14k": "3/3 PASS",
+      "needle_132k": "3/3 PASS"
+    }
+  }
+}

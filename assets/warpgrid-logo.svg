@@ -1,0 +1,113 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 360" width="960" height="360">
+  <defs>
+    <!-- Deep obsidian background gradient -->
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0B0F1A"/>
+      <stop offset="55%" stop-color="#0D1322"/>
+      <stop offset="100%" stop-color="#090D16"/>
+    </linearGradient>
+
+    <!-- Core plasma radial glow -->
+    <radialGradient id="coreGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="1"/>
+      <stop offset="18%" stop-color="#67E8F9" stop-opacity="0.92"/>
+      <stop offset="45%" stop-color="#38BDF8" stop-opacity="0.38"/>
+      <stop offset="75%" stop-color="#6366F1" stop-opacity="0.12"/>
+      <stop offset="100%" stop-color="#0B0F1A" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- Grid line gradient -->
+    <linearGradient id="gridLine" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38BDF8" stop-opacity="0.22"/>
+      <stop offset="50%" stop-color="#22D3EE" stop-opacity="0.95"/>
+      <stop offset="100%" stop-color="#818CF8" stop-opacity="0.28"/>
+    </linearGradient>
+
+    <!-- Wordmark accent gradient -->
+    <linearGradient id="accentText" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#67E8F9"/>
+      <stop offset="55%" stop-color="#38BDF8"/>
+      <stop offset="100%" stop-color="#818CF8"/>
+    </linearGradient>
+
+    <!-- Subtle glow filter for core & spark -->
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="5" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <clipPath id="emblemClip">
+      <rect x="76" y="64" width="232" height="232" rx="36"/>
+    </clipPath>
+  </defs>
+
+  <!-- Card frame -->
+  <rect x="2" y="2" width="956" height="356" rx="24" fill="url(#bg)" stroke="#1E293B" stroke-width="2"/>
+
+  <!-- Subtle background ambient glow behind emblem -->
+  <circle cx="192" cy="180" r="145" fill="url(#coreGlow)" opacity="0.65"/>
+
+  <!-- Emblem container -->
+  <rect x="76" y="64" width="232" height="232" rx="36" fill="#070B14" stroke="#1E293B" stroke-width="1.75"/>
+
+  <!-- Warped 6x6 GPU Compute Grid curving inward toward core (192, 180) -->
+  <g clip-path="url(#emblemClip)" fill="none" stroke-linecap="round">
+    <!-- Horizontal warped grid lines -->
+    <path d="M 76 92  Q 192 108 308 92"  stroke="url(#gridLine)" stroke-width="1.4" opacity="0.48"/>
+    <path d="M 76 126 Q 192 146 308 126" stroke="url(#gridLine)" stroke-width="1.7" opacity="0.72"/>
+    <path d="M 76 160 Q 192 174 308 160" stroke="url(#gridLine)" stroke-width="2.1" opacity="0.95"/>
+    <path d="M 76 200 Q 192 186 308 200" stroke="url(#gridLine)" stroke-width="2.1" opacity="0.95"/>
+    <path d="M 76 234 Q 192 214 308 234" stroke="url(#gridLine)" stroke-width="1.7" opacity="0.72"/>
+    <path d="M 76 268 Q 192 252 308 268" stroke="url(#gridLine)" stroke-width="1.4" opacity="0.48"/>
+
+    <!-- Vertical warped grid lines -->
+    <path d="M 104 64 Q 120 180 104 296" stroke="url(#gridLine)" stroke-width="1.4" opacity="0.48"/>
+    <path d="M 138 64 Q 158 180 138 296" stroke="url(#gridLine)" stroke-width="1.7" opacity="0.72"/>
+    <path d="M 172 64 Q 186 180 172 296" stroke="url(#gridLine)" stroke-width="2.1" opacity="0.95"/>
+    <path d="M 212 64 Q 198 180 212 296" stroke="url(#gridLine)" stroke-width="2.1" opacity="0.95"/>
+    <path d="M 246 64 Q 226 180 246 296" stroke="url(#gridLine)" stroke-width="1.7" opacity="0.72"/>
+    <path d="M 280 64 Q 264 180 280 296" stroke="url(#gridLine)" stroke-width="1.4" opacity="0.48"/>
+
+    <!-- Inner warp field ring -->
+    <circle cx="192" cy="180" r="46" stroke="#38BDF8" stroke-width="1.5" stroke-opacity="0.55" stroke-dasharray="4 5"/>
+    <circle cx="192" cy="180" r="24" stroke="#67E8F9" stroke-width="1.75" stroke-opacity="0.85"/>
+  </g>
+
+  <!-- Central high-energy spark (4-point precision star) -->
+  <g filter="url(#glow)">
+    <circle cx="192" cy="180" r="34" fill="url(#coreGlow)"/>
+    <path d="M 192 152 L 198 174 L 220 180 L 198 186 L 192 208 L 186 186 L 164 180 L 186 174 Z"
+          fill="#E0F2FE"/>
+    <circle cx="192" cy="180" r="6" fill="#FFFFFF"/>
+  </g>
+
+  <!-- Crisp corner lattice accent dots -->
+  <g fill="#38BDF8" opacity="0.85">
+    <circle cx="110" cy="97"  r="2.2"/>
+    <circle cx="274" cy="97"  r="2.2"/>
+    <circle cx="110" cy="263" r="2.2"/>
+    <circle cx="274" cy="263" r="2.2"/>
+  </g>
+
+  <!-- Wordmark: warpgrid -->
+  <text x="364" y="198"
+        font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Inter', 'Segoe UI', Helvetica, Arial, sans-serif"
+        font-size="96"
+        letter-spacing="-3">
+    <tspan font-weight="800" fill="#F8FAFC">warp</tspan><tspan font-weight="600" fill="url(#accentText)">grid</tspan>
+  </text>
+
+  <!-- Subtle engineering subtitle -->
+  <text x="368" y="242"
+        font-family="ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, monospace"
+        font-size="14"
+        font-weight="500"
+        letter-spacing="2.4"
+        fill="#94A3B8">BARE-METAL LLM INFERENCE</text>
+
+  <!-- Minimal accent bar under subtitle -->
+  <rect x="368" y="258" width="96" height="3" rx="1.5" fill="url(#accentText)"/>
+</svg>
