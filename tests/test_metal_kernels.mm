@@ -73,6 +73,15 @@ struct MetalCtx {
 #else
         MTLCompileOptions* opts = [[MTLCompileOptions alloc] init];
         opts.languageVersion = MTLLanguageVersion3_1;
+        if (@available(macOS 15.0, *)) {
+            opts.mathMode = MTLMathModeSafe;
+            opts.mathFloatingPointFunctions = MTLMathFloatingPointFunctionsPrecise;
+        } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            opts.fastMathEnabled = NO;
+#pragma clang diagnostic pop
+        }
         NSString* src = [[NSString alloc] initWithBytes:kMetalSourceBytes
                                                  length:kMetalSourceLen
                                                encoding:NSUTF8StringEncoding];

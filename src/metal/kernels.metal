@@ -6,6 +6,10 @@ constant float kE2M1Lut[16] = {
    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
 };
 
+inline float safe_tanh(float x) {
+    return tanh(clamp(x, -20.0f, 20.0f));
+}
+
 inline float e4m3_to_f32(uchar b) {
     uint sign = (b >> 7) & 1u;
     uint exp = (b >> 3) & 0xFu;
@@ -407,7 +411,7 @@ kernel void fused_ctrl_blend_rmsnorm_kernel(
             g = fma(float(gw[r]), hr, g);
             f = fma(float(fw[r]), hr, f);
         }
-        float v = (1.0f - tanh(f)) * dest[off + long(d)] + tanh(g) * message[off + long(d)];
+        float v = (1.0f - safe_tanh(f)) * dest[off + long(d)] + safe_tanh(g) * message[off + long(d)];
         reg[k++] = v;
         sum_sq += v * v;
     }
@@ -454,7 +458,7 @@ kernel void ctrl_gf_blend_small_t_kernel(
         float f = simd_sum(fma(ff.x, h0, ff.y * h1));
         if (lane == 0u) {
             long off = long(t) * long(p.D) + long(d);
-            out_fp32[off] = (1.0f - tanh(f)) * dest[off] + tanh(g) * message[off];
+            out_fp32[off] = (1.0f - safe_tanh(f)) * dest[off] + safe_tanh(g) * message[off];
         }
     }
 }
@@ -1416,8 +1420,8 @@ kernel void moe_nvfp4_w13_kernel(
 
     if (lane == 0u) {
         float sig = 1.0f / (1.0f + exp(-acc_g));
-        float g_cap = tanh(acc_g / p.gate_cap) * p.gate_cap;
-        float u_cap = tanh(acc_u / p.up_cap) * p.up_cap;
+        float g_cap = safe_tanh(acc_g / p.gate_cap) * p.gate_cap;
+        float u_cap = safe_tanh(acc_u / p.up_cap) * p.up_cap;
         float y = (g_cap * sig * u_cap) * gamma;
         act_out[long(tk) * long(p.inter) + long(j)] = float(bfloat(y));
     }
@@ -1619,8 +1623,8 @@ kernel void moe_nvfp4_w13_grouped_kernel(
                 float g = smOut[m * 32u + 2u * jl] * gscale;
                 float u = smOut[m * 32u + 2u * jl + 1u] * gscale;
                 float sig = 1.0f / (1.0f + exp(-g));
-                float gc = tanh(g / p.gate_cap) * p.gate_cap;
-                float uc = tanh(u / p.up_cap) * p.up_cap;
+                float gc = safe_tanh(g / p.gate_cap) * p.gate_cap;
+                float uc = safe_tanh(u / p.up_cap) * p.up_cap;
                 float y = (gc * sig * uc) * topk_wts[tk];
                 act_out[long(tk) * long(p.inter) + long(j0 + jl)] = float(bfloat(y));
             }
@@ -1842,8 +1846,8 @@ kernel void moe_mxfp8_w13_grouped_kernel(
                 float g = smOut[m * 32u + 2u * jl];
                 float u = smOut[m * 32u + 2u * jl + 1u];
                 float sig = 1.0f / (1.0f + exp(-g));
-                float gc = tanh(g / p.gate_cap) * p.gate_cap;
-                float uc = tanh(u / p.up_cap) * p.up_cap;
+                float gc = safe_tanh(g / p.gate_cap) * p.gate_cap;
+                float uc = safe_tanh(u / p.up_cap) * p.up_cap;
                 float y = (gc * sig * uc) * topk_wts[tk];
                 act_out[long(tk) * long(p.inter) + long(j0 + jl)] = float(bfloat(y));
             }
@@ -2000,8 +2004,8 @@ kernel void moe_mxfp8_w13_kernel(
     acc_u = simd_sum(acc_u);
     if (lane == 0u) {
         float sig = 1.0f / (1.0f + exp(-acc_g));
-        float g_cap = tanh(acc_g / p.gate_cap) * p.gate_cap;
-        float u_cap = tanh(acc_u / p.up_cap) * p.up_cap;
+        float g_cap = safe_tanh(acc_g / p.gate_cap) * p.gate_cap;
+        float u_cap = safe_tanh(acc_u / p.up_cap) * p.up_cap;
         float y = (g_cap * sig * u_cap) * gamma;
         act_out[long(tk) * long(p.inter) + long(j)] = float(bfloat(y));
     }
@@ -2277,7 +2281,7 @@ kernel void softcap_argmax_kernel(
     int best_i = 0;
     float inv_cap = 1.0f / p.softcap;
     for (uint i = tid; i < p.vocab_size; i += tg_size) {
-        float v = tanh(logits[i] * inv_cap) * p.softcap;
+        float v = safe_tanh(logits[i] * inv_cap) * p.softcap;
         logits[i] = v;
         if (v > best_v) {
             best_v = v;
@@ -2754,9 +2758,9 @@ kernel void markov_gate_kernel(
     float o = float(bfloat(raw[2u * rank + c] + bias[2u * rank + c]));
     float st = float(state[c]);
     g = 1.0f / (1.0f + exp(-g));
-    cand = tanh(cand);
+    cand = safe_tanh(cand);
     state[c] = bfloat(g * st + (1.0f - g) * cand);
-    latent[c] = bfloat(tanh(o));
+    latent[c] = bfloat(safe_tanh(o));
 }
 
 struct MarkovArgParams {

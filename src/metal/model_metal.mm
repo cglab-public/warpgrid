@@ -1712,7 +1712,15 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
 #else
         MTLCompileOptions* opts = [[MTLCompileOptions alloc] init];
         opts.languageVersion = MTLLanguageVersion3_1;
-        opts.fastMathEnabled = NO;
+        if (@available(macOS 15.0, *)) {
+            opts.mathMode = MTLMathModeSafe;
+            opts.mathFloatingPointFunctions = MTLMathFloatingPointFunctionsPrecise;
+        } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            opts.fastMathEnabled = NO;
+#pragma clang diagnostic pop
+        }
         NSString* src = [[NSString alloc] initWithBytes:kMetalSourceBytes
                                                  length:kMetalSourceLen
                                                encoding:NSUTF8StringEncoding];

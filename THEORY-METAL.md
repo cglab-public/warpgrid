@@ -65,3 +65,23 @@ Weights on disk: `/Users/daniel/models/mtplx/Youssofal--Inkling-2-Mini-MTPLX-Opt
 - Local SWA KV cache (BF16): **160 MiB per active stream** (constant).
 - **8 concurrent slots × 139,264 tokens (1.11M live KV tokens):** ~17.7 GiB global KV + 1.25 GiB local SWA + ~21 GiB weights ≈ **~40 GiB total**, well under the 100 GiB cap (~88 GiB headroom).
 - **M4 Mac mini (16 GB) note:** Official `Inkling-2-Mini` text weights alone (~18.9 GiB) exceed a 16 GB Mac's ~10.7–12 GiB wired GPU limit; however, the Metal backend + `make test` suite targets Apple9+ (MSL 3.1) cleanly for M4/M5 parity and future ≤ 10 GB models.
+
+---
+
+## Apple M4 Mac mini (16 GB) Measured Hardware Ceilings (`ssh mini`, Story 7)
+
+Measured natively on `Daniels-Mac-mini.local` (**Apple M4**, 10 CPU cores, 16 GiB unified RAM, Apple clang 21.0.0, **no `xcrun metal` toolchain** — exercising the embedded runtime MSL source fallback):
+
+| Metric | Apple M4 (16 GB) | Apple M5 Max (128 GB) | Ratio (M4 / M5 Max) |
+|---|---:|---:|---:|
+| Recommended Max GPU Working Set | **11.84 GiB** | 107.52 GiB | 11.0% |
+| Max Single Buffer Length | **8.88 GiB** | 80.64 GiB | 11.0% |
+| Apple9 / Metal 3 / Max TG Threads | YES / YES / 1024 | YES / YES / 1024 | Identical ISA |
+| Memory Copy BW (`512 MiB`, med / peak) | **87.43 / 93.94 GB/s** | 477.17 / 494.82 GB/s | 18.3% |
+| Read-Only BW (`512 MiB`, med / peak) | **99.22 / 101.30 GB/s** | 465.69 / 471.63 GB/s | 21.3% |
+| MPS FP16 GEMM (`8192³`) | **3.48 TFLOPS** | 59.68 TFLOPS | 5.8% |
+| Custom MSL `simdgroup_matrix` BF16 (`4096³`) | **2.02 TFLOPS** | 12.82 TFLOPS | 15.8% |
+| `make test` (5 host + 9 Metal kernels) | **14/14 PASS** | **14/14 PASS** | 100% parity |
+
+- **Capacity Constraint:** With `recommendedMaxWorkingSetSize = 11.84 GiB`, `Inkling-2-Mini`'s 18.0 GiB official NVFP4/MXFP8 safetensors (~21.2 GiB with W8A16 FP8 dense copies) physically exceeds 16 GB unified RAM. Startup GPU-shape detection sets `low_mem = 1` and automatically clamps KV/slots (`1 slot × 2048`) to prevent KV over-allocation; full Inkling-2-Mini serving requires ≥ 32 GB unified RAM (M4 Pro/Max 36–128 GB), while smaller ≤ 10 GB models will run natively on 16 GB M4 at up to `99.22 GB/s` bandwidth.
+- **Portability Bug Caught on M4:** Live-testing the runtime MSL fallback without `xcrun metal` caught that macOS 15+ `MTLMathModeSafe` alone still leaves `tanh(large)` on fast transcendentals (`inf/inf = NaN`). Fixed via `safe_tanh(x) = tanh(clamp(x, -20.0f, 20.0f))` in `src/metal/kernels.metal` + `MTLMathFloatingPointFunctionsPrecise` in both `model_metal.mm` and `test_metal_kernels.mm`.
