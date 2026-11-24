@@ -168,7 +168,6 @@ Endpoints:
 - ~~**DFlash 2 Block-Diffusion Speculative Drafting:**~~ Shipped on both Apple Metal and NVIDIA Blackwell CUDA.
 - **Multi-Model Support:** Generalize beyond `Inkling-2-Mini` to additional NVFP4 / MoE / dense Transformer families.
 - **Paged Radix Prefix Cache & Chunked Prefill Interleaving:** Cross-slot shared system prompts and zero-stall decode during 100K+ incoming prefills.
-- **Domain-Specialized Inkling-2-Mini Fine-Tuning:** Train Inkling-2-Mini specifically for CUDA/Metal kernel engineering, low-bit quantization, and high-throughput LLM serving.
 
 ---
 
