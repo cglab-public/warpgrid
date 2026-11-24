@@ -7,3 +7,4 @@ bench_hw/hw_probe_metal
 tests/test_host
 tests/test_metal_kernels
 .agenfk/
+.DS_Store
