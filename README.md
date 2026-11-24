@@ -73,7 +73,7 @@ Measured end-to-end over the live OpenAI-compatible HTTP/SSE server (`./warpgrid
 | **14.5K Needle-in-a-Haystack** | — | — | — | **443.3** prefill / **53.06** decode | **3/3 exact PASS** (Split-K FP8 attn) |
 | **132K Needle-in-a-Haystack** | — | — | — | **233.6** prefill / **18.8** decode | **3/3 exact PASS**, **860.9 ms** warm (**656.9×**) |
 | **Parallel Ladder (`c=1..8`)** | — | — | — | **68.81** (`c=1`) → **74.92 agg** (`c=8`) | Batched continuous decode |
-| **Apple M4 Mac mini (16 GB, `Q2_G64`)** | 16.1 tok/s (`IQ2_XXS`) | — | — | **21.69** raw / **26.70** DFlash 2 | **+35% raw / +66% DFlash 2** vs `llama.cpp`, 16/16 tests PASS |
+| **Apple M4 Mac mini (16 GB, [`Q2_G64`](https://huggingface.co/cglab-org/Inkling-2-Mini-Q2-warpgrid))** | 16.1 tok/s (`IQ2_XXS`) | — | — | **21.69** raw / **26.70** DFlash 2 | **+35% raw / +66% DFlash 2** vs `llama.cpp`, 16/16 tests PASS |
 
 ---
 
@@ -119,7 +119,17 @@ This builds a single standalone binary: `./warpgrid` (and runs the portable C++2
   --max-seq-len 139264 \
   --max-chunk 4096
 
-# Optional: quantize MoE layers to compact 2.5-bpw Q2_G64 for 16 GB Apple Silicon Macs
+# 16 GB Apple Silicon Macs (e.g., M4 Mac mini): pull the pre-quantized Q2_G64 checkpoint
+hf download cglab-org/Inkling-2-Mini-Q2-warpgrid --local-dir ./Inkling-2-Mini-Q2
+./warpgrid \
+  --model ./Inkling-2-Mini-Q2 \
+  --dflash2 /path/to/incoai/Inkling-2-Mini-DFlash2 \
+  --draft-k 6 \
+  --max-slots 1 \
+  --max-seq-len 2048 \
+  --port 8888
+
+# Or quantize your own Q2_G64 checkpoint from official weights:
 uv run --with numpy python3 scripts/quantize_q2.py \
   --src /path/to/thinkingmachines/Inkling-2-Mini \
   --dst /path/to/Inkling-2-Mini-Q2 \
