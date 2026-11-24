@@ -28,27 +28,27 @@ Modern LLM serving frameworks like vLLM and SGLang are extraordinary pieces of s
 
 ## Reference Benchmarks (NVIDIA DGX Spark — GB10, `sm_121a`)
 
-Measured end-to-end over the live OpenAI-compatible HTTP/SSE server (`./warpgrid` serving `thinkingmachines/Inkling-2-Mini` with **8 concurrent slots × 139,264 tokens = 1.11M live KV tokens**, **30.03 GiB KV**, **57 GiB RAM free**):
+Measured end-to-end over the live OpenAI-compatible HTTP/SSE server (`./warpgrid` serving `thinkingmachines/Inkling-2-Mini` + native CUDA `DFlash 2` with **8 concurrent slots × 139,264 tokens = 1.11M live KV tokens**, **30.03 GiB KV**, **57 GiB RAM free**):
 
 ### Single-User Decode (`c=1`) vs. vLLM
 
-| Workload | vLLM | **`warpgrid`** | Delta |
+| Workload | vLLM | **`warpgrid` (CUDA + DFlash 2)** | Delta |
 |---|---:|---:|---|
-| **`c=1` Ladder (per-user)** | 59.8 tok/s (code) | **65.8 – 69.4 tok/s** | **+10% to +16%** vs vLLM |
-| **`c=1` Code Panel (med / peak)** | 59.8 tok/s | **58.8 / 69.0 tok/s** | Peak **+15.3%** vs vLLM |
-| **`c=1` Prose Panel (med / peak)** | 33.2 tok/s | **44.2 / 51.8 tok/s** | **+33% med / +56% peak** vs vLLM |
-| **`c=1` CLI DFlash 2 (`--dflash2`, `k=7`)** | — | **95.90** math / **76.66** code / **49.31** prose | **+79% / +42% / +36%** vs DSpark (`0.17 s` load, CUDA-graphed) |
-| **Cold Server Load** | ~45–60 s | **3.81 s** | **~15×** faster startup |
+| **`c=1` Ladder (per-user SSE)** | 59.8 tok/s (code) | **95.51 tok/s** | **+60%** vs vLLM |
+| **`c=1` Code Panel (med / peak SSE)** | 59.8 tok/s | **60.63 / 74.94 tok/s** | Peak **+25.3%** vs vLLM |
+| **`c=1` Prose Panel (med / peak SSE)** | 33.2 tok/s | **46.99 / 47.36 tok/s** | **+41.5% med** vs vLLM (full 200K vocab) |
+| **`c=1` CLI DFlash 2 (`--dflash2`, `k=7`)** | — | **95.90** math / **76.66** code / **49.31** prose | **+79% / +42% / +36%** vs DSpark (`0.19 s` load, CUDA-graphed) |
+| **Cold Server Load** | ~45–60 s | **3.81 s** (+0.19 s DFlash 2) | **~15×** faster startup |
 
 ### Parallel Continuous-Batching Ladder (`c = 1..8`)
 
 | Concurrency | Per-User Median | Aggregate Throughput | Median TTFT |
 |---:|---:|---:|---:|
-| **`c = 1`** *(Speculative adaptive `k=3..7`)* | **65.78 tok/s** | 59.57 tok/s | 267 ms |
-| **`c = 2`** *(Batched speculative `k=3`)* | **41.51 tok/s** | **68.86 tok/s** | 482 ms |
-| **`c = 4`** *(Continuous batching)* | **23.86 tok/s** | **84.85 tok/s** | 880 ms |
-| **`c = 6`** *(Continuous batching)* | **18.69 tok/s** | **97.94 tok/s** | 1,294 ms |
-| **`c = 8`** *(Continuous batching)* | **16.07 tok/s** | **110.40 tok/s** | 1,695 ms |
+| **`c = 1`** *(DFlash 2 `k=7`, full 200K vocab)* | **95.51 tok/s** | **87.56 tok/s** | 375 ms |
+| **`c = 2`** *(Batched DFlash 2 `k=3`)* | **46.43 tok/s** | **81.08 tok/s** | 688 ms |
+| **`c = 4`** *(Continuous batching)* | **25.05 tok/s** | **92.50 tok/s** | 1,314 ms |
+| **`c = 6`** *(Continuous batching)* | **20.04 tok/s** | **109.36 tok/s** | 1,951 ms |
+| **`c = 8`** *(Continuous batching)* | **17.45 tok/s** | **125.26 tok/s** | 2,578 ms |
 
 ### Long Context & Prefix Caching (`14.5K` & `132K` — `3/3` Exact Needles)
 

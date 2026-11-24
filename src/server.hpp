@@ -260,7 +260,8 @@ class OpenAIServer {
                     active.clear();
                     continue;
                 }
-                int cur_k = std::min(std::min(r->dyn_k, model_.draft_k), r->max_tokens - r->generated);
+                bool is_df2 = !model_.dflash2_dir.empty();
+                int cur_k = std::min(is_df2 ? model_.draft_k : std::min(r->dyn_k, model_.draft_k), r->max_tokens - r->generated);
                 if (cur_k <= 0) {
                     r->mark_done();
                     slot_used[r->slot_id] = false;
@@ -278,9 +279,10 @@ class OpenAIServer {
                     if (verify_out[j] == drafts[j]) ++acc;
                     else break;
                 }
-                // Smart adaptive k: climb to k=7 on high-locality code, step down promptly on prose/thinking
-                if (acc == cur_k && r->dyn_k < model_.draft_k) r->dyn_k++;
-                else if (acc <= cur_k - 2 && r->dyn_k > 3) r->dyn_k--;
+                if (!is_df2) {
+                    if (acc == cur_k && r->dyn_k < model_.draft_k) r->dyn_k++;
+                    else if (acc <= cur_k - 2 && r->dyn_k > 3) r->dyn_k--;
+                }
                 int emitted = acc + 1;
                 if (emitted < cur_k + 1) model_.rollback_conv_states(emitted);
                 model_.commit_dspark_context(emitted, r->pos);
