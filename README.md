@@ -109,10 +109,12 @@ This builds a single standalone binary: `./warpgrid` (and runs the portable C++2
 ### 2. Serve (OpenAI-Compatible API)
 
 ```bash
-# Serve with DFlash 2 speculative drafting (recommended on both CUDA & Apple Metal)
+# Download official weights + DFlash 2 drafter and serve (CUDA & Apple Metal)
+hf download thinkingmachines/Inkling-2-Mini --local-dir ./Inkling-2-Mini
+hf download incoai/Inkling-2-Mini-DFlash2 --local-dir ./Inkling-2-Mini-DFlash2
 ./warpgrid \
-  --model /path/to/thinkingmachines/Inkling-2-Mini \
-  --dflash2 /path/to/incoai/Inkling-2-Mini-DFlash2 \
+  --model ./Inkling-2-Mini \
+  --dflash2 ./Inkling-2-Mini-DFlash2 \
   --draft-k 6 \
   --port 8888 \
   --max-slots 8 \
@@ -121,9 +123,10 @@ This builds a single standalone binary: `./warpgrid` (and runs the portable C++2
 
 # 16 GB Apple Silicon Macs (e.g., M4 Mac mini): pull the pre-quantized Q3 hybrid checkpoint (90% HumanEval)
 hf download cglab-org/Inkling-2-Mini-Q3-warpgrid --local-dir ./Inkling-2-Mini-Q3
+hf download incoai/Inkling-2-Mini-DFlash2 --local-dir ./Inkling-2-Mini-DFlash2
 ./warpgrid \
   --model ./Inkling-2-Mini-Q3 \
-  --dflash2 /path/to/incoai/Inkling-2-Mini-DFlash2 \
+  --dflash2 ./Inkling-2-Mini-DFlash2 \
   --draft-k 6 \
   --max-slots 1 \
   --max-seq-len 2048 \
@@ -131,11 +134,11 @@ hf download cglab-org/Inkling-2-Mini-Q3-warpgrid --local-dir ./Inkling-2-Mini-Q3
 
 # Or quantize your own Q3/Q2 checkpoint from official weights:
 uv run --with numpy python3 scripts/quantize_q2.py \
-  --src /path/to/thinkingmachines/Inkling-2-Mini \
-  --dst /path/to/Inkling-2-Mini-Q3 \
+  --src ./Inkling-2-Mini \
+  --dst ./Inkling-2-Mini-Q3 \
   --keep-nvfp4-layers "" \
   --q3-layers 0,1,2,3,4,5,6,11,12,15,16,17,18,19,20,21,22,23 \
-  --imatrix /path/to/imatrix.bin \
+  --imatrix ./imatrix.bin \
   --drop-vision
 ```
 
