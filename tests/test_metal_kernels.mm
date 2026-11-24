@@ -470,6 +470,58 @@ static void test_bf16_gemm_tiled() {
     EXPECT_TRUE(max_err < 5e-2f);
 }
 
+static void test_dspark_and_verify_kernels() {
+    auto p_sg = g_ctx.pso("fp8_small_gemm_kernel");
+    auto p_ba = g_ctx.pso("batched_argmax_kernel");
+    auto p_mg = g_ctx.pso("markov_gate_kernel");
+    EXPECT_TRUE(p_sg != nil && p_ba != nil && p_mg != nil);
+
+    const uint32_t M = 4, N = 64, K = 128;
+    std::vector<uint16_t> X(M * K);
+    std::vector<uint8_t> W8(N * K, 0x38);
+    std::vector<float> Wsc(N, 1.0f);
+    for (uint32_t m = 0; m < M; ++m) {
+        for (uint32_t k = 0; k < K; ++k) {
+            X[m * K + k] = f32_to_bf16(0.1f * float(m + 1));
+        }
+    }
+    for (uint32_t n = 0; n < N; ++n) Wsc[n] = (n == 19) ? 2.0f : 0.5f;
+
+    auto bX = g_ctx.buf(X.size() * 2, X.data());
+    auto bW8 = g_ctx.buf(W8.size(), W8.data());
+    auto bWsc = g_ctx.buf(Wsc.size() * 4, Wsc.data());
+    auto bY_bf = g_ctx.buf(M * N * 2);
+    auto bY_f32 = g_ctx.buf(M * N * 4);
+    auto bOut = g_ctx.buf(M * 4);
+
+    struct GemvParams { uint32_t M; uint32_t N; uint32_t K; uint32_t out_fp32; } gp{M, N, K, 1};
+    struct BatchArgParams { uint32_t M; uint32_t vocab; } bap{M, N};
+
+    id<MTLCommandBuffer> cb = [g_ctx.q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:p_sg];
+    [enc setBuffer:bX offset:0 atIndex:0];
+    [enc setBuffer:bW8 offset:0 atIndex:1];
+    [enc setBuffer:bWsc offset:0 atIndex:2];
+    [enc setBuffer:bY_bf offset:0 atIndex:3];
+    [enc setBuffer:bY_f32 offset:0 atIndex:4];
+    [enc setBytes:&gp length:sizeof(gp) atIndex:5];
+    [enc dispatchThreadgroups:MTLSizeMake((N + 3) / 4, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+    [enc setComputePipelineState:p_ba];
+    [enc setBuffer:bY_f32 offset:0 atIndex:0];
+    [enc setBuffer:bOut offset:0 atIndex:1];
+    [enc setBytes:&bap length:sizeof(bap) atIndex:2];
+    [enc dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [enc endEncoding];
+    EXPECT_TRUE(g_ctx.run_cb(cb));
+
+    const int32_t* gout = (const int32_t*)bOut.contents;
+    for (uint32_t m = 0; m < M; ++m) {
+        EXPECT_TRUE(gout[m] == 19);
+    }
+}
+
 int main() {
     @autoreleasepool {
         if (!g_ctx.init()) {
@@ -483,6 +535,7 @@ int main() {
         run_test("test_bf16_gemv_and_softcap_argmax", test_bf16_gemv_and_softcap_argmax);
         run_test("test_w8a16_fp8_quant_and_gemv", test_w8a16_fp8_quant_and_gemv);
         run_test("test_bf16_gemm_tiled", test_bf16_gemm_tiled);
+        run_test("test_dspark_and_verify_kernels", test_dspark_and_verify_kernels);
         printf("Metal kernel tests: %d passed, %d failed\n", g_passed, g_failed);
         return g_failed == 0 ? 0 : 1;
     }

@@ -1546,3 +1546,554 @@ kernel void softcap_argmax_kernel(
         if (lane == 0u) out_token[0] = best_i;
     }
 }
+
+kernel void fp8_small_gemm_kernel(
+    device const bfloat* X   [[buffer(0)]],
+    device const uchar* W8   [[buffer(1)]],
+    device const float* Wsc  [[buffer(2)]],
+    device bfloat* Y_bf16    [[buffer(3)]],
+    device float* Y_fp32     [[buffer(4)]],
+    constant GemvParams& p   [[buffer(5)]],
+    uint tgid                [[threadgroup_position_in_grid]],
+    uint sg_id               [[simdgroup_index_in_threadgroup]],
+    uint lane                [[thread_index_in_simdgroup]])
+{
+    uint n = tgid * 4u + sg_id;
+    if (n >= p.N) return;
+
+    device const uchar4* wr4 = reinterpret_cast<device const uchar4*>(W8 + long(n) * long(p.K));
+    uint k4 = p.K >> 2;
+    device const bfloat4* x0 = reinterpret_cast<device const bfloat4*>(X + 0L * long(p.K));
+    device const bfloat4* x1 = reinterpret_cast<device const bfloat4*>(X + 1L * long(p.K));
+    device const bfloat4* x2 = reinterpret_cast<device const bfloat4*>(X + 2L * long(p.K));
+    device const bfloat4* x3 = reinterpret_cast<device const bfloat4*>(X + 3L * long(p.K));
+    device const bfloat4* x4 = reinterpret_cast<device const bfloat4*>(X + 4L * long(p.K));
+    device const bfloat4* x5 = reinterpret_cast<device const bfloat4*>(X + 5L * long(p.K));
+    device const bfloat4* x6 = reinterpret_cast<device const bfloat4*>(X + 6L * long(p.K));
+    device const bfloat4* x7 = reinterpret_cast<device const bfloat4*>(X + 7L * long(p.K));
+
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    float a4 = 0.0f, a5 = 0.0f, a6 = 0.0f, a7 = 0.0f;
+    uint M = p.M;
+
+    for (uint i = lane; i < k4; i += 32u) {
+        uchar4 wv = wr4[i];
+        float w0 = e4m3_to_f32(wv.x);
+        float w1 = e4m3_to_f32(wv.y);
+        float w2 = e4m3_to_f32(wv.z);
+        float w3 = e4m3_to_f32(wv.w);
+        { float4 xv = float4(x0[i]); a0 = fma(w0, xv.x, fma(w1, xv.y, fma(w2, xv.z, fma(w3, xv.w, a0)))); }
+        if (M > 1u) { float4 xv = float4(x1[i]); a1 = fma(w0, xv.x, fma(w1, xv.y, fma(w2, xv.z, fma(w3, xv.w, a1)))); }
+        if (M > 2u) { float4 xv = float4(x2[i]); a2 = fma(w0, xv.x, fma(w1, xv.y, fma(w2, xv.z, fma(w3, xv.w, a2)))); }
+        if (M > 3u) { float4 xv = float4(x3[i]); a3 = fma(w0, xv.x, fma(w1, xv.y, fma(w2, xv.z, fma(w3, xv.w, a3)))); }
+        if (M > 4u) { float4 xv = float4(x4[i]); a4 = fma(w0, xv.x, fma(w1, xv.y, fma(w2, xv.z, fma(w3, xv.w, a4)))); }
+        if (M > 5u) { float4 xv = float4(x5[i]); a5 = fma(w0, xv.x, fma(w1, xv.y, fma(w2, xv.z, fma(w3, xv.w, a5)))); }
+        if (M > 6u) { float4 xv = float4(x6[i]); a6 = fma(w0, xv.x, fma(w1, xv.y, fma(w2, xv.z, fma(w3, xv.w, a6)))); }
+        if (M > 7u) { float4 xv = float4(x7[i]); a7 = fma(w0, xv.x, fma(w1, xv.y, fma(w2, xv.z, fma(w3, xv.w, a7)))); }
+    }
+
+    float sc = Wsc[n];
+    float v0 = simd_sum(a0) * sc;
+    float v1 = (M > 1u) ? (simd_sum(a1) * sc) : 0.0f;
+    float v2 = (M > 2u) ? (simd_sum(a2) * sc) : 0.0f;
+    float v3 = (M > 3u) ? (simd_sum(a3) * sc) : 0.0f;
+    float v4 = (M > 4u) ? (simd_sum(a4) * sc) : 0.0f;
+    float v5 = (M > 5u) ? (simd_sum(a5) * sc) : 0.0f;
+    float v6 = (M > 6u) ? (simd_sum(a6) * sc) : 0.0f;
+    float v7 = (M > 7u) ? (simd_sum(a7) * sc) : 0.0f;
+
+    if (lane == 0u) {
+        if (p.out_fp32 != 0u) {
+            Y_fp32[0L * long(p.N) + long(n)] = v0;
+            if (M > 1u) Y_fp32[1L * long(p.N) + long(n)] = v1;
+            if (M > 2u) Y_fp32[2L * long(p.N) + long(n)] = v2;
+            if (M > 3u) Y_fp32[3L * long(p.N) + long(n)] = v3;
+            if (M > 4u) Y_fp32[4L * long(p.N) + long(n)] = v4;
+            if (M > 5u) Y_fp32[5L * long(p.N) + long(n)] = v5;
+            if (M > 6u) Y_fp32[6L * long(p.N) + long(n)] = v6;
+            if (M > 7u) Y_fp32[7L * long(p.N) + long(n)] = v7;
+        } else {
+            Y_bf16[0L * long(p.N) + long(n)] = bfloat(v0);
+            if (M > 1u) Y_bf16[1L * long(p.N) + long(n)] = bfloat(v1);
+            if (M > 2u) Y_bf16[2L * long(p.N) + long(n)] = bfloat(v2);
+            if (M > 3u) Y_bf16[3L * long(p.N) + long(n)] = bfloat(v3);
+            if (M > 4u) Y_bf16[4L * long(p.N) + long(n)] = bfloat(v4);
+            if (M > 5u) Y_bf16[5L * long(p.N) + long(n)] = bfloat(v5);
+            if (M > 6u) Y_bf16[6L * long(p.N) + long(n)] = bfloat(v6);
+            if (M > 7u) Y_bf16[7L * long(p.N) + long(n)] = bfloat(v7);
+        }
+    }
+}
+
+struct BatchArgParams {
+    uint M;
+    uint vocab_size;
+};
+
+kernel void batched_argmax_kernel(
+    device const float* logits [[buffer(0)]],
+    device int* out_tokens     [[buffer(1)]],
+    constant BatchArgParams& p [[buffer(2)]],
+    uint tgid                  [[threadgroup_position_in_grid]],
+    uint tid                   [[thread_index_in_threadgroup]],
+    uint tg_size               [[threads_per_threadgroup]])
+{
+    uint m = tgid;
+    if (m >= p.M) return;
+    device const float* row = logits + long(m) * long(p.vocab_size);
+    float best_v = -1e30f;
+    int best_i = 0;
+    for (uint i = tid; i < p.vocab_size; i += tg_size) {
+        float v = row[i];
+        if (v > best_v) {
+            best_v = v;
+            best_i = int(i);
+        }
+    }
+    threadgroup float sm_v[32];
+    threadgroup int sm_i[32];
+    uint lane = tid & 31u;
+    uint wid = tid >> 5;
+    for (uint off = 16u; off > 0u; off >>= 1) {
+        float ov = simd_shuffle_down(best_v, off);
+        int oi = simd_shuffle_down(best_i, off);
+        if (ov > best_v || (ov == best_v && oi < best_i)) {
+            best_v = ov;
+            best_i = oi;
+        }
+    }
+    if (lane == 0u) {
+        sm_v[wid] = best_v;
+        sm_i[wid] = best_i;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (wid == 0u) {
+        uint nw = (tg_size + 31u) >> 5;
+        best_v = (lane < nw) ? sm_v[lane] : -1e30f;
+        best_i = (lane < nw) ? sm_i[lane] : 0;
+        for (uint off = 16u; off > 0u; off >>= 1) {
+            float ov = simd_shuffle_down(best_v, off);
+            int oi = simd_shuffle_down(best_i, off);
+            if (ov > best_v || (ov == best_v && oi < best_i)) {
+                best_v = ov;
+                best_i = oi;
+            }
+        }
+        if (lane == 0u) out_tokens[m] = best_i;
+    }
+}
+
+struct DflareMixParams {
+    uint aux_stride;
+    uint T;
+    uint D;
+    float eps;
+};
+
+kernel void dflare_mix_rmsnorm_kernel(
+    device const bfloat* aux   [[buffer(0)]],
+    device const float* alpha  [[buffer(1)]],
+    device const bfloat* w     [[buffer(2)]],
+    device bfloat* out         [[buffer(3)]],
+    constant DflareMixParams& p [[buffer(4)]],
+    uint tgid                  [[threadgroup_position_in_grid]],
+    uint tid                   [[thread_index_in_threadgroup]],
+    uint tg_size               [[threads_per_threadgroup]])
+{
+    uint t = tgid;
+    if (t >= p.T) return;
+    float a0 = alpha[0], a1 = alpha[1], a2 = alpha[2], a3 = alpha[3];
+    float reg[12];
+    float sum_sq = 0.0f;
+    uint k = 0u;
+    for (uint d = tid; d < p.D; d += tg_size) {
+        long off = long(t) * long(p.D) + long(d);
+        float v = a0 * float(aux[0L * long(p.aux_stride) + off])
+                + a1 * float(aux[1L * long(p.aux_stride) + off])
+                + a2 * float(aux[2L * long(p.aux_stride) + off])
+                + a3 * float(aux[3L * long(p.aux_stride) + off]);
+        reg[k++] = v;
+        sum_sq += v * v;
+    }
+    threadgroup float sm[32];
+    sum_sq = tg_reduce_sum(sum_sq, tid, tg_size, sm);
+    float rstd = rsqrt(sum_sq / float(p.D) + p.eps);
+    k = 0u;
+    for (uint d = tid; d < p.D; d += tg_size) {
+        out[long(t) * long(p.D) + long(d)] = bfloat(reg[k++] * rstd * float(w[d]));
+    }
+}
+
+struct QkRopeParams {
+    uint start_pos;
+    uint T;
+    uint n_heads;
+    uint head_dim;
+    float rope_theta;
+    float eps;
+};
+
+kernel void qk_norm_rope_kernel(
+    device bfloat* x           [[buffer(0)]],
+    device const bfloat* nw    [[buffer(1)]],
+    constant QkRopeParams& p   [[buffer(2)]],
+    uint2 tgid                 [[threadgroup_position_in_grid]],
+    uint tid                   [[thread_index_in_threadgroup]])
+{
+    uint h = tgid.x;
+    uint t = tgid.y;
+    if (h >= p.n_heads || t >= p.T) return;
+    uint half_d = p.head_dim >> 1;
+    uint i = tid;
+    if (i >= half_d) return;
+
+    device bfloat* row = x + (long(t) * long(p.n_heads) + long(h)) * long(p.head_dim);
+    float x1 = float(row[i]);
+    float x2 = float(row[half_d + i]);
+
+    threadgroup float sm[32];
+    float sq = tg_reduce_sum(x1 * x1 + x2 * x2, tid, half_d, sm);
+    float inv = rsqrt(sq / float(p.head_dim) + p.eps);
+    x1 = float(bfloat(x1 * inv * float(nw[i])));
+    x2 = float(bfloat(x2 * inv * float(nw[half_d + i])));
+
+    float pos = float(p.start_pos + t);
+    float inv_freq = pow(p.rope_theta, -2.0f * float(i) / float(p.head_dim));
+    float ang = pos * inv_freq;
+    float c = cos(ang), s = sin(ang);
+    row[i] = bfloat(x1 * c - x2 * s);
+    row[half_d + i] = bfloat(x2 * c + x1 * s);
+}
+
+struct DraftWriteKvParams {
+    uint start_pos;
+    uint T;
+    uint cap;
+    uint is_local;
+    uint kv_dim;
+};
+
+kernel void draft_write_kv_kernel(
+    device const bfloat* k_in  [[buffer(0)]],
+    device const bfloat* v_in  [[buffer(1)]],
+    device bfloat* k_cache     [[buffer(2)]],
+    device bfloat* v_cache     [[buffer(3)]],
+    constant DraftWriteKvParams& p [[buffer(4)]],
+    uint2 gid                  [[thread_position_in_grid]])
+{
+    uint d = gid.x;
+    uint t = gid.y;
+    if (t >= p.T || d >= p.kv_dim) return;
+    uint pos = p.start_pos + t;
+    uint slot = (p.is_local != 0u) ? (pos % p.cap) : pos;
+    k_cache[long(slot) * long(p.kv_dim) + long(d)] = k_in[long(t) * long(p.kv_dim) + long(d)];
+    v_cache[long(slot) * long(p.kv_dim) + long(d)] = v_in[long(t) * long(p.kv_dim) + long(d)];
+}
+
+struct DraftAttnParams {
+    uint anchor_pos;
+    uint B;
+    uint cap;
+    uint is_local;
+    uint window_size;
+    uint n_heads;
+    uint n_kv_heads;
+    uint head_dim;
+};
+
+kernel void draft_block_attn_kernel(
+    device const bfloat* Q       [[buffer(0)]],
+    device const bfloat* k_cache [[buffer(1)]],
+    device const bfloat* v_cache [[buffer(2)]],
+    device bfloat* out           [[buffer(3)]],
+    constant DraftAttnParams& p  [[buffer(4)]],
+    uint2 tgid                   [[threadgroup_position_in_grid]],
+    uint sg_id                   [[simdgroup_index_in_threadgroup]],
+    uint lane                    [[thread_index_in_simdgroup]])
+{
+    uint h = tgid.x;
+    uint b = tgid.y;
+    if (h >= p.n_heads || b >= p.B) return;
+    uint kv_h = h / (p.n_heads / p.n_kv_heads);
+
+    uint k_end = p.anchor_pos + p.B;
+    uint k_start = (p.is_local != 0u && p.anchor_pos > p.window_size) ? (p.anchor_pos - p.window_size) : 0u;
+
+    device const bfloat* q_ptr = Q + (long(b) * long(p.n_heads) + long(h)) * long(p.head_dim);
+    float qv[4];
+    for (uint i = 0; i < 4u; ++i) qv[i] = float(q_ptr[lane + i * 32u]);
+    float inv_sqrt_d = rsqrt(float(p.head_dim));
+
+    float m_val = -1e30f;
+    float l_val = 0.0f;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    long kv_stride = long(p.n_kv_heads) * long(p.head_dim);
+
+    for (uint kp = k_start + sg_id; kp < k_end; kp += 4u) {
+        uint slot = (p.is_local != 0u) ? (kp % p.cap) : kp;
+        device const bfloat* k_ptr = k_cache + long(slot) * kv_stride + long(kv_h) * long(p.head_dim);
+        device const bfloat* v_ptr = v_cache + long(slot) * kv_stride + long(kv_h) * long(p.head_dim);
+        float dot = 0.0f;
+        for (uint i = 0; i < 4u; ++i) dot = fma(qv[i], float(k_ptr[lane + i * 32u]), dot);
+        dot = simd_sum(dot) * inv_sqrt_d;
+        float m_new = max(m_val, dot);
+        float alpha = exp(m_val - m_new);
+        float pr = exp(dot - m_new);
+        l_val = l_val * alpha + pr;
+        for (uint i = 0; i < 4u; ++i) acc[i] = acc[i] * alpha + pr * float(v_ptr[lane + i * 32u]);
+        m_val = m_new;
+    }
+
+    threadgroup float sm_m[4];
+    threadgroup float sm_l[4];
+    threadgroup float sm_acc[4][128];
+    if (lane == 0u) { sm_m[sg_id] = m_val; sm_l[sg_id] = l_val; }
+    for (uint i = 0; i < 4u; ++i) sm_acc[sg_id][lane + i * 32u] = acc[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sg_id == 0u) {
+        float gm = -1e30f;
+        for (uint w = 0; w < 4u; ++w) if (sm_l[w] > 0.0f) gm = max(gm, sm_m[w]);
+        float gl = 0.0f;
+        float gacc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (uint w = 0; w < 4u; ++w) {
+            if (sm_l[w] > 0.0f) {
+                float sc = exp(sm_m[w] - gm);
+                gl += sm_l[w] * sc;
+                for (uint i = 0; i < 4u; ++i) gacc[i] += sm_acc[w][lane + i * 32u] * sc;
+            }
+        }
+        float inv_l = 1.0f / gl;
+        device bfloat* o_ptr = out + (long(b) * long(p.n_heads) + long(h)) * long(p.head_dim);
+        for (uint i = 0; i < 4u; ++i) o_ptr[lane + i * 32u] = bfloat(gacc[i] * inv_l);
+    }
+}
+
+kernel void add_rmsnorm_kernel(
+    device const bfloat* x [[buffer(0)]],
+    device bfloat* res     [[buffer(1)]],
+    device const bfloat* w [[buffer(2)]],
+    device bfloat* out     [[buffer(3)]],
+    constant RmsParams& p  [[buffer(4)]],
+    uint tgid              [[threadgroup_position_in_grid]],
+    uint tid               [[thread_index_in_threadgroup]],
+    uint tg_size           [[threads_per_threadgroup]])
+{
+    uint t = tgid;
+    if (t >= p.T) return;
+    long off = long(t) * long(p.D);
+    float reg[12];
+    float sum_sq = 0.0f;
+    uint k = 0u;
+    for (uint d = tid; d < p.D; d += tg_size) {
+        float v = float(res[off + long(d)]) + float(x[off + long(d)]);
+        res[off + long(d)] = bfloat(v);
+        reg[k++] = v;
+        sum_sq += v * v;
+    }
+    threadgroup float sm[32];
+    sum_sq = tg_reduce_sum(sum_sq, tid, tg_size, sm);
+    float rstd = rsqrt(sum_sq / float(p.D) + p.eps);
+    k = 0u;
+    for (uint d = tid; d < p.D; d += tg_size) {
+        out[off + long(d)] = bfloat(reg[k++] * rstd * float(w[d]));
+    }
+}
+
+kernel void silu_mul_kernel(
+    device bfloat* g       [[buffer(0)]],
+    device const bfloat* u [[buffer(1)]],
+    constant uint& N       [[buffer(2)]],
+    uint gid               [[thread_position_in_grid]])
+{
+    if (gid < N) {
+        float gv = float(g[gid]);
+        float uv = float(u[gid]);
+        g[gid] = bfloat((gv / (1.0f + exp(-gv))) * uv);
+    }
+}
+
+kernel void embed_draft_block_kernel(
+    device const int* anchor_tok  [[buffer(0)]],
+    device const bfloat* embed_w  [[buffer(1)]],
+    device const bfloat* norm_w   [[buffer(2)]],
+    device const bfloat* mask_emb [[buffer(3)]],
+    device bfloat* out            [[buffer(4)]],
+    constant RmsParams& p         [[buffer(5)]],
+    uint tgid                     [[threadgroup_position_in_grid]],
+    uint tid                      [[thread_index_in_threadgroup]],
+    uint tg_size                  [[threads_per_threadgroup]])
+{
+    uint b = tgid;
+    if (b >= p.T) return;
+    device bfloat* dst = out + long(b) * long(p.D);
+    if (b > 0u) {
+        for (uint d = tid; d < p.D; d += tg_size) dst[d] = mask_emb[d];
+        return;
+    }
+    long tok = long(anchor_tok[0]);
+    device const bfloat* row = embed_w + tok * long(p.D);
+    threadgroup float sm[32];
+    float sum_sq = 0.0f;
+    for (uint d = tid; d < p.D; d += tg_size) {
+        float v = float(row[d]);
+        sum_sq += v * v;
+    }
+    sum_sq = tg_reduce_sum(sum_sq, tid, tg_size, sm);
+    float rstd = rsqrt(sum_sq / float(p.D) + p.eps);
+    for (uint d = tid; d < p.D; d += tg_size) {
+        dst[d] = bfloat(float(row[d]) * rstd * float(norm_w[d]));
+    }
+}
+
+struct MarkovInParams {
+    uint rank;
+    uint D;
+};
+
+kernel void assemble_markov_in_dev_kernel(
+    device const bfloat* state     [[buffer(0)]],
+    device const bfloat* markov_w1 [[buffer(1)]],
+    device const int* prev_tok_ptr [[buffer(2)]],
+    device const bfloat* draft_h   [[buffer(3)]],
+    device const bfloat* f_rnn     [[buffer(4)]],
+    device bfloat* out             [[buffer(5)]],
+    constant MarkovInParams& p     [[buffer(6)]],
+    uint i                         [[thread_position_in_grid]])
+{
+    uint total = 2u * p.rank + 2u * p.D;
+    if (i >= total) return;
+    long prev_tok = long(prev_tok_ptr[0]);
+    if (i < p.rank) out[i] = state[i];
+    else if (i < 2u * p.rank) out[i] = markov_w1[prev_tok * long(p.rank) + long(i - p.rank)];
+    else if (i < 2u * p.rank + p.D) out[i] = draft_h[i - 2u * p.rank];
+    else out[i] = f_rnn[i - 2u * p.rank - p.D];
+}
+
+kernel void markov_gate_kernel(
+    device const float* raw  [[buffer(0)]],
+    device const float* bias [[buffer(1)]],
+    device bfloat* state     [[buffer(2)]],
+    device bfloat* latent    [[buffer(3)]],
+    constant uint& rank      [[buffer(4)]],
+    uint c                   [[thread_position_in_grid]])
+{
+    if (c >= rank) return;
+    float g = float(bfloat(raw[c] + bias[c]));
+    float cand = float(bfloat(raw[rank + c] + bias[rank + c]));
+    float o = float(bfloat(raw[2u * rank + c] + bias[2u * rank + c]));
+    float st = float(state[c]);
+    g = 1.0f / (1.0f + exp(-g));
+    cand = tanh(cand);
+    state[c] = bfloat(g * st + (1.0f - g) * cand);
+    latent[c] = bfloat(tanh(o));
+}
+
+struct MarkovArgParams {
+    uint V;
+    uint has_map;
+};
+
+kernel void markov_argmax_kernel(
+    device const bfloat* base_logits [[buffer(0)]],
+    device const float* fold_b       [[buffer(1)]],
+    device const float* markov_bias  [[buffer(2)]],
+    device const int* draft_to_tgt   [[buffer(3)]],
+    device int* out_tok              [[buffer(4)]],
+    constant MarkovArgParams& p      [[buffer(5)]],
+    uint tid                         [[thread_index_in_threadgroup]],
+    uint tg_size                     [[threads_per_threadgroup]])
+{
+    float best_v = -1e30f;
+    int best_i = 0;
+    for (uint i = tid; i < p.V; i += tg_size) {
+        float v = float(base_logits[i]) + fold_b[i] + markov_bias[i];
+        if (v > best_v) {
+            best_v = v;
+            best_i = int(i);
+        }
+    }
+    threadgroup float sm_v[32];
+    threadgroup int sm_i[32];
+    uint lane = tid & 31u;
+    uint wid = tid >> 5;
+    for (uint off = 16u; off > 0u; off >>= 1) {
+        float ov = simd_shuffle_down(best_v, off);
+        int oi = simd_shuffle_down(best_i, off);
+        if (ov > best_v || (ov == best_v && oi < best_i)) {
+            best_v = ov;
+            best_i = oi;
+        }
+    }
+    if (lane == 0u) {
+        sm_v[wid] = best_v;
+        sm_i[wid] = best_i;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (wid == 0u) {
+        uint nw = (tg_size + 31u) >> 5;
+        best_v = (lane < nw) ? sm_v[lane] : -1e30f;
+        best_i = (lane < nw) ? sm_i[lane] : 0;
+        for (uint off = 16u; off > 0u; off >>= 1) {
+            float ov = simd_shuffle_down(best_v, off);
+            int oi = simd_shuffle_down(best_i, off);
+            if (ov > best_v || (ov == best_v && oi < best_i)) {
+                best_v = ov;
+                best_i = oi;
+            }
+        }
+        if (lane == 0u) out_tok[0] = (p.has_map != 0u) ? draft_to_tgt[best_i] : best_i;
+    }
+}
+
+struct GatherParams {
+    uint M;
+    uint D;
+};
+
+kernel void gather_bf16_rows_kernel(
+    device const bfloat* src [[buffer(0)]],
+    device const int* idx    [[buffer(1)]],
+    device bfloat* dst       [[buffer(2)]],
+    constant GatherParams& p [[buffer(3)]],
+    uint2 gid                [[thread_position_in_grid]])
+{
+    uint d = gid.x;
+    uint m = gid.y;
+    if (m >= p.M || d >= p.D) return;
+    long row = long(idx[m]);
+    dst[long(m) * long(p.D) + long(d)] = src[row * long(p.D) + long(d)];
+}
+
+struct FoldParams {
+    uint V;
+    uint D;
+    uint rank;
+};
+
+kernel void fold_unembed_ho_kernel(
+    device const bfloat* unembed [[buffer(0)]],
+    device const bfloat* ho_w    [[buffer(1)]],
+    device bfloat* fold_w        [[buffer(2)]],
+    constant FoldParams& p       [[buffer(3)]],
+    uint2 gid                    [[thread_position_in_grid]])
+{
+    uint r = gid.x;
+    uint v = gid.y;
+    if (v >= p.V || r >= p.rank) return;
+    device const bfloat* urow = unembed + long(v) * long(p.D);
+    float acc = 0.0f;
+    for (uint d = 0; d < p.D; ++d) {
+        acc = fma(float(urow[d]), float(ho_w[long(d) * long(p.rank) + long(r)]), acc);
+    }
+    fold_w[long(v) * long(p.rank) + long(r)] = bfloat(acc);
+}
+
+kernel void zero_bf16_kernel(
+    device bfloat* dst [[buffer(0)]],
+    constant uint& N   [[buffer(1)]],
+    uint gid           [[thread_position_in_grid]])
+{
+    if (gid < N) dst[gid] = bfloat(0.0f);
+}
+

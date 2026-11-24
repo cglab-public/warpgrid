@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -49,6 +50,44 @@ struct MoeParams { uint32_t T; uint32_t D; uint32_t inter; uint32_t K; float gat
 struct GemvParams { uint32_t M; uint32_t N; uint32_t K; uint32_t out_fp32; };
 struct QuantParams { uint32_t N; uint32_t K; };
 struct ArgmaxParams { uint32_t vocab_size; float softcap; };
+struct BatchArgParams { uint32_t M; uint32_t vocab_size; };
+struct DflareMixParams { uint32_t aux_stride; uint32_t T; uint32_t D; float eps; };
+struct QkRopeParams { uint32_t start_pos; uint32_t T; uint32_t n_heads; uint32_t head_dim; float rope_theta; float eps; };
+struct DraftWriteKvParams { uint32_t start_pos; uint32_t T; uint32_t cap; uint32_t is_local; uint32_t kv_dim; };
+struct DraftAttnParams {
+    uint32_t anchor_pos; uint32_t B; uint32_t cap; uint32_t is_local;
+    uint32_t window_size; uint32_t n_heads; uint32_t n_kv_heads; uint32_t head_dim;
+};
+struct MarkovInParams { uint32_t rank; uint32_t D; };
+struct MarkovArgParams { uint32_t V; uint32_t has_map; };
+struct GatherParams { uint32_t M; uint32_t D; };
+struct FoldParams { uint32_t V; uint32_t D; uint32_t rank; };
+
+static float bf16_bits_to_f32(uint16_t b) {
+    uint32_t u = (uint32_t)b << 16;
+    float f;
+    memcpy(&f, &u, 4);
+    return f;
+}
+
+struct MetalDraftLayerWeights {
+    bool is_local = true;
+    id<MTLBuffer> dflare_norm = nil;
+    id<MTLBuffer> input_ln = nil;
+    id<MTLBuffer> post_attn_ln = nil;
+    id<MTLBuffer> k_proj_ctx = nil;
+    id<MTLBuffer> v_proj_ctx = nil;
+    id<MTLBuffer> q_norm = nil;
+    id<MTLBuffer> k_norm = nil;
+    id<MTLBuffer> k_norm_ctx = nil;
+    id<MTLBuffer> q_fp8 = nil, q_sc = nil;
+    id<MTLBuffer> k_fp8 = nil, k_sc = nil;
+    id<MTLBuffer> v_fp8 = nil, v_sc = nil;
+    id<MTLBuffer> o_fp8 = nil, o_sc = nil;
+    id<MTLBuffer> gate_fp8 = nil, gate_sc = nil;
+    id<MTLBuffer> up_fp8 = nil, up_sc = nil;
+    id<MTLBuffer> down_fp8 = nil, down_sc = nil;
+};
 
 struct MetalLayerWeights {
     bool is_local = true;
@@ -108,6 +147,10 @@ struct MetalVisitCache {
     id<MTLBuffer> v_conv_state = nil;
     id<MTLBuffer> attn_conv_state = nil;
     id<MTLBuffer> mlp_conv_state = nil;
+    id<MTLBuffer> k_conv_snap = nil;
+    id<MTLBuffer> v_conv_snap = nil;
+    id<MTLBuffer> attn_conv_snap = nil;
+    id<MTLBuffer> mlp_conv_snap = nil;
     id<MTLBuffer> local_k_prefill_snap = nil;
     id<MTLBuffer> local_v_prefill_snap = nil;
     id<MTLBuffer> k_conv_prefill_snap = nil;
@@ -152,8 +195,23 @@ struct Inkling2Model::Impl {
     id<MTLComputePipelineState> pso_bf16_gemv_1sg = nil;
     id<MTLComputePipelineState> pso_quant_fp8 = nil;
     id<MTLComputePipelineState> pso_fp8_gemv = nil;
+    id<MTLComputePipelineState> pso_fp8_small_gemm = nil;
     id<MTLComputePipelineState> pso_bf16_gemm_tiled = nil;
     id<MTLComputePipelineState> pso_softcap_argmax = nil;
+    id<MTLComputePipelineState> pso_batched_argmax = nil;
+    id<MTLComputePipelineState> pso_dflare_mix = nil;
+    id<MTLComputePipelineState> pso_qk_rope = nil;
+    id<MTLComputePipelineState> pso_draft_write_kv = nil;
+    id<MTLComputePipelineState> pso_draft_attn = nil;
+    id<MTLComputePipelineState> pso_add_rmsnorm = nil;
+    id<MTLComputePipelineState> pso_silu_mul = nil;
+    id<MTLComputePipelineState> pso_embed_draft = nil;
+    id<MTLComputePipelineState> pso_assemble_markov = nil;
+    id<MTLComputePipelineState> pso_markov_gate = nil;
+    id<MTLComputePipelineState> pso_markov_argmax = nil;
+    id<MTLComputePipelineState> pso_gather_bf16 = nil;
+    id<MTLComputePipelineState> pso_fold_unembed = nil;
+    id<MTLComputePipelineState> pso_zero_bf16 = nil;
 
     id<MTLBuffer> embed_w = nil;
     id<MTLBuffer> embed_norm_w = nil;
@@ -207,8 +265,63 @@ struct Inkling2Model::Impl {
     id<MTLBuffer> b_moe_act = nil;
     id<MTLBuffer> b_logits = nil;
     id<MTLBuffer> b_out_token = nil;
+    id<MTLBuffer> b_aux_states = nil;
+    id<MTLBuffer> b_last_aux = nil;
 
+    bool ds_loaded = false;
     int dspark_slots = 0;
+    int ds_num_layers = 3;
+    int ds_hidden = 2304;
+    int ds_heads = 24;
+    int ds_kv_heads = 8;
+    int ds_head_dim = 128;
+    int ds_inter = 9216;
+    int ds_block = 8;
+    int ds_rank = 256;
+    int ds_window = 1024;
+    float ds_eps = 1e-6f;
+    float ds_rope_theta = 1000000.0f;
+    int ds_vocab_size = 200058;
+    int ds_kv_cap[3] = {0, 0, 0};
+
+    id<MTLBuffer> ds_fuse_alpha = nil;
+    id<MTLBuffer> ds_mask_embed = nil;
+    id<MTLBuffer> ds_final_norm = nil;
+    std::vector<MetalDraftLayerWeights> ds_layers;
+    id<MTLBuffer> ds_markov_dflare_norm = nil;
+    id<MTLBuffer> ds_markov_w1 = nil;
+    id<MTLBuffer> ds_rnn_proj_w = nil;
+    id<MTLBuffer> ds_rnn_proj_b = nil;
+    id<MTLBuffer> ds_pruned_unembed_fp8 = nil;
+    id<MTLBuffer> ds_pruned_unembed_sc = nil;
+    id<MTLBuffer> ds_draft_to_target = nil;
+    id<MTLBuffer> ds_fold_w_fp8 = nil;
+    id<MTLBuffer> ds_fold_w_sc = nil;
+    id<MTLBuffer> ds_fold_b = nil;
+    id<MTLBuffer> ds_k_cache[3] = {nil, nil, nil};
+    id<MTLBuffer> ds_v_cache[3] = {nil, nil, nil};
+    id<MTLBuffer> ds_ctx_mix = nil;
+    id<MTLBuffer> ds_ctx_k = nil;
+    id<MTLBuffer> ds_ctx_v = nil;
+    id<MTLBuffer> ds_x = nil;
+    id<MTLBuffer> ds_res = nil;
+    id<MTLBuffer> ds_q = nil;
+    id<MTLBuffer> ds_k = nil;
+    id<MTLBuffer> ds_v = nil;
+    id<MTLBuffer> ds_attn_out = nil;
+    id<MTLBuffer> ds_proj_out = nil;
+    id<MTLBuffer> ds_mlp_g = nil;
+    id<MTLBuffer> ds_mlp_u = nil;
+    id<MTLBuffer> ds_f_rnn = nil;
+    id<MTLBuffer> ds_base_logits = nil;
+    id<MTLBuffer> ds_rnn_in = nil;
+    id<MTLBuffer> ds_rnn_raw = nil;
+    id<MTLBuffer> ds_rnn_state = nil;
+    id<MTLBuffer> ds_rnn_latent = nil;
+    id<MTLBuffer> ds_markov_bias = nil;
+    id<MTLBuffer> ds_draft_tok = nil;
+    id<MTLBuffer> ds_anchor_tok = nil;
+
     double gpu_ws_gib = 0.0;
     uint32_t gpu_max_tg = 256;
     bool gpu_is_apple9 = false;
@@ -308,6 +421,18 @@ struct Inkling2Model::Impl {
                            uint32_t M, uint32_t N, uint32_t K, bool out_fp32)
     {
         GemvParams gp{M, N, K, out_fp32 ? 1u : 0u};
+        if (M >= 2u && M <= 8u) {
+            [enc setComputePipelineState:pso_fp8_small_gemm];
+            [enc setBuffer:X offset:x_off atIndex:0];
+            [enc setBuffer:W8 offset:w8_off atIndex:1];
+            [enc setBuffer:Wsc offset:wsc_off atIndex:2];
+            [enc setBuffer:(Y_bf ? Y_bf : b_dummy) offset:y_bf_off atIndex:3];
+            [enc setBuffer:(Y_f32 ? Y_f32 : b_dummy) offset:y_f32_off atIndex:4];
+            [enc setBytes:&gp length:sizeof(gp) atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake((N + 3u) / 4u, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            return;
+        }
         [enc setComputePipelineState:pso_fp8_gemv];
         [enc setBuffer:X offset:x_off atIndex:0];
         [enc setBuffer:W8 offset:w8_off atIndex:1];
@@ -414,7 +539,7 @@ struct Inkling2Model::Impl {
 
     void forward_internal(const InklingConfig& cfg, int max_batch_tokens,
                           const int32_t* h_tokens, int T, int start_pos, int slot_id, bool do_argmax,
-                          bool profile_stages)
+                          bool profile_stages, bool save_conv_snaps, int aux_tok_offset = 0)
     {
         if (T <= 0 || T > max_batch_tokens) {
             throw std::runtime_error("Invalid T for Metal forward_internal");
@@ -491,6 +616,14 @@ struct Inkling2Model::Impl {
             }
 
             size_t partial_off = (size_t)num_blocks * stack_stride_bytes;
+            if (ds_loaded) {
+                int aux_slot = (v == 5) ? 0 : (v == 23 ? 1 : (v == 41 ? 2 : -1));
+                if (aux_slot >= 0) {
+                    blit_copy(b_stack, partial_off, b_aux_states,
+                              (size_t)aux_slot * stack_stride_bytes + (size_t)aux_tok_offset * D * 2,
+                              (size_t)T * D * 2);
+                }
+            }
             size_t q_in_off = 0, k_in_off = 0, v_in_off = 0;
 
             if (looped) {
@@ -603,15 +736,18 @@ struct Inkling2Model::Impl {
             size_t sc_slot_off = (size_t)slot_id * (size_t)vc.cap * (size_t)cfg.num_key_value_heads * sizeof(float);
             size_t k_cs_off = (size_t)slot_id * 3 * kv_dim * 2;
             size_t d_cs_off = (size_t)slot_id * 3 * D * 2;
+            uint32_t snap_flag = save_conv_snaps ? 1u : 0u;
+            size_t k_snap_off = (size_t)slot_id * 8 * 3 * kv_dim * 2;
+            size_t d_snap_off = (size_t)slot_id * 8 * 3 * D * 2;
 
             if (lw.is_local) {
-                SconvStaticParams sp{(uint32_t)T, kv_dim, 0u};
+                SconvStaticParams sp{(uint32_t)T, kv_dim, snap_flag};
                 [enc setComputePipelineState:pso_sconv_static];
                 [enc setBuffer:b_K offset:0 atIndex:0];
                 [enc setBuffer:lw.k_sconv_w offset:0 atIndex:1];
                 [enc setBuffer:vc.k_conv_state offset:k_cs_off atIndex:2];
                 [enc setBuffer:b_K_conv offset:0 atIndex:3];
-                [enc setBuffer:b_dummy offset:0 atIndex:4];
+                [enc setBuffer:(save_conv_snaps ? vc.k_conv_snap : b_dummy) offset:(save_conv_snaps ? k_snap_off : 0) atIndex:4];
                 [enc setBytes:&sp length:sizeof(sp) atIndex:5];
                 [enc dispatchThreads:MTLSizeMake(kv_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 
@@ -619,12 +755,12 @@ struct Inkling2Model::Impl {
                 [enc setBuffer:lw.v_sconv_w offset:0 atIndex:1];
                 [enc setBuffer:vc.v_conv_state offset:k_cs_off atIndex:2];
                 [enc setBuffer:b_V_conv offset:0 atIndex:3];
-                [enc setBuffer:b_dummy offset:0 atIndex:4];
+                [enc setBuffer:(save_conv_snaps ? vc.v_conv_snap : b_dummy) offset:(save_conv_snaps ? k_snap_off : 0) atIndex:4];
                 [enc setBytes:&sp length:sizeof(sp) atIndex:5];
                 [enc dispatchThreads:MTLSizeMake(kv_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             } else {
                 uint32_t dyn_dim = (uint32_t)cfg.num_key_value_heads * 4u;
-                SconvDynamicParams dp{(uint32_t)T, (uint32_t)cfg.num_key_value_heads, (uint32_t)cfg.head_dim, 0u};
+                SconvDynamicParams dp{(uint32_t)T, (uint32_t)cfg.num_key_value_heads, (uint32_t)cfg.head_dim, snap_flag};
 
                 encode_linear_bf16(enc, b_attn_in, k_in_off, lw.k_sconv_proj, 0, b_dyn_w, 0, nil, 0, (uint32_t)T, dyn_dim, D, false);
                 [enc setComputePipelineState:pso_sconv_dynamic];
@@ -633,7 +769,7 @@ struct Inkling2Model::Impl {
                 [enc setBuffer:b_dyn_w offset:0 atIndex:2];
                 [enc setBuffer:vc.k_conv_state offset:k_cs_off atIndex:3];
                 [enc setBuffer:b_K_conv offset:0 atIndex:4];
-                [enc setBuffer:b_dummy offset:0 atIndex:5];
+                [enc setBuffer:(save_conv_snaps ? vc.k_conv_snap : b_dummy) offset:(save_conv_snaps ? k_snap_off : 0) atIndex:5];
                 [enc setBytes:&dp length:sizeof(dp) atIndex:6];
                 [enc dispatchThreads:MTLSizeMake(kv_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 
@@ -644,7 +780,7 @@ struct Inkling2Model::Impl {
                 [enc setBuffer:b_dyn_w offset:0 atIndex:2];
                 [enc setBuffer:vc.v_conv_state offset:k_cs_off atIndex:3];
                 [enc setBuffer:b_V_conv offset:0 atIndex:4];
-                [enc setBuffer:b_dummy offset:0 atIndex:5];
+                [enc setBuffer:(save_conv_snaps ? vc.v_conv_snap : b_dummy) offset:(save_conv_snaps ? k_snap_off : 0) atIndex:5];
                 [enc setBytes:&dp length:sizeof(dp) atIndex:6];
                 [enc dispatchThreads:MTLSizeMake(kv_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             }
@@ -748,13 +884,13 @@ struct Inkling2Model::Impl {
             flush_stage(prof_dense_proj_ms);
 
             {
-                SconvStaticParams sp{(uint32_t)T, D, 0u};
+                SconvStaticParams sp{(uint32_t)T, D, snap_flag};
                 [enc setComputePipelineState:pso_sconv_static];
                 [enc setBuffer:b_attn_proj offset:0 atIndex:0];
                 [enc setBuffer:lw.attn_sconv_w offset:0 atIndex:1];
                 [enc setBuffer:vc.attn_conv_state offset:d_cs_off atIndex:2];
                 [enc setBuffer:b_attn_out offset:0 atIndex:3];
-                [enc setBuffer:b_dummy offset:0 atIndex:4];
+                [enc setBuffer:(save_conv_snaps ? vc.attn_conv_snap : b_dummy) offset:(save_conv_snaps ? d_snap_off : 0) atIndex:4];
                 [enc setBytes:&sp length:sizeof(sp) atIndex:5];
                 [enc dispatchThreads:MTLSizeMake(D, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             }
@@ -859,13 +995,13 @@ struct Inkling2Model::Impl {
             }
 
             {
-                SconvStaticParams sp{(uint32_t)T, D, 0u};
+                SconvStaticParams sp{(uint32_t)T, D, snap_flag};
                 [enc setComputePipelineState:pso_sconv_static];
                 [enc setBuffer:b_mlp_raw offset:0 atIndex:0];
                 [enc setBuffer:lw.mlp_sconv_w offset:0 atIndex:1];
                 [enc setBuffer:vc.mlp_conv_state offset:d_cs_off atIndex:2];
                 [enc setBuffer:b_mlp_out offset:0 atIndex:3];
-                [enc setBuffer:b_dummy offset:0 atIndex:4];
+                [enc setBuffer:(save_conv_snaps ? vc.mlp_conv_snap : b_dummy) offset:(save_conv_snaps ? d_snap_off : 0) atIndex:4];
                 [enc setBytes:&sp length:sizeof(sp) atIndex:5];
                 [enc dispatchThreads:MTLSizeMake(D, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             }
@@ -901,19 +1037,35 @@ struct Inkling2Model::Impl {
                         output_query, 0, 1,
                         final_norm_w, 0, b_mlp_in, 0, nil, 0,
                         (uint32_t)T, D, cfg.rms_norm_eps);
+        if (ds_loaded) {
+            blit_copy(b_mlp_in, 0, b_aux_states,
+                      (size_t)3 * stack_stride_bytes + (size_t)aux_tok_offset * D * 2,
+                      (size_t)T * D * 2);
+        }
         flush_stage(prof_attn_res_ctrl_ms);
 
-        size_t last_tok_off = (size_t)(T - 1) * D * 2;
-        encode_linear_fp8(enc, b_mlp_in, last_tok_off, unembed_fp8, 0, unembed_sc, 0, nil, 0, b_logits, 0,
-                          1u, (uint32_t)cfg.unpadded_vocab_size, D, true);
-
-        if (do_argmax) {
-            ArgmaxParams amp{(uint32_t)cfg.unpadded_vocab_size, cfg.final_logit_softcapping};
-            [enc setComputePipelineState:pso_softcap_argmax];
+        if (save_conv_snaps) {
+            encode_linear_fp8(enc, b_mlp_in, 0, unembed_fp8, 0, unembed_sc, 0, nil, 0, b_logits, 0,
+                              (uint32_t)T, (uint32_t)cfg.unpadded_vocab_size, D, true);
+            BatchArgParams bap{(uint32_t)T, (uint32_t)cfg.unpadded_vocab_size};
+            [enc setComputePipelineState:pso_batched_argmax];
             [enc setBuffer:b_logits offset:0 atIndex:0];
             [enc setBuffer:b_out_token offset:0 atIndex:1];
-            [enc setBytes:&amp length:sizeof(amp) atIndex:2];
-            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc setBytes:&bap length:sizeof(bap) atIndex:2];
+            [enc dispatchThreadgroups:MTLSizeMake((uint32_t)T, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        } else {
+            size_t last_tok_off = (size_t)(T - 1) * D * 2;
+            encode_linear_fp8(enc, b_mlp_in, last_tok_off, unembed_fp8, 0, unembed_sc, 0, nil, 0, b_logits, 0,
+                              1u, (uint32_t)cfg.unpadded_vocab_size, D, true);
+
+            if (do_argmax) {
+                ArgmaxParams amp{(uint32_t)cfg.unpadded_vocab_size, cfg.final_logit_softcapping};
+                [enc setComputePipelineState:pso_softcap_argmax];
+                [enc setBuffer:b_logits offset:0 atIndex:0];
+                [enc setBuffer:b_out_token offset:0 atIndex:1];
+                [enc setBytes:&amp length:sizeof(amp) atIndex:2];
+                [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            }
         }
 
         [enc endEncoding];
@@ -922,6 +1074,383 @@ struct Inkling2Model::Impl {
             prof_lm_head_ms += (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
             prof_steps += 1;
         }
+    }
+
+    void load_dspark(const std::string& model_dir, const InklingConfig& cfg,
+                     int max_seq, int max_ctx_chunk, const std::string& draft_vocab_file, int n_ds_slots)
+    {
+        auto t0 = std::chrono::steady_clock::now();
+        dspark_slots = n_ds_slots;
+        SafetensorsFile dst;
+        dst.open(model_dir + "/mtp.safetensors");
+
+        {
+            std::vector<uint8_t> raw;
+            dst.load_to_host("fuse_weight", raw);
+            const uint16_t* fw = reinterpret_cast<const uint16_t*>(raw.data());
+            ds_fuse_alpha = alloc_shared(16 * sizeof(float));
+            float* fa = static_cast<float*>(ds_fuse_alpha.contents);
+            for (int r = 0; r < 4; ++r) {
+                float m = -1e30f;
+                for (int c = 0; c < 4; ++c) m = std::max(m, bf16_bits_to_f32(fw[r * 4 + c]));
+                float s = 0.0f;
+                for (int c = 0; c < 4; ++c) {
+                    fa[r * 4 + c] = std::exp(bf16_bits_to_f32(fw[r * 4 + c]) - m);
+                    s += fa[r * 4 + c];
+                }
+                for (int c = 0; c < 4; ++c) fa[r * 4 + c] /= s;
+            }
+        }
+
+        ds_mask_embed = load_tensor(dst, "mask_embed");
+        ds_final_norm = load_tensor(dst, "norm.weight");
+
+        id<MTLCommandBuffer> qcb = [queue commandBuffer];
+        id<MTLComputeCommandEncoder> qenc = [qcb computeCommandEncoder];
+
+        auto load_and_quant = [&](const std::string& name, id<MTLBuffer> __strong& dst_fp8, id<MTLBuffer> __strong& dst_sc, uint32_t N, uint32_t K) {
+            id<MTLBuffer> tmp = load_tensor(dst, name);
+            dst_fp8 = alloc_shared((size_t)N * K);
+            dst_sc = alloc_shared((size_t)N * sizeof(float));
+            quantize_rowwise_fp8(qenc, tmp, dst_fp8, dst_sc, N, K);
+        };
+
+        uint32_t q_dim = (uint32_t)(ds_heads * ds_head_dim);
+        uint32_t kv_dim = (uint32_t)(ds_kv_heads * ds_head_dim);
+        ds_layers.resize(ds_num_layers);
+        for (int i = 0; i < ds_num_layers; ++i) {
+            auto& lw = ds_layers[i];
+            lw.is_local = (i == 0 || i == 2);
+            std::string p = "layers." + std::to_string(i) + ".";
+            lw.dflare_norm = load_tensor(dst, p + "dflare_norm.weight");
+            lw.input_ln = load_tensor(dst, p + "input_layernorm.weight");
+            lw.post_attn_ln = load_tensor(dst, p + "post_attention_layernorm.weight");
+            lw.k_proj_ctx = load_tensor(dst, p + "self_attn.k_proj_ctx.weight");
+            lw.v_proj_ctx = load_tensor(dst, p + "self_attn.v_proj_ctx.weight");
+            lw.q_norm = load_tensor(dst, p + "self_attn.q_norm.weight");
+            lw.k_norm = load_tensor(dst, p + "self_attn.k_norm.weight");
+            lw.k_norm_ctx = load_tensor(dst, p + "self_attn.k_norm_ctx.weight");
+            load_and_quant(p + "self_attn.q_proj.weight", lw.q_fp8, lw.q_sc, q_dim, (uint32_t)ds_hidden);
+            load_and_quant(p + "self_attn.k_proj.weight", lw.k_fp8, lw.k_sc, kv_dim, (uint32_t)ds_hidden);
+            load_and_quant(p + "self_attn.v_proj.weight", lw.v_fp8, lw.v_sc, kv_dim, (uint32_t)ds_hidden);
+            load_and_quant(p + "self_attn.o_proj.weight", lw.o_fp8, lw.o_sc, (uint32_t)ds_hidden, q_dim);
+            load_and_quant(p + "mlp.gate_proj.weight", lw.gate_fp8, lw.gate_sc, (uint32_t)ds_inter, (uint32_t)ds_hidden);
+            load_and_quant(p + "mlp.up_proj.weight", lw.up_fp8, lw.up_sc, (uint32_t)ds_inter, (uint32_t)ds_hidden);
+            load_and_quant(p + "mlp.down_proj.weight", lw.down_fp8, lw.down_sc, (uint32_t)ds_hidden, (uint32_t)ds_inter);
+        }
+
+        ds_markov_dflare_norm = load_tensor(dst, "markov_head.dflare_norm.weight");
+        ds_markov_w1 = load_tensor(dst, "markov_head.markov_w1.weight");
+        ds_rnn_proj_w = load_tensor(dst, "markov_head.rnn_proj.weight");
+        {
+            std::vector<uint8_t> raw;
+            dst.load_to_host("markov_head.rnn_proj.bias", raw);
+            const uint16_t* bp = reinterpret_cast<const uint16_t*>(raw.data());
+            ds_rnn_proj_b = alloc_shared((size_t)3 * ds_rank * sizeof(float));
+            float* fb = static_cast<float*>(ds_rnn_proj_b.contents);
+            for (int i = 0; i < 3 * ds_rank; ++i) fb[i] = bf16_bits_to_f32(bp[i]);
+        }
+
+        id<MTLBuffer> draft_unembed_src = unembed_w;
+        if (!draft_vocab_file.empty()) {
+            std::ifstream vf(draft_vocab_file, std::ios::binary | std::ios::ate);
+            if (!vf) throw std::runtime_error("Cannot open draft vocab file: " + draft_vocab_file);
+            size_t nbytes = (size_t)vf.tellg();
+            vf.seekg(0);
+            ds_vocab_size = (int)(nbytes / sizeof(int32_t));
+            ds_draft_to_target = alloc_shared(nbytes);
+            vf.read(static_cast<char*>(ds_draft_to_target.contents), (std::streamsize)nbytes);
+            id<MTLBuffer> pruned = alloc_shared((size_t)ds_vocab_size * ds_hidden * 2);
+            GatherParams gp{(uint32_t)ds_vocab_size, (uint32_t)ds_hidden};
+            [qenc setComputePipelineState:pso_gather_bf16];
+            [qenc setBuffer:unembed_w offset:0 atIndex:0];
+            [qenc setBuffer:ds_draft_to_target offset:0 atIndex:1];
+            [qenc setBuffer:pruned offset:0 atIndex:2];
+            [qenc setBytes:&gp length:sizeof(gp) atIndex:3];
+            [qenc dispatchThreads:MTLSizeMake((uint32_t)ds_hidden, (uint32_t)ds_vocab_size, 1)
+                threadsPerThreadgroup:MTLSizeMake(64, 4, 1)];
+            draft_unembed_src = pruned;
+        } else {
+            ds_vocab_size = cfg.unpadded_vocab_size;
+            ds_draft_to_target = nil;
+        }
+
+        id<MTLBuffer> ho_w = load_tensor(dst, "markov_head.hidden_out.weight");
+        id<MTLBuffer> ho_b = load_tensor(dst, "markov_head.hidden_out.bias");
+        id<MTLBuffer> fold_w_bf16 = alloc_shared((size_t)ds_vocab_size * ds_rank * 2);
+        ds_fold_b = alloc_shared((size_t)ds_vocab_size * sizeof(float));
+
+        FoldParams fp{(uint32_t)ds_vocab_size, (uint32_t)ds_hidden, (uint32_t)ds_rank};
+        [qenc setComputePipelineState:pso_fold_unembed];
+        [qenc setBuffer:draft_unembed_src offset:0 atIndex:0];
+        [qenc setBuffer:ho_w offset:0 atIndex:1];
+        [qenc setBuffer:fold_w_bf16 offset:0 atIndex:2];
+        [qenc setBytes:&fp length:sizeof(fp) atIndex:3];
+        [qenc dispatchThreads:MTLSizeMake((uint32_t)ds_rank, (uint32_t)ds_vocab_size, 1)
+            threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+
+        encode_linear_bf16(qenc, ho_b, 0, draft_unembed_src, 0, nil, 0, ds_fold_b, 0,
+                           1u, (uint32_t)ds_vocab_size, (uint32_t)ds_hidden, true);
+
+        ds_pruned_unembed_fp8 = alloc_shared((size_t)ds_vocab_size * ds_hidden);
+        ds_pruned_unembed_sc = alloc_shared((size_t)ds_vocab_size * sizeof(float));
+        quantize_rowwise_fp8(qenc, draft_unembed_src, ds_pruned_unembed_fp8, ds_pruned_unembed_sc,
+                             (uint32_t)ds_vocab_size, (uint32_t)ds_hidden);
+
+        ds_fold_w_fp8 = alloc_shared((size_t)ds_vocab_size * ds_rank);
+        ds_fold_w_sc = alloc_shared((size_t)ds_vocab_size * sizeof(float));
+        quantize_rowwise_fp8(qenc, fold_w_bf16, ds_fold_w_fp8, ds_fold_w_sc,
+                             (uint32_t)ds_vocab_size, (uint32_t)ds_rank);
+
+        [qenc endEncoding];
+        commit_and_wait(qcb);
+
+        for (int i = 0; i < ds_num_layers; ++i) {
+            ds_kv_cap[i] = ds_layers[i].is_local ? (ds_window + ds_block + 16) : (max_seq + ds_block + 16);
+            size_t sz = (size_t)dspark_slots * (size_t)ds_kv_cap[i] * kv_dim * 2;
+            ds_k_cache[i] = alloc_shared(sz);
+            ds_v_cache[i] = alloc_shared(sz);
+        }
+
+        ds_ctx_mix = alloc_shared((size_t)max_ctx_chunk * ds_hidden * 2);
+        ds_ctx_k = alloc_shared((size_t)max_ctx_chunk * kv_dim * 2);
+        ds_ctx_v = alloc_shared((size_t)max_ctx_chunk * kv_dim * 2);
+        ds_x = alloc_shared((size_t)ds_block * ds_hidden * 2);
+        ds_res = alloc_shared((size_t)ds_block * ds_hidden * 2);
+        ds_q = alloc_shared((size_t)ds_block * q_dim * 2);
+        ds_k = alloc_shared((size_t)ds_block * kv_dim * 2);
+        ds_v = alloc_shared((size_t)ds_block * kv_dim * 2);
+        ds_attn_out = alloc_shared((size_t)ds_block * q_dim * 2);
+        ds_proj_out = alloc_shared((size_t)ds_block * ds_hidden * 2);
+        ds_mlp_g = alloc_shared((size_t)ds_block * ds_inter * 2);
+        ds_mlp_u = alloc_shared((size_t)ds_block * ds_inter * 2);
+        ds_f_rnn = alloc_shared((size_t)ds_hidden * 2);
+        ds_base_logits = alloc_shared((size_t)(ds_block - 1) * ds_vocab_size * 2);
+        ds_rnn_in = alloc_shared((size_t)(2 * ds_rank + 2 * ds_hidden) * 2);
+        ds_rnn_raw = alloc_shared((size_t)3 * ds_rank * sizeof(float));
+        ds_rnn_state = alloc_shared((size_t)ds_rank * 2);
+        ds_rnn_latent = alloc_shared((size_t)ds_rank * 2);
+        ds_markov_bias = alloc_shared((size_t)ds_vocab_size * sizeof(float));
+        ds_draft_tok = alloc_shared(8 * sizeof(int32_t));
+        ds_anchor_tok = alloc_shared(sizeof(int32_t));
+
+        ds_loaded = true;
+        double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        fprintf(stderr, "[warpgrid-metal] Loaded DSpark drafter (FP8 W8A16, draft_vocab=%d, slots=%d) in %.2f s\n",
+                ds_vocab_size, dspark_slots, sec);
+    }
+
+    void store_dspark_context_kv(size_t aux_off_bytes, uint32_t aux_stride, int T, int start_pos, int slot_id) {
+        uint32_t kv_dim = (uint32_t)(ds_kv_heads * ds_head_dim);
+        id<MTLCommandBuffer> cb = [queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        for (int i = 0; i < ds_num_layers; ++i) {
+            const auto& lw = ds_layers[i];
+            size_t slot_off = (size_t)slot_id * (size_t)ds_kv_cap[i] * kv_dim * 2;
+            DflareMixParams dmp{aux_stride, (uint32_t)T, (uint32_t)ds_hidden, ds_eps};
+            [enc setComputePipelineState:pso_dflare_mix];
+            [enc setBuffer:b_aux_states offset:aux_off_bytes atIndex:0];
+            [enc setBuffer:ds_fuse_alpha offset:(size_t)i * 4 * sizeof(float) atIndex:1];
+            [enc setBuffer:lw.dflare_norm offset:0 atIndex:2];
+            [enc setBuffer:ds_ctx_mix offset:0 atIndex:3];
+            [enc setBytes:&dmp length:sizeof(dmp) atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake((uint32_t)T, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+            encode_linear_bf16(enc, ds_ctx_mix, 0, lw.k_proj_ctx, 0, ds_ctx_k, 0, nil, 0, (uint32_t)T, kv_dim, (uint32_t)ds_hidden, false);
+            encode_linear_bf16(enc, ds_ctx_mix, 0, lw.v_proj_ctx, 0, ds_ctx_v, 0, nil, 0, (uint32_t)T, kv_dim, (uint32_t)ds_hidden, false);
+
+            QkRopeParams qrp{(uint32_t)start_pos, (uint32_t)T, (uint32_t)ds_kv_heads, (uint32_t)ds_head_dim, ds_rope_theta, ds_eps};
+            [enc setComputePipelineState:pso_qk_rope];
+            [enc setBuffer:ds_ctx_k offset:0 atIndex:0];
+            [enc setBuffer:lw.k_norm_ctx offset:0 atIndex:1];
+            [enc setBytes:&qrp length:sizeof(qrp) atIndex:2];
+            [enc dispatchThreadgroups:MTLSizeMake((uint32_t)ds_kv_heads, (uint32_t)T, 1)
+                threadsPerThreadgroup:MTLSizeMake((uint32_t)(ds_head_dim / 2), 1, 1)];
+
+            DraftWriteKvParams wkp{(uint32_t)start_pos, (uint32_t)T, (uint32_t)ds_kv_cap[i], lw.is_local ? 1u : 0u, kv_dim};
+            [enc setComputePipelineState:pso_draft_write_kv];
+            [enc setBuffer:ds_ctx_k offset:0 atIndex:0];
+            [enc setBuffer:ds_ctx_v offset:0 atIndex:1];
+            [enc setBuffer:ds_k_cache[i] offset:slot_off atIndex:2];
+            [enc setBuffer:ds_v_cache[i] offset:slot_off atIndex:3];
+            [enc setBytes:&wkp length:sizeof(wkp) atIndex:4];
+            [enc dispatchThreads:MTLSizeMake(kv_dim, (uint32_t)T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        }
+        [enc endEncoding];
+        commit_and_wait(cb);
+    }
+
+    void run_dspark_draft(int32_t anchor_tok, int anchor_pos, int num_draft, int32_t* h_out_drafts, int slot_id) {
+        static_cast<int32_t*>(ds_anchor_tok.contents)[0] = anchor_tok;
+        uint32_t B = (uint32_t)ds_block;
+        uint32_t D = (uint32_t)ds_hidden;
+        uint32_t q_dim = (uint32_t)(ds_heads * ds_head_dim);
+        uint32_t kv_dim = (uint32_t)(ds_kv_heads * ds_head_dim);
+
+        id<MTLCommandBuffer> cb = [queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+
+        RmsParams erp{B, D, ds_eps};
+        [enc setComputePipelineState:pso_embed_draft];
+        [enc setBuffer:ds_anchor_tok offset:0 atIndex:0];
+        [enc setBuffer:embed_w offset:0 atIndex:1];
+        [enc setBuffer:embed_norm_w offset:0 atIndex:2];
+        [enc setBuffer:ds_mask_embed offset:0 atIndex:3];
+        [enc setBuffer:ds_res offset:0 atIndex:4];
+        [enc setBytes:&erp length:sizeof(erp) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake(B, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+        for (int i = 0; i < ds_num_layers; ++i) {
+            const auto& lw = ds_layers[i];
+            size_t slot_off = (size_t)slot_id * (size_t)ds_kv_cap[i] * kv_dim * 2;
+            if (i == 0) {
+                [enc setComputePipelineState:pso_rmsnorm];
+                [enc setBuffer:ds_res offset:0 atIndex:0];
+                [enc setBuffer:lw.input_ln offset:0 atIndex:1];
+                [enc setBuffer:ds_x offset:0 atIndex:2];
+                [enc setBytes:&erp length:sizeof(erp) atIndex:3];
+                [enc dispatchThreadgroups:MTLSizeMake(B, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            } else {
+                [enc setComputePipelineState:pso_add_rmsnorm];
+                [enc setBuffer:ds_proj_out offset:0 atIndex:0];
+                [enc setBuffer:ds_res offset:0 atIndex:1];
+                [enc setBuffer:lw.input_ln offset:0 atIndex:2];
+                [enc setBuffer:ds_x offset:0 atIndex:3];
+                [enc setBytes:&erp length:sizeof(erp) atIndex:4];
+                [enc dispatchThreadgroups:MTLSizeMake(B, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            }
+
+            encode_linear_fp8(enc, ds_x, 0, lw.q_fp8, 0, lw.q_sc, 0, ds_q, 0, nil, 0, B, q_dim, D, false);
+            encode_linear_fp8(enc, ds_x, 0, lw.k_fp8, 0, lw.k_sc, 0, ds_k, 0, nil, 0, B, kv_dim, D, false);
+            encode_linear_fp8(enc, ds_x, 0, lw.v_fp8, 0, lw.v_sc, 0, ds_v, 0, nil, 0, B, kv_dim, D, false);
+
+            QkRopeParams qrp_q{(uint32_t)anchor_pos, B, (uint32_t)ds_heads, (uint32_t)ds_head_dim, ds_rope_theta, ds_eps};
+            [enc setComputePipelineState:pso_qk_rope];
+            [enc setBuffer:ds_q offset:0 atIndex:0];
+            [enc setBuffer:lw.q_norm offset:0 atIndex:1];
+            [enc setBytes:&qrp_q length:sizeof(qrp_q) atIndex:2];
+            [enc dispatchThreadgroups:MTLSizeMake((uint32_t)ds_heads, B, 1)
+                threadsPerThreadgroup:MTLSizeMake((uint32_t)(ds_head_dim / 2), 1, 1)];
+
+            QkRopeParams qrp_k{(uint32_t)anchor_pos, B, (uint32_t)ds_kv_heads, (uint32_t)ds_head_dim, ds_rope_theta, ds_eps};
+            [enc setBuffer:ds_k offset:0 atIndex:0];
+            [enc setBuffer:lw.k_norm offset:0 atIndex:1];
+            [enc setBytes:&qrp_k length:sizeof(qrp_k) atIndex:2];
+            [enc dispatchThreadgroups:MTLSizeMake((uint32_t)ds_kv_heads, B, 1)
+                threadsPerThreadgroup:MTLSizeMake((uint32_t)(ds_head_dim / 2), 1, 1)];
+
+            DraftWriteKvParams wkp{(uint32_t)anchor_pos, B, (uint32_t)ds_kv_cap[i], lw.is_local ? 1u : 0u, kv_dim};
+            [enc setComputePipelineState:pso_draft_write_kv];
+            [enc setBuffer:ds_k offset:0 atIndex:0];
+            [enc setBuffer:ds_v offset:0 atIndex:1];
+            [enc setBuffer:ds_k_cache[i] offset:slot_off atIndex:2];
+            [enc setBuffer:ds_v_cache[i] offset:slot_off atIndex:3];
+            [enc setBytes:&wkp length:sizeof(wkp) atIndex:4];
+            [enc dispatchThreads:MTLSizeMake(kv_dim, B, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+            DraftAttnParams dap{(uint32_t)anchor_pos, B, (uint32_t)ds_kv_cap[i], lw.is_local ? 1u : 0u,
+                                (uint32_t)ds_window, (uint32_t)ds_heads, (uint32_t)ds_kv_heads, (uint32_t)ds_head_dim};
+            [enc setComputePipelineState:pso_draft_attn];
+            [enc setBuffer:ds_q offset:0 atIndex:0];
+            [enc setBuffer:ds_k_cache[i] offset:slot_off atIndex:1];
+            [enc setBuffer:ds_v_cache[i] offset:slot_off atIndex:2];
+            [enc setBuffer:ds_attn_out offset:0 atIndex:3];
+            [enc setBytes:&dap length:sizeof(dap) atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake((uint32_t)ds_heads, B, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+            encode_linear_fp8(enc, ds_attn_out, 0, lw.o_fp8, 0, lw.o_sc, 0, ds_proj_out, 0, nil, 0, B, D, q_dim, false);
+
+            [enc setComputePipelineState:pso_add_rmsnorm];
+            [enc setBuffer:ds_proj_out offset:0 atIndex:0];
+            [enc setBuffer:ds_res offset:0 atIndex:1];
+            [enc setBuffer:lw.post_attn_ln offset:0 atIndex:2];
+            [enc setBuffer:ds_x offset:0 atIndex:3];
+            [enc setBytes:&erp length:sizeof(erp) atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake(B, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+            encode_linear_fp8(enc, ds_x, 0, lw.gate_fp8, 0, lw.gate_sc, 0, ds_mlp_g, 0, nil, 0, B, (uint32_t)ds_inter, D, false);
+            encode_linear_fp8(enc, ds_x, 0, lw.up_fp8, 0, lw.up_sc, 0, ds_mlp_u, 0, nil, 0, B, (uint32_t)ds_inter, D, false);
+
+            uint32_t silu_n = B * (uint32_t)ds_inter;
+            [enc setComputePipelineState:pso_silu_mul];
+            [enc setBuffer:ds_mlp_g offset:0 atIndex:0];
+            [enc setBuffer:ds_mlp_u offset:0 atIndex:1];
+            [enc setBytes:&silu_n length:sizeof(silu_n) atIndex:2];
+            [enc dispatchThreads:MTLSizeMake(silu_n, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+            encode_linear_fp8(enc, ds_mlp_g, 0, lw.down_fp8, 0, lw.down_sc, 0, ds_proj_out, 0, nil, 0, B, D, (uint32_t)ds_inter, false);
+        }
+
+        [enc setComputePipelineState:pso_add_rmsnorm];
+        [enc setBuffer:ds_proj_out offset:0 atIndex:0];
+        [enc setBuffer:ds_res offset:0 atIndex:1];
+        [enc setBuffer:ds_final_norm offset:0 atIndex:2];
+        [enc setBuffer:ds_x offset:0 atIndex:3];
+        [enc setBytes:&erp length:sizeof(erp) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(B, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+        encode_linear_fp8(enc, ds_x, (size_t)D * 2, ds_pruned_unembed_fp8, 0, ds_pruned_unembed_sc, 0,
+                          ds_base_logits, 0, nil, 0, (uint32_t)num_draft, (uint32_t)ds_vocab_size, D, false);
+
+        DflareMixParams fmp{D, 1u, D, ds_eps};
+        [enc setComputePipelineState:pso_dflare_mix];
+        [enc setBuffer:b_last_aux offset:(size_t)slot_id * 4 * D * 2 atIndex:0];
+        [enc setBuffer:ds_fuse_alpha offset:(size_t)3 * 4 * sizeof(float) atIndex:1];
+        [enc setBuffer:ds_markov_dflare_norm offset:0 atIndex:2];
+        [enc setBuffer:ds_f_rnn offset:0 atIndex:3];
+        [enc setBytes:&fmp length:sizeof(fmp) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+        uint32_t z_rank = (uint32_t)ds_rank;
+        [enc setComputePipelineState:pso_zero_bf16];
+        [enc setBuffer:ds_rnn_state offset:0 atIndex:0];
+        [enc setBytes:&z_rank length:sizeof(z_rank) atIndex:1];
+        [enc dispatchThreads:MTLSizeMake(z_rank, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+        uint32_t rnn_in_dim = (uint32_t)(2 * ds_rank + 2 * ds_hidden);
+        MarkovInParams mip{(uint32_t)ds_rank, D};
+        MarkovArgParams map{(uint32_t)ds_vocab_size, ds_draft_to_target ? 1u : 0u};
+
+        for (int s = 0; s < num_draft; ++s) {
+            id<MTLBuffer> prev_buf = (s == 0) ? ds_anchor_tok : ds_draft_tok;
+            size_t prev_off = (s == 0) ? 0 : (size_t)(s - 1) * sizeof(int32_t);
+            [enc setComputePipelineState:pso_assemble_markov];
+            [enc setBuffer:ds_rnn_state offset:0 atIndex:0];
+            [enc setBuffer:ds_markov_w1 offset:0 atIndex:1];
+            [enc setBuffer:prev_buf offset:prev_off atIndex:2];
+            [enc setBuffer:ds_x offset:(size_t)(s + 1) * D * 2 atIndex:3];
+            [enc setBuffer:ds_f_rnn offset:0 atIndex:4];
+            [enc setBuffer:ds_rnn_in offset:0 atIndex:5];
+            [enc setBytes:&mip length:sizeof(mip) atIndex:6];
+            [enc dispatchThreads:MTLSizeMake(rnn_in_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+            encode_linear_bf16(enc, ds_rnn_in, 0, ds_rnn_proj_w, 0, nil, 0, ds_rnn_raw, 0,
+                               1u, (uint32_t)(3 * ds_rank), rnn_in_dim, true);
+
+            [enc setComputePipelineState:pso_markov_gate];
+            [enc setBuffer:ds_rnn_raw offset:0 atIndex:0];
+            [enc setBuffer:ds_rnn_proj_b offset:0 atIndex:1];
+            [enc setBuffer:ds_rnn_state offset:0 atIndex:2];
+            [enc setBuffer:ds_rnn_latent offset:0 atIndex:3];
+            [enc setBytes:&z_rank length:sizeof(z_rank) atIndex:4];
+            [enc dispatchThreads:MTLSizeMake(z_rank, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+            encode_linear_fp8(enc, ds_rnn_latent, 0, ds_fold_w_fp8, 0, ds_fold_w_sc, 0, nil, 0, ds_markov_bias, 0,
+                              1u, (uint32_t)ds_vocab_size, (uint32_t)ds_rank, true);
+
+            [enc setComputePipelineState:pso_markov_argmax];
+            [enc setBuffer:ds_base_logits offset:(size_t)s * (size_t)ds_vocab_size * 2 atIndex:0];
+            [enc setBuffer:ds_fold_b offset:0 atIndex:1];
+            [enc setBuffer:ds_markov_bias offset:0 atIndex:2];
+            [enc setBuffer:(ds_draft_to_target ? ds_draft_to_target : b_dummy) offset:0 atIndex:3];
+            [enc setBuffer:ds_draft_tok offset:(size_t)s * sizeof(int32_t) atIndex:4];
+            [enc setBytes:&map length:sizeof(map) atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        }
+
+        [enc endEncoding];
+        commit_and_wait(cb);
+        memcpy(h_out_drafts, ds_draft_tok.contents, (size_t)num_draft * sizeof(int32_t));
     }
 };
 
@@ -994,8 +1523,23 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
         impl_->pso_bf16_gemv_1sg = impl_->make_pso("bf16_gemv_1sg_kernel");
         impl_->pso_quant_fp8 = impl_->make_pso("quantize_bf16_to_fp8_rowwise_kernel");
         impl_->pso_fp8_gemv = impl_->make_pso("fp8_gemv_kernel");
+        impl_->pso_fp8_small_gemm = impl_->make_pso("fp8_small_gemm_kernel");
         impl_->pso_bf16_gemm_tiled = impl_->make_pso("bf16_gemm_tiled_kernel");
         impl_->pso_softcap_argmax = impl_->make_pso("softcap_argmax_kernel");
+        impl_->pso_batched_argmax = impl_->make_pso("batched_argmax_kernel");
+        impl_->pso_dflare_mix = impl_->make_pso("dflare_mix_rmsnorm_kernel");
+        impl_->pso_qk_rope = impl_->make_pso("qk_norm_rope_kernel");
+        impl_->pso_draft_write_kv = impl_->make_pso("draft_write_kv_kernel");
+        impl_->pso_draft_attn = impl_->make_pso("draft_block_attn_kernel");
+        impl_->pso_add_rmsnorm = impl_->make_pso("add_rmsnorm_kernel");
+        impl_->pso_silu_mul = impl_->make_pso("silu_mul_kernel");
+        impl_->pso_embed_draft = impl_->make_pso("embed_draft_block_kernel");
+        impl_->pso_assemble_markov = impl_->make_pso("assemble_markov_in_dev_kernel");
+        impl_->pso_markov_gate = impl_->make_pso("markov_gate_kernel");
+        impl_->pso_markov_argmax = impl_->make_pso("markov_argmax_kernel");
+        impl_->pso_gather_bf16 = impl_->make_pso("gather_bf16_rows_kernel");
+        impl_->pso_fold_unembed = impl_->make_pso("fold_unembed_ho_kernel");
+        impl_->pso_zero_bf16 = impl_->make_pso("zero_bf16_kernel");
 
         impl_->b_dummy = impl_->alloc_shared(64);
         impl_->embed_w = impl_->load_tensor(st, "model.llm.embed.weight");
@@ -1170,6 +1714,12 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
             vc.attn_conv_state = impl_->alloc_shared((size_t)max_slots * 3 * D * 2);
             vc.mlp_conv_state = impl_->alloc_shared((size_t)max_slots * 3 * D * 2);
 
+            int n_ds = std::min(2, max_slots);
+            vc.k_conv_snap = impl_->alloc_shared((size_t)n_ds * 8 * 3 * kv_dim * 2);
+            vc.v_conv_snap = impl_->alloc_shared((size_t)n_ds * 8 * 3 * kv_dim * 2);
+            vc.attn_conv_snap = impl_->alloc_shared((size_t)n_ds * 8 * 3 * D * 2);
+            vc.mlp_conv_snap = impl_->alloc_shared((size_t)n_ds * 8 * 3 * D * 2);
+
             if (vc.is_local) {
                 size_t kv_sz = (size_t)max_slots * (size_t)vc.cap * kv_dim * 2;
                 vc.local_k_prefill_snap = impl_->alloc_shared(kv_sz);
@@ -1216,8 +1766,11 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
         impl_->b_topk_weights = impl_->alloc_shared((size_t)T * cfg.num_experts_per_tok * sizeof(float));
         impl_->b_router_logits = impl_->alloc_shared((size_t)T * cfg.n_routed_experts * sizeof(float));
         impl_->b_moe_act = impl_->alloc_shared((size_t)T * cfg.num_experts_per_tok * cfg.intermediate_size * sizeof(float));
-        impl_->b_logits = impl_->alloc_shared((size_t)cfg.vocab_size * sizeof(float));
+        impl_->b_logits = impl_->alloc_shared((size_t)8 * cfg.vocab_size * sizeof(float));
         impl_->b_out_token = impl_->alloc_shared(16 * sizeof(int32_t));
+        impl_->b_aux_states = impl_->alloc_shared((size_t)4 * T * D * 2);
+        int n_ds_slots = std::min(2, max_slots);
+        impl_->b_last_aux = impl_->alloc_shared((size_t)n_ds_slots * 4 * D * 2);
 
         {
             id<MTLCommandBuffer> qcb = [impl_->queue commandBuffer];
@@ -1241,6 +1794,10 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
         fprintf(stderr, "[warpgrid-metal] Loaded Inkling-2-Mini on %s in %.2f s (KV: %.2f GiB, %d slots x max_seq=%d)\n",
                 impl_->device.name.UTF8String, sec,
                 kv_bytes_total / (1024.0 * 1024.0 * 1024.0), max_slots, max_seq_len);
+
+        if (draft_k > 0) {
+            impl_->load_dspark(model_dir, cfg, max_seq_len, max_batch_tokens, draft_vocab_file, n_ds_slots);
+        }
     }
 }
 
@@ -1307,7 +1864,7 @@ void Inkling2Model::restore_prefill_snapshot(int slot_id) {
 
 int32_t Inkling2Model::forward_and_greedy(const int32_t* h_tokens, int T, int start_pos, int slot_id) {
     @autoreleasepool {
-        impl_->forward_internal(cfg, max_batch_tokens, h_tokens, T, start_pos, slot_id, true, profile_stages);
+        impl_->forward_internal(cfg, max_batch_tokens, h_tokens, T, start_pos, slot_id, true, profile_stages, false);
         return static_cast<const int32_t*>(impl_->b_out_token.contents)[0];
     }
 }
@@ -1322,8 +1879,9 @@ void Inkling2Model::forward_batch_decode_greedy(
 }
 
 void Inkling2Model::forward_verify_greedy(const int32_t* h_tokens, int T, int start_pos, int32_t* h_out_tokens) {
-    for (int t = 0; t < T; ++t) {
-        h_out_tokens[t] = forward_and_greedy(&h_tokens[t], 1, start_pos + t, 0);
+    @autoreleasepool {
+        impl_->forward_internal(cfg, max_batch_tokens, h_tokens, T, start_pos, 0, true, profile_stages, true);
+        memcpy(h_out_tokens, impl_->b_out_token.contents, (size_t)T * sizeof(int32_t));
     }
 }
 
@@ -1331,27 +1889,66 @@ void Inkling2Model::forward_batch_verify_greedy(
     const int32_t* h_tokens, const int32_t* h_slots, const int32_t* h_positions,
     int B, int L, int32_t* h_out_tokens)
 {
-    for (int b = 0; b < B; ++b) {
-        for (int t = 0; t < L; ++t) {
-            h_out_tokens[b * L + t] = forward_and_greedy(&h_tokens[b * L + t], 1, h_positions[b] + t, h_slots[b]);
+    @autoreleasepool {
+        for (int b = 0; b < B; ++b) {
+            impl_->forward_internal(cfg, max_batch_tokens, h_tokens + b * L, L, h_positions[b], h_slots[b], true, profile_stages, true, b * L);
+            memcpy(h_out_tokens + b * L, impl_->b_out_token.contents, (size_t)L * sizeof(int32_t));
         }
     }
 }
 
-void Inkling2Model::rollback_conv_states(int, int) {}
-void Inkling2Model::commit_dspark_context(int, int, int, int) {}
+void Inkling2Model::rollback_conv_states(int accepted_len, int slot_id) {
+    int idx = accepted_len - 1;
+    int kv_dim = cfg.num_key_value_heads * cfg.head_dim;
+    int D = cfg.hidden_size;
+    size_t k_sz = (size_t)3 * kv_dim * 2;
+    size_t d_sz = (size_t)3 * D * 2;
+    size_t k_dst = (size_t)slot_id * k_sz;
+    size_t d_dst = (size_t)slot_id * d_sz;
+    size_t k_src = ((size_t)slot_id * 8 + (size_t)idx) * k_sz;
+    size_t d_src = ((size_t)slot_id * 8 + (size_t)idx) * d_sz;
+    for (auto& vc : impl_->caches) {
+        memcpy(static_cast<uint8_t*>(vc.k_conv_state.contents) + k_dst,
+               static_cast<uint8_t*>(vc.k_conv_snap.contents) + k_src, k_sz);
+        memcpy(static_cast<uint8_t*>(vc.v_conv_state.contents) + k_dst,
+               static_cast<uint8_t*>(vc.v_conv_snap.contents) + k_src, k_sz);
+        memcpy(static_cast<uint8_t*>(vc.attn_conv_state.contents) + d_dst,
+               static_cast<uint8_t*>(vc.attn_conv_snap.contents) + d_src, d_sz);
+        memcpy(static_cast<uint8_t*>(vc.mlp_conv_state.contents) + d_dst,
+               static_cast<uint8_t*>(vc.mlp_conv_snap.contents) + d_src, d_sz);
+    }
+}
+
+void Inkling2Model::commit_dspark_context(int count, int start_pos, int slot_id, int aux_tok_offset) {
+    if (!impl_->ds_loaded || count <= 0 || slot_id >= impl_->dspark_slots) return;
+    @autoreleasepool {
+        int D = cfg.hidden_size;
+        uint32_t stack_stride = (uint32_t)(max_batch_tokens * D);
+        impl_->store_dspark_context_kv((size_t)aux_tok_offset * D * 2, stack_stride, count, start_pos, slot_id);
+        uint8_t* dst_aux = static_cast<uint8_t*>(impl_->b_last_aux.contents) + (size_t)slot_id * 4 * D * 2;
+        const uint8_t* src_base = static_cast<const uint8_t*>(impl_->b_aux_states.contents);
+        size_t last_off = (size_t)(aux_tok_offset + count - 1) * D * 2;
+        for (int tap = 0; tap < 4; ++tap) {
+            memcpy(dst_aux + (size_t)tap * D * 2,
+                   src_base + (size_t)tap * (size_t)stack_stride * 2 + last_off,
+                   (size_t)D * 2);
+        }
+    }
+}
 
 int Inkling2Model::max_dspark_slots() const {
     return impl_->dspark_slots;
 }
 
-void Inkling2Model::draft_tokens(int32_t, int, int, int32_t*, int) {
-    throw std::runtime_error("Metal DSpark drafter not implemented yet");
+void Inkling2Model::draft_tokens(int32_t anchor_tok, int anchor_pos, int num_draft, int32_t* h_out_drafts, int slot_id) {
+    @autoreleasepool {
+        impl_->run_dspark_draft(anchor_tok, anchor_pos, num_draft, h_out_drafts, slot_id);
+    }
 }
 
 void Inkling2Model::forward_logits(const int32_t* h_tokens, int T, int start_pos, std::vector<float>& h_logits, int slot_id) {
     @autoreleasepool {
-        impl_->forward_internal(cfg, max_batch_tokens, h_tokens, T, start_pos, slot_id, true, profile_stages);
+        impl_->forward_internal(cfg, max_batch_tokens, h_tokens, T, start_pos, slot_id, true, profile_stages, false);
         h_logits.resize(cfg.unpadded_vocab_size);
         memcpy(h_logits.data(), impl_->b_logits.contents, (size_t)cfg.unpadded_vocab_size * sizeof(float));
     }
