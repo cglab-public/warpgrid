@@ -34,6 +34,46 @@ struct DraftLayerWeights {
     float   *gate_sc = nullptr, *up_sc = nullptr, *down_sc = nullptr;
 };
 
+struct DFlash2LayerWeights {
+    __nv_bfloat16* input_ln = nullptr;
+    __nv_bfloat16* post_ln = nullptr;
+    __nv_bfloat16* q_norm = nullptr;
+    __nv_bfloat16* k_norm = nullptr;
+    __nv_bfloat16* attn_conv_base = nullptr;
+    __nv_bfloat16* attn_conv_proj = nullptr;
+    __nv_bfloat16* mlp_conv_base = nullptr;
+    __nv_bfloat16* mlp_conv_proj = nullptr;
+    __nv_bfloat16* k_proj = nullptr;
+    __nv_bfloat16* v_proj = nullptr;
+    uint8_t *q_fp8 = nullptr, *k_fp8 = nullptr, *v_fp8 = nullptr, *o_fp8 = nullptr;
+    uint8_t *gate_fp8 = nullptr, *up_fp8 = nullptr, *down_fp8 = nullptr;
+    float *q_sc = nullptr, *k_sc = nullptr, *v_sc = nullptr, *o_sc = nullptr;
+    float *gate_sc = nullptr, *up_sc = nullptr, *down_sc = nullptr;
+};
+
+void launch_dflash2_concat_taps(
+    const __nv_bfloat16* aux_states, int aux_stride,
+    __nv_bfloat16* out, int T, int D, cudaStream_t stream);
+
+void launch_dflash2_grouped_dyn_conv(
+    const __nv_bfloat16* x, const __nv_bfloat16* base_k, const __nv_bfloat16* dyn_k,
+    __nv_bfloat16* out, int T, int D, int group_size, int half_idx, cudaStream_t stream);
+
+void launch_dflash2_block_attn(
+    const __nv_bfloat16* q_blk, const __nv_bfloat16* k_blk, const __nv_bfloat16* v_blk,
+    const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache, __nv_bfloat16* out,
+    int anchor_pos, const int32_t* d_anchor_pos, int B, int cap, int window_size,
+    int n_heads, int n_kv_heads, int head_dim, cudaStream_t stream);
+
+void launch_dflash2_topk16(
+    float* logits, float* top_vals, int32_t* top_ids,
+    const int32_t* draft_to_target, int M, int V, cudaStream_t stream);
+
+void launch_dflash2_select_path(
+    const int32_t* d_anchor_tok, const float* top_vals, const int32_t* top_ids,
+    const __nv_bfloat16* h_sel, const __nv_bfloat16* pred_cb, const __nv_bfloat16* succ_cb,
+    int32_t* out_tok, int nd, int rank, cudaStream_t stream);
+
 class DSparkDrafter {
 public:
     SafetensorsFile st;
@@ -121,6 +161,54 @@ public:
 
     std::vector<void*> allocs;
     bool loaded = false;
+    bool df2_mode = false;
+
+    int df2_num_layers = 5;
+    int df2_heads = 32;
+    int df2_kv_heads = 8;
+    int df2_head_dim = 128;
+    int df2_inter = 6912;
+    int df2_block = 8;
+    int df2_window = 2048;
+    int df2_kv_cap = 0;
+    int df2_group_size = 16;
+    int df2_sel_rank = 256;
+    int32_t df2_mask_id = 200056;
+    float df2_rope_theta = 10000.0f;
+    float df2_eps = 1e-6f;
+
+    __nv_bfloat16* df2_fc = nullptr;
+    uint8_t* df2_fc_fp8 = nullptr;
+    float* df2_fc_sc = nullptr;
+    __nv_bfloat16* df2_hidden_norm = nullptr;
+    __nv_bfloat16* df2_final_norm = nullptr;
+    __nv_bfloat16* df2_sel_hproj = nullptr;
+    __nv_bfloat16* df2_sel_pred_cb = nullptr;
+    __nv_bfloat16* df2_sel_succ_cb = nullptr;
+    std::vector<DFlash2LayerWeights> df2_layers;
+    __nv_bfloat16* df2_k_cache[5] = {};
+    __nv_bfloat16* df2_v_cache[5] = {};
+
+    __nv_bfloat16* df2_ctx_cat = nullptr;
+    __nv_bfloat16* df2_ctx_fc = nullptr;
+    __nv_bfloat16* df2_ctx_norm = nullptr;
+    __nv_bfloat16* df2_ctx_k = nullptr;
+    __nv_bfloat16* df2_ctx_v = nullptr;
+    __nv_bfloat16* df2_res = nullptr;
+    __nv_bfloat16* df2_x = nullptr;
+    __nv_bfloat16* df2_xc = nullptr;
+    __nv_bfloat16* df2_dyn = nullptr;
+    __nv_bfloat16* df2_q = nullptr;
+    __nv_bfloat16* df2_k = nullptr;
+    __nv_bfloat16* df2_v = nullptr;
+    __nv_bfloat16* df2_attn_out = nullptr;
+    __nv_bfloat16* df2_proj_out = nullptr;
+    __nv_bfloat16* df2_mlp_g = nullptr;
+    __nv_bfloat16* df2_mlp_u = nullptr;
+    __nv_bfloat16* df2_h_sel = nullptr;
+    float* df2_logits = nullptr;
+    float* df2_top_v = nullptr;
+    int32_t* df2_top_i = nullptr;
 
     DSparkDrafter() = default;
     ~DSparkDrafter();
@@ -133,6 +221,15 @@ public:
               cudaStream_t shared_stream,
               int max_seq, int max_ctx_chunk, const std::string& draft_vocab_file = "",
               int n_dspark_slots = 4);
+
+    void load_dflash2(const std::string& df2_dir,
+                      const __nv_bfloat16* embed_w,
+                      const __nv_bfloat16* embed_norm_w,
+                      const __nv_bfloat16* unembed_w,
+                      cublasHandle_t shared_cublas,
+                      cudaStream_t shared_stream,
+                      int max_ctx_chunk, const std::string& draft_vocab_file = "",
+                      int n_dspark_slots = 4);
 
     // Store context K/V from target's 4 aux hidden states [4, T, 2304] at [start_pos .. start_pos+T-1]
     void store_context_kv(const __nv_bfloat16* aux_states, int aux_stride, int T, int start_pos, int slot_id = 0);
@@ -147,6 +244,8 @@ private:
     void* alloc_gpu(size_t bytes);
     void linear_bf16(const __nv_bfloat16* X, const __nv_bfloat16* W, __nv_bfloat16* Y, int M, int N, int K);
     void linear_bf16_to_fp32(const __nv_bfloat16* X, const __nv_bfloat16* W, float* Y, int M, int N, int K);
+    void store_dflash2_context_kv(const __nv_bfloat16* aux_states, int aux_stride, int T, int start_pos, int slot_id);
+    void draft_dflash2_tokens(int32_t anchor_tok, int anchor_pos, int num_draft, int32_t* h_out_drafts, int slot_id);
 };
 
 } // namespace ink

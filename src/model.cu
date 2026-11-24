@@ -405,7 +405,11 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
     fprintf(stderr, "[warpgrid] Loaded Inkling-2-Mini in %.2f s (KV cache: %.2f GiB for %d slots x max_seq=%d)\n",
             sec, kv_bytes_total / (1024.0 * 1024.0 * 1024.0), max_slots, max_seq_len);
 
-    if (draft_k > 0) {
+    if (!dflash2_dir.empty()) {
+        if (draft_k <= 0) draft_k = 6;
+        dspark.load_dflash2(dflash2_dir, embed_w, embed_norm_w, unembed_w, cublas, stream,
+                            max_batch_tokens, draft_vocab_file, n_ds_slots);
+    } else if (draft_k > 0) {
         dspark.load(model_dir, embed_w, embed_norm_w, unembed_w, cublas, stream,
                     max_seq_len, max_batch_tokens, draft_vocab_file, n_ds_slots);
     }

@@ -37,6 +37,7 @@ Measured end-to-end over the live OpenAI-compatible HTTP/SSE server (`./warpgrid
 | **`c=1` Ladder (per-user)** | 59.8 tok/s (code) | **65.8 – 69.4 tok/s** | **+10% to +16%** vs vLLM |
 | **`c=1` Code Panel (med / peak)** | 59.8 tok/s | **58.8 / 69.0 tok/s** | Peak **+15.3%** vs vLLM |
 | **`c=1` Prose Panel (med / peak)** | 33.2 tok/s | **44.2 / 51.8 tok/s** | **+33% med / +56% peak** vs vLLM |
+| **`c=1` CLI DFlash 2 (`--dflash2`, `k=7`)** | — | **95.90** math / **76.66** code / **49.31** prose | **+79% / +42% / +36%** vs DSpark (`0.17 s` load, CUDA-graphed) |
 | **Cold Server Load** | ~45–60 s | **3.81 s** | **~15×** faster startup |
 
 ### Parallel Continuous-Batching Ladder (`c = 1..8`)

@@ -70,11 +70,15 @@ $(TARGET): $(SRCS) $(COMMON_HDRS) src/kernels.cuh src/dspark.hpp
 tests/test_host: tests/test_host.cpp src/config.hpp src/json.hpp src/safetensors.hpp src/tokenizer.hpp
 	g++ -O3 -std=c++20 -Wall -DWARPGRID_METAL tests/test_host.cpp -o tests/test_host
 
-test: tests/test_host
+tests/test_dflash2_cuda: tests/test_dflash2_cuda.cu src/dspark.cu src/kernels.cu src/dspark.hpp src/kernels.cuh $(COMMON_HDRS)
+	$(NVCC) $(CXXFLAGS) -gencode arch=compute_121a,code=sm_121a tests/test_dflash2_cuda.cu src/dspark.cu src/kernels.cu -o tests/test_dflash2_cuda $(LDFLAGS)
+
+test: tests/test_host tests/test_dflash2_cuda
 	./tests/test_host
+	./tests/test_dflash2_cuda
 
 clean:
-	rm -f $(TARGET) tests/test_host
+	rm -f $(TARGET) tests/test_host tests/test_dflash2_cuda
 endif
 
 .PHONY: all test clean
