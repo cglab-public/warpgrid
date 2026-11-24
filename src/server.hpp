@@ -1,6 +1,7 @@
 #pragma once
 #include "json.hpp"
 #include "model.hpp"
+#include "telemetry.hpp"
 #include "tokenizer.hpp"
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -27,6 +28,8 @@ class OpenAIServer {
     Tokenizer& tok_;
     std::string served_name_;
     int port_;
+    ServerMetrics metrics_;
+    OtlpExporter otlp_;
 
     struct RequestState {
         std::vector<int32_t> prompt_ids;
@@ -34,6 +37,8 @@ class OpenAIServer {
         float temperature = 0.0f;
         float top_p = 1.0f;
         uint32_t seed = 42;
+        std::chrono::steady_clock::time_point t_start{};
+        uint64_t start_unix_ns = 0;
 
         // Runtime state owned by GPU worker
         int slot_id = -1;
@@ -44,13 +49,17 @@ class OpenAIServer {
         int32_t last_tok = 0;
         bool dspark_ready = false;
         int dyn_k = 5;
+        std::atomic<int> spec_steps{0};
+        std::atomic<int> spec_drafted{0};
+        std::atomic<int> spec_accepted{0};
+        std::atomic<bool> used_dflash2{false};
 
         // Output token stream consumed by HTTP thread
         std::mutex mu;
         std::condition_variable cv;
         std::deque<int32_t> tokens;
         bool finished = false;
-        bool cancelled = false;
+        std::atomic<bool> cancelled{false};
         std::string error;
 
         void push_token(int32_t tid) {
@@ -87,11 +96,15 @@ class OpenAIServer {
         return true;
     }
 
-    static void send_json(int fd, int status, const std::string& body) {
+    static void send_text(int fd, int status, const char* content_type, const std::string& body) {
         std::string hdr = "HTTP/1.1 " + std::to_string(status) + (status == 200 ? " OK" : " Error") +
-                          "\r\nContent-Type: application/json\r\nContent-Length: " +
+                          "\r\nContent-Type: " + content_type + "\r\nContent-Length: " +
                           std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n";
         send_all(fd, hdr + body);
+    }
+
+    static void send_json(int fd, int status, const std::string& body) {
+        send_text(fd, status, "application/json", body);
     }
 
     static int32_t sample_token(const std::vector<float>& logits, float temp, float top_p, std::mt19937& rng) {
@@ -139,10 +152,27 @@ class OpenAIServer {
     void worker_loop() {
         int max_slots = model_.max_slots;
         std::vector<bool> slot_used(max_slots, false);
+        std::vector<bool> slot_dspark_valid(max_slots, false);
+        std::vector<int> slot_dspark_written(max_slots, 0);
         std::vector<std::vector<int32_t>> slot_full_tokens(max_slots);
         std::vector<std::vector<int32_t>> slot_prefill_tokens(max_slots);
         std::vector<std::shared_ptr<RequestState>> active;
         std::vector<float> logits;
+
+        auto publish_slot = [&](const std::shared_ptr<RequestState>& r) {
+            SlotTelemetry st;
+            st.slot_id = r->slot_id;
+            st.active = true;
+            st.pos = r->pos;
+            st.cached_tokens = r->cached_tokens;
+            st.generated = r->generated;
+            st.dflash2_active = r->dspark_ready && !model_.dflash2_dir.empty();
+            metrics_.update_slot(st);
+        };
+        auto release_slot = [&](int sid) {
+            slot_used[sid] = false;
+            metrics_.clear_slot(sid);
+        };
 
         auto is_strict_prefix = [](const std::vector<int32_t>& cached, const std::vector<int32_t>& prompt) -> int {
             if (cached.empty() || cached.size() >= prompt.size()) return 0;
@@ -182,6 +212,8 @@ class OpenAIServer {
                     req->cached_tokens = best_hit;
                     req->use_prefill_snap = best_snap;
                     active.push_back(req);
+                    metrics_.on_dequeue();
+                    publish_slot(req);
                 }
             }
 
@@ -192,7 +224,7 @@ class OpenAIServer {
                 int plen = (int)r->prompt_ids.size();
                 if (plen + r->max_tokens > model_.max_seq_len) {
                     r->mark_done("prompt + max_tokens exceeds max_seq_len");
-                    slot_used[r->slot_id] = false;
+                    release_slot(r->slot_id);
                     it = active.erase(it);
                     continue;
                 }
@@ -203,6 +235,22 @@ class OpenAIServer {
                     }
                 } else {
                     model_.reset_cache(r->slot_id);
+                }
+                bool can_commit_ds = false;
+                if (r->slot_id < model_.max_dspark_slots() && model_.draft_k > 0) {
+                    if (r->cached_tokens == 0) {
+                        slot_dspark_valid[r->slot_id] = true;
+                        slot_dspark_written[r->slot_id] = 0;
+                        can_commit_ds = true;
+                    } else if (!r->use_prefill_snap && slot_dspark_valid[r->slot_id] &&
+                               slot_dspark_written[r->slot_id] == r->cached_tokens) {
+                        can_commit_ds = true;
+                    } else if (r->use_prefill_snap && slot_dspark_valid[r->slot_id] &&
+                               slot_dspark_written[r->slot_id] < (model_.dflash2_dir.empty() ? 1024 : 2048)) {
+                        can_commit_ds = true;
+                    } else {
+                        slot_dspark_valid[r->slot_id] = false;
+                    }
                 }
                 int chunk = model_.max_batch_tokens;
                 int32_t first_tok = 0;
@@ -216,11 +264,14 @@ class OpenAIServer {
                     } else {
                         first_tok = model_.forward_and_greedy(r->prompt_ids.data() + p, n, p, r->slot_id);
                     }
-                    if (r->slot_id < model_.max_dspark_slots() && model_.draft_k > 0 && r->cached_tokens == 0) {
+                    if (can_commit_ds) {
                         model_.commit_dspark_context(n, p, r->slot_id);
+                        slot_dspark_written[r->slot_id] = p + n;
                         r->dspark_ready = true;
                     }
                     p += n;
+                    r->pos = p;
+                    publish_slot(r);
                 }
                 model_.save_prefill_snapshot(r->slot_id);
                 slot_prefill_tokens[r->slot_id] = r->prompt_ids;
@@ -230,9 +281,10 @@ class OpenAIServer {
                 r->last_tok = first_tok;
                 r->generated = 1;
                 r->push_token(first_tok);
+                publish_slot(r);
                 if (first_tok == tok_.eos_id || r->generated >= r->max_tokens) {
                     r->mark_done();
-                    slot_used[r->slot_id] = false;
+                    release_slot(r->slot_id);
                     it = active.erase(it);
                 } else {
                     ++it;
@@ -256,7 +308,7 @@ class OpenAIServer {
                 auto& r = active[0];
                 if (r->cancelled) {
                     r->mark_done();
-                    slot_used[r->slot_id] = false;
+                    release_slot(r->slot_id);
                     active.clear();
                     continue;
                 }
@@ -264,7 +316,7 @@ class OpenAIServer {
                 int cur_k = std::min(is_df2 ? model_.draft_k : std::min(r->dyn_k, model_.draft_k), r->max_tokens - r->generated);
                 if (cur_k <= 0) {
                     r->mark_done();
-                    slot_used[r->slot_id] = false;
+                    release_slot(r->slot_id);
                     active.clear();
                     continue;
                 }
@@ -279,6 +331,10 @@ class OpenAIServer {
                     if (verify_out[j] == drafts[j]) ++acc;
                     else break;
                 }
+                r->spec_steps.fetch_add(1, std::memory_order_relaxed);
+                r->spec_drafted.fetch_add(cur_k, std::memory_order_relaxed);
+                r->spec_accepted.fetch_add(acc, std::memory_order_relaxed);
+                if (is_df2) r->used_dflash2.store(true, std::memory_order_relaxed);
                 if (!is_df2) {
                     if (acc == cur_k && r->dyn_k < model_.draft_k) r->dyn_k++;
                     else if (acc <= cur_k - 2 && r->dyn_k > 3) r->dyn_k--;
@@ -286,6 +342,7 @@ class OpenAIServer {
                 int emitted = acc + 1;
                 if (emitted < cur_k + 1) model_.rollback_conv_states(emitted);
                 model_.commit_dspark_context(emitted, r->pos);
+                slot_dspark_written[r->slot_id] = r->pos + emitted;
                 // Record the `emitted` tokens that were committed to slot 0's KV/conv cache
                 for (int j = 0; j < emitted; ++j) {
                     slot_full_tokens[r->slot_id].push_back(verify_in[j]);
@@ -304,9 +361,10 @@ class OpenAIServer {
                     if (r->last_tok == tok_.eos_id) done = true;
                 }
                 r->pos += emitted;
+                publish_slot(r);
                 if (done || r->generated >= r->max_tokens) {
                     r->mark_done();
-                    slot_used[r->slot_id] = false;
+                    release_slot(r->slot_id);
                     active.clear();
                 }
                 continue;
@@ -352,8 +410,13 @@ class OpenAIServer {
                             else break;
                         }
                         int emitted = acc + 1;
+                        r->spec_steps.fetch_add(1, std::memory_order_relaxed);
+                        r->spec_drafted.fetch_add(batch_k, std::memory_order_relaxed);
+                        r->spec_accepted.fetch_add(acc, std::memory_order_relaxed);
+                        if (!model_.dflash2_dir.empty()) r->used_dflash2.store(true, std::memory_order_relaxed);
                         if (emitted < L) model_.rollback_conv_states(emitted, r->slot_id);
                         model_.commit_dspark_context(emitted, r->pos, r->slot_id, b * L);
+                        slot_dspark_written[r->slot_id] = r->pos + emitted;
                         for (int j = 0; j < emitted; ++j) {
                             slot_full_tokens[r->slot_id].push_back(verify_in[b * L + j]);
                         }
@@ -370,9 +433,10 @@ class OpenAIServer {
                             if (r->last_tok == tok_.eos_id) done = true;
                         }
                         r->pos += emitted;
+                        publish_slot(r);
                         if (done || r->generated >= r->max_tokens) {
                             r->mark_done();
-                            slot_used[r->slot_id] = false;
+                            release_slot(r->slot_id);
                             active.erase(active.begin() + b);
                         }
                     }
@@ -386,6 +450,7 @@ class OpenAIServer {
             int32_t h_toks[8], h_slots[8], h_pos[8], h_out[8];
             for (int b = 0; b < B; ++b) {
                 active[b]->dspark_ready = false;
+                slot_dspark_valid[active[b]->slot_id] = false;
                 h_toks[b] = active[b]->last_tok;
                 h_slots[b] = active[b]->slot_id;
                 h_pos[b] = active[b]->pos;
@@ -397,7 +462,7 @@ class OpenAIServer {
                 auto& r = active[b];
                 if (r->cancelled) {
                     r->mark_done();
-                    slot_used[r->slot_id] = false;
+                    release_slot(r->slot_id);
                     active.erase(active.begin() + b);
                     continue;
                 }
@@ -405,9 +470,10 @@ class OpenAIServer {
                 r->pos += 1;
                 r->generated += 1;
                 r->push_token(r->last_tok);
+                publish_slot(r);
                 if (r->last_tok == tok_.eos_id || r->generated >= r->max_tokens) {
                     r->mark_done();
-                    slot_used[r->slot_id] = false;
+                    release_slot(r->slot_id);
                     active.erase(active.begin() + b);
                 }
             }
@@ -424,12 +490,17 @@ class OpenAIServer {
         st->temperature = req.contains("temperature") ? (float)req["temperature"].as_double(0.0) : 0.0f;
         st->top_p = req.contains("top_p") ? (float)req["top_p"].as_double(1.0) : 1.0f;
         st->seed = req.contains("seed") ? (uint32_t)req["seed"].as_i64(42) : 42;
+        st->t_start = std::chrono::steady_clock::now();
+        st->start_unix_ns = now_unix_ns();
 
         std::string prompt = Tokenizer::render_chat(req);
         st->prompt_ids = tok_.encode(prompt);
         int prompt_len = (int)st->prompt_ids.size();
 
         if (prompt_len + st->max_tokens > model_.max_seq_len) {
+            metrics_.on_request_error();
+            fprintf(stderr, "[warpgrid] req_error 400 prompt=%d max_tokens=%d exceeds max_seq_len=%d\n",
+                    prompt_len, st->max_tokens, model_.max_seq_len);
             send_json(fd, 400, "{\"error\":\"prompt + max_tokens exceeds max_seq_len\"}");
             return;
         }
@@ -440,7 +511,7 @@ class OpenAIServer {
             if (!send_all(fd, hdr)) return;
         }
 
-        // Enqueue request to continuous-batching GPU worker
+        metrics_.on_enqueue();
         {
             std::lock_guard<std::mutex> lk(sched_mu_);
             pending_.push_back(st);
@@ -486,6 +557,8 @@ class OpenAIServer {
         };
 
         bool client_ok = true;
+        double ttft_ms = 0.0;
+        bool got_first = false;
         while (client_ok) {
             int32_t tid = -1;
             {
@@ -494,6 +567,10 @@ class OpenAIServer {
                 if (st->tokens.empty()) break;
                 tid = st->tokens.front();
                 st->tokens.pop_front();
+            }
+            if (!got_first) {
+                got_first = true;
+                ttft_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - st->t_start).count();
             }
             ++completion_tokens;
             if (tid == tok_.eos_id) {
@@ -527,8 +604,50 @@ class OpenAIServer {
                 }
             }
         }
-        if (!client_ok) { st->cancelled = true; return; }
+        auto record_telemetry = [&](bool cancelled, const std::string& fin_reason) {
+            double total_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - st->t_start).count();
+            double gen_ms = std::max(0.0, total_ms - ttft_ms);
+            double gen_tps = (completion_tokens > 1 && gen_ms > 0.0)
+                ? ((completion_tokens - 1) * 1000.0 / gen_ms)
+                : (total_ms > 0.0 ? (completion_tokens * 1000.0 / total_ms) : 0.0);
+            int s_steps = st->spec_steps.load(std::memory_order_relaxed);
+            int s_drafted = st->spec_drafted.load(std::memory_order_relaxed);
+            int s_accepted = st->spec_accepted.load(std::memory_order_relaxed);
+            bool used_df2 = st->used_dflash2.load(std::memory_order_relaxed);
+            double mean_a = s_steps > 0 ? (double)(s_accepted + s_steps) / (double)s_steps : 0.0;
+
+            RequestSpan sp;
+            sp.model = served_name_;
+            sp.slot_id = st->slot_id;
+            sp.prompt_tokens = prompt_len;
+            sp.cached_tokens = st->cached_tokens;
+            sp.completion_tokens = completion_tokens;
+            sp.ttft_ms = ttft_ms;
+            sp.total_ms = total_ms;
+            sp.gen_tok_per_sec = gen_tps;
+            sp.spec_mean_a = mean_a;
+            sp.dflash2_active = used_df2;
+            sp.finish_reason = cancelled ? "cancelled" : fin_reason;
+            sp.cancelled = cancelled;
+            sp.error = st->error;
+            sp.start_unix_ns = st->start_unix_ns;
+            sp.end_unix_ns = now_unix_ns();
+
+            metrics_.on_request_complete(sp, s_steps, s_drafted, s_accepted);
+            otlp_.emit(sp);
+            const char* spec_lbl = s_steps > 0 ? (used_df2 ? "df2" : "dspark") : "off";
+            fprintf(stderr, "[warpgrid] req slot=%d prompt=%d cached=%d gen=%d ttft=%.1fms tps=%.2f spec=%s(mean_a=%.2f) temp=%.2f finish=%s\n",
+                    st->slot_id, prompt_len, st->cached_tokens, completion_tokens, ttft_ms, gen_tps,
+                    spec_lbl, mean_a, st->temperature, sp.finish_reason.c_str());
+        };
+
+        if (!client_ok) {
+            st->cancelled.store(true, std::memory_order_relaxed);
+            record_telemetry(true, "cancelled");
+            return;
+        }
         finish_tool_buf();
+        record_telemetry(false, finish_reason);
 
         if (stream) {
             std::string end_chunk = "{\"id\":\"chatcmpl-warpgrid\",\"object\":\"chat.completion.chunk\",\"model\":"
@@ -599,6 +718,10 @@ class OpenAIServer {
 
         if (req_line.rfind("GET /health", 0) == 0) {
             send_json(fd, 200, "{\"status\":\"ok\"}");
+        } else if (req_line.rfind("GET /status", 0) == 0) {
+            send_json(fd, 200, metrics_.format_status_json());
+        } else if (req_line.rfind("GET /metrics", 0) == 0) {
+            send_text(fd, 200, "text/plain; version=0.0.4; charset=utf-8", metrics_.format_prometheus());
         } else if (req_line.rfind("GET /v1/models", 0) == 0) {
             send_json(fd, 200, "{\"object\":\"list\",\"data\":[{\"id\":" + json::escape_str(served_name_) + ",\"object\":\"model\"}]}");
         } else if (req_line.rfind("POST /v1/chat/completions", 0) == 0) {
@@ -606,6 +729,8 @@ class OpenAIServer {
                 auto req = json::parse(body);
                 handle_chat(fd, req);
             } catch (const std::exception& e) {
+                metrics_.on_request_error();
+                fprintf(stderr, "[warpgrid] req_error 400 %s\n", e.what());
                 send_json(fd, 400, std::string("{\"error\":") + json::escape_str(e.what()) + "}");
             }
         } else {
@@ -615,8 +740,20 @@ class OpenAIServer {
     }
 
 public:
-    OpenAIServer(Inkling2Model& m, Tokenizer& t, std::string name, int port)
-        : model_(m), tok_(t), served_name_(std::move(name)), port_(port) {}
+    OpenAIServer(Inkling2Model& m, Tokenizer& t, std::string name, int port, std::string otlp_endpoint = "")
+        : model_(m),
+          tok_(t),
+          served_name_(std::move(name)),
+          port_(port),
+          metrics_(served_name_,
+#ifdef WARPGRID_METAL
+                   "metal",
+#else
+                   "cuda",
+#endif
+                   m.max_slots, m.max_seq_len, !m.dflash2_dir.empty(),
+                   parse_http_url(otlp_endpoint).valid),
+          otlp_(otlp_endpoint) {}
 
     ~OpenAIServer() {
         stop_worker_ = true;

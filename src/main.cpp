@@ -25,6 +25,7 @@ int main(int argc, char** argv) {
     std::string dflash2_dir;
     std::string dump_imatrix_path;
     std::string calib_file;
+    std::string otlp_endpoint;
     int moe_group_thresh = 64;
     std::string bench_prompt = "What is 17 * 19? Reply with just the number.";
 
@@ -45,6 +46,7 @@ int main(int argc, char** argv) {
         else if (a == "--dflash2" && i + 1 < argc) dflash2_dir = argv[++i];
         else if (a == "--dump-imatrix" && i + 1 < argc) dump_imatrix_path = argv[++i];
         else if (a == "--calib-file" && i + 1 < argc) calib_file = argv[++i];
+        else if (a == "--otlp-endpoint" && i + 1 < argc) otlp_endpoint = argv[++i];
         else if (a == "--moe-group-thresh" && i + 1 < argc) moe_group_thresh = std::stoi(argv[++i]);
         else if (a == "--prompt" && i + 1 < argc) bench_prompt = argv[++i];
         else if (a == "--no-gemv") no_gemv = true;
@@ -227,7 +229,7 @@ int main(int argc, char** argv) {
             return 0;
         }
 
-        ink::OpenAIServer server(model, tok, served_name, port);
+        ink::OpenAIServer server(model, tok, served_name, port, otlp_endpoint);
         server.run();
     } catch (const std::exception& e) {
         fprintf(stderr, "FATAL: %s\n", e.what());

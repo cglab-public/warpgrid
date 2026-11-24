@@ -144,6 +144,8 @@ uv run --with numpy python3 scripts/quantize_q2.py \
 
 Endpoints:
 - `GET /health`
+- `GET /status` (live JSON snapshot: active/pending requests, per-slot KV occupancy, prefix-cache hit ratio, decode `tok/s`, DFlash 2 `mean_a`)
+- `GET /metrics` (Prometheus / Datadog OpenMetrics text format)
 - `GET /v1/models`
 - `POST /v1/chat/completions` (streaming SSE & non-streaming, tool calls, `reasoning_content`, `cached_tokens` usage stats)
 
@@ -160,6 +162,7 @@ Endpoints:
 | `--dflash2 <dir>` | *(empty)* | Enable native DFlash 2 drafter (`incoai/Inkling-2-Mini-DFlash2`) |
 | `--draft-k <int>` | `0` | Max speculative draft tokens (`1..7`; `6` on Metal, `7` on CUDA) |
 | `--draft-vocab-file <path>` | *(empty)* | Optional pruned frequency-ranked draft vocab binary (DSpark & CUDA DFlash 2) |
+| `--otlp-endpoint <url>` | *(off)* | Optional OTLP/HTTP JSON trace exporter (e.g. `http://127.0.0.1:4318` for Datadog / OTel Collector) |
 | `--moe-group-thresh <int>` | `64` | Token threshold `T` for grouped `cuBLASLt` NVFP4 MoE |
 | `--bench` / `--bench-tokens <N>` | `false` / `128` | Run standalone single-request decode benchmark |
 | `--prompt <text>` | *(math canary)* | Custom prompt for `--bench` mode |

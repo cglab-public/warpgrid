@@ -1,7 +1,11 @@
 #include "../src/config.hpp"
 #include "../src/json.hpp"
 #include "../src/safetensors.hpp"
+#include "../src/telemetry.hpp"
 #include "../src/tokenizer.hpp"
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -9,6 +13,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -209,12 +214,155 @@ static void test_tokenizer_bpe_roundtrip_synthetic() {
     EXPECT_EQ(tok.decode(ids, true), std::string("hi!"));
 }
 
+static void test_telemetry_metrics_and_formats() {
+    ink::ServerMetrics m("Inkling-2-Mini", "metal", 8, 139264, true, false);
+    m.on_enqueue();
+    m.on_dequeue();
+    ink::SlotTelemetry st;
+    st.slot_id = 0;
+    st.active = true;
+    st.pos = 128;
+    st.cached_tokens = 64;
+    st.generated = 32;
+    st.dflash2_active = true;
+    m.update_slot(st);
+
+    ink::RequestSpan sp;
+    sp.model = "Inkling-2-Mini";
+    sp.slot_id = 0;
+    sp.prompt_tokens = 100;
+    sp.cached_tokens = 60;
+    sp.completion_tokens = 50;
+    sp.ttft_ms = 250.0;
+    sp.total_ms = 1250.0;
+    sp.gen_tok_per_sec = 50.0;
+    sp.spec_mean_a = 4.5;
+    sp.dflash2_active = true;
+    sp.finish_reason = "stop";
+    m.on_request_complete(sp, 10, 70, 35);
+    m.clear_slot(0);
+
+    auto status = json::parse(m.format_status_json());
+    EXPECT_TRUE(status.is_object());
+    EXPECT_EQ(status["model"].as_str(), std::string("Inkling-2-Mini"));
+    EXPECT_EQ(status["max_slots"].as_int(), 8);
+    EXPECT_EQ(status["requests"]["total"].as_int(), 1);
+    EXPECT_EQ(status["tokens"]["prompt_total"].as_int(), 100);
+    EXPECT_EQ(status["tokens"]["cached_total"].as_int(), 60);
+    EXPECT_EQ(status["tokens"]["generated_total"].as_int(), 50);
+    EXPECT_TRUE(status["speculative"]["accept_ratio"].as_double() > 0.49);
+
+    std::string prom = m.format_prometheus();
+    EXPECT_TRUE(prom.find("warpgrid_requests_total 1") != std::string::npos);
+    EXPECT_TRUE(prom.find("warpgrid_prompt_tokens_total 100") != std::string::npos);
+    EXPECT_TRUE(prom.find("warpgrid_prefix_cache_hit_tokens_total 60") != std::string::npos);
+    EXPECT_TRUE(prom.find("warpgrid_generated_tokens_total 50") != std::string::npos);
+    EXPECT_TRUE(prom.find("warpgrid_spec_accept_ratio") != std::string::npos);
+    EXPECT_TRUE(prom.find("# TYPE warpgrid_requests_total counter") != std::string::npos);
+}
+
+static void test_telemetry_otlp_payload_and_loopback() {
+    ink::OtlpExporter disabled("");
+    EXPECT_TRUE(!disabled.enabled());
+
+    auto u1 = ink::parse_http_url("http://127.0.0.1:4318");
+    EXPECT_TRUE(u1.valid);
+    EXPECT_EQ(u1.host, std::string("127.0.0.1"));
+    EXPECT_EQ(u1.port, 4318);
+    EXPECT_EQ(u1.path, std::string("/v1/traces"));
+
+    auto u2 = ink::parse_http_url("http://127.0.0.1:4318/custom/traces");
+    EXPECT_TRUE(u2.valid);
+    EXPECT_EQ(u2.path, std::string("/custom/traces"));
+
+    auto u3 = ink::parse_http_url("http://[::1]:4318");
+    EXPECT_TRUE(u3.valid);
+    EXPECT_EQ(u3.host, std::string("::1"));
+    EXPECT_EQ(u3.port, 4318);
+    EXPECT_EQ(u3.path, std::string("/v1/traces"));
+
+    ink::RequestSpan sp;
+    sp.model = "Inkling-2-Mini";
+    sp.slot_id = 0;
+    sp.prompt_tokens = 120;
+    sp.cached_tokens = 80;
+    sp.completion_tokens = 40;
+    sp.ttft_ms = 180.0;
+    sp.total_ms = 980.0;
+    sp.gen_tok_per_sec = 50.0;
+    sp.spec_mean_a = 4.2;
+    sp.dflash2_active = true;
+    sp.finish_reason = "stop";
+    sp.start_unix_ns = 1700000000000000000ULL;
+    sp.end_unix_ns = 1700000000980000000ULL;
+
+    std::string payload = ink::OtlpExporter::build_otlp_span_json(sp);
+    auto root = json::parse(payload);
+    EXPECT_TRUE(root.is_object());
+    EXPECT_EQ(root["resourceSpans"].arr.size(), (size_t)1);
+    auto& span = root["resourceSpans"].arr[0]["scopeSpans"].arr[0]["spans"].arr[0];
+    EXPECT_EQ(span["name"].as_str(), std::string("chat.completions"));
+    EXPECT_EQ(span["traceId"].as_str().size(), (size_t)32);
+    EXPECT_EQ(span["spanId"].as_str().size(), (size_t)16);
+
+    int lfd = ::socket(AF_INET, SOCK_STREAM, 0);
+    EXPECT_TRUE(lfd >= 0);
+    int opt = 1;
+    ::setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    EXPECT_EQ(::bind(lfd, (sockaddr*)&addr, sizeof(addr)), 0);
+    socklen_t alen = sizeof(addr);
+    EXPECT_EQ(::getsockname(lfd, (sockaddr*)&addr, &alen), 0);
+    int port = ntohs(addr.sin_port);
+    EXPECT_EQ(::listen(lfd, 4), 0);
+
+    std::string received;
+    std::thread srv([&]() {
+        int cfd = ::accept(lfd, nullptr, nullptr);
+        if (cfd >= 0) {
+            char buf[4096];
+            ssize_t n = 0;
+            while ((n = ::recv(cfd, buf, sizeof(buf), 0)) > 0) {
+                received.append(buf, (size_t)n);
+                auto he = received.find("\r\n\r\n");
+                if (he != std::string::npos) {
+                    auto cl = received.find("Content-Length:");
+                    if (cl != std::string::npos) {
+                        size_t len = (size_t)std::strtoull(received.c_str() + cl + 15, nullptr, 10);
+                        if (received.size() >= he + 4 + len) break;
+                    }
+                }
+            }
+            const char* ok = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+            (void)::send(cfd, ok, std::strlen(ok), 0);
+            ::close(cfd);
+        }
+        ::close(lfd);
+    });
+
+    {
+        ink::OtlpExporter exp("http://127.0.0.1:" + std::to_string(port));
+        EXPECT_TRUE(exp.enabled());
+        exp.emit(sp);
+    }
+    srv.join();
+
+    EXPECT_TRUE(received.find("POST /v1/traces HTTP/1.1") != std::string::npos);
+    EXPECT_TRUE(received.find("Content-Type: application/json") != std::string::npos);
+    EXPECT_TRUE(received.find("chat.completions") != std::string::npos);
+}
+
 int main() {
     run_test("test_json_roundtrip_and_escaping", test_json_roundtrip_and_escaping);
     run_test("test_config_inkling2_parse", test_config_inkling2_parse);
     run_test("test_safetensors_portable_read_into_and_errors", test_safetensors_portable_read_into_and_errors);
     run_test("test_tokenizer_render_chat_and_tools", test_tokenizer_render_chat_and_tools);
     run_test("test_tokenizer_bpe_roundtrip_synthetic", test_tokenizer_bpe_roundtrip_synthetic);
+    run_test("test_telemetry_metrics_and_formats", test_telemetry_metrics_and_formats);
+    run_test("test_telemetry_otlp_payload_and_loopback", test_telemetry_otlp_payload_and_loopback);
     printf("Host tests: %d passed, %d failed\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;
 }
