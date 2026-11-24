@@ -22,7 +22,7 @@ Modern LLM serving frameworks like vLLM and SGLang are extraordinary pieces of s
 2. **Novel architectures outrun generic frameworks.** Next-generation models like Thinking Machines' `Inkling-2-Mini` — with 4× looped transformer layers, Attention Residuals (`AttnRes`), dynamic short-convolutions (`sconv`), 128-expert NVFP4 MoE, and `DSpark` Markov speculative drafting — pay a steep tax in Python dispatch and generic fallback kernels.
 3. **Single-binary simplicity.** Sometimes you don't want a 15 GB container, a 60-second Python boot, or a dependency tree of 200 packages just to serve a team of 8 developers from a single workstation.
 
-**`warpgrid`** is a 100% from-scratch, **~9,700-line standalone C++20/GPU** inference engine (CUDA backend today; pure portable C++20 host layer ready for Apple Metal via `metal-cpp` next) engineered from first principles around GPU memory hierarchies — where every **warp** / SIMDgroup and every GPU **grid** launch is hand-tuned to push close to the hardware bandwidth ceiling.
+**`warpgrid`** is a 100% from-scratch standalone **C++20/GPU** inference engine with native **NVIDIA Blackwell CUDA** and **Apple Silicon Metal** backends sharing a single portable C++20 host/HTTP/tokenizer/scheduler stack — engineered from first principles around GPU memory hierarchies, where every **warp** / **SIMDgroup** and every GPU **grid** launch is hand-tuned to push close to the hardware bandwidth ceiling.
 
 ---
 
@@ -59,6 +59,22 @@ Measured end-to-end over the live OpenAI-compatible HTTP/SSE server (`./warpgrid
 
 ---
 
+## Reference Benchmarks (Apple Silicon Metal — M5 Max, 128 GiB Unified RAM)
+
+Measured end-to-end over the live OpenAI-compatible HTTP/SSE server (`./warpgrid` built with `make -j` on macOS — zero Python/PyTorch/MLX dependencies — serving official `thinkingmachines/Inkling-2-Mini` NVFP4/MXFP8 + `DSpark` `mtp.safetensors` with **8 concurrent slots × 139,264 tokens**, **18.5 GiB peak RSS**):
+
+| Workload | `llama.cpp` (`IQ4_NL`) | `oMLX 0.8.3` (`oQ4e`) | **`warpgrid` (Metal)** | Notes |
+|---|---:|---:|---:|---|
+| **Cold Server Load** | — | — | **1.21 s** (+0.31 s DSpark) | Direct unified-memory safetensors load |
+| **`c=1` Code SSE (med / peak)** | 41.0 tok/s | 59.5 tok/s | **72.72 / 75.10 tok/s** | **+22.2% med / +26.2% peak** vs `oMLX` |
+| **`c=1` Prose SSE (med)** | 41.0 tok/s | 57.2 tok/s | **48.71 tok/s** | Native `DSpark` (`--draft-k 5`) |
+| **4.1K Multi-Turn Prefix Cache** | — | — | **358.2 ms** warm (**27.5×**) | Exact `cached_tokens` match |
+| **14.5K Needle-in-a-Haystack** | — | — | **387.1** prefill / **53.06** decode | **3/3 exact PASS** (Split-K FP8 attn) |
+| **132K Needle-in-a-Haystack** | — | — | **233.6** prefill / **18.8** decode | **3/3 exact PASS**, **860.9 ms** warm (**656.9×**) |
+| **Parallel Ladder (`c=1..8`)** | — | — | **68.81** (`c=1`) → **74.92 agg** (`c=8`) | Batched continuous decode |
+
+---
+
 ## Architecture & Key Optimizations
 
 - **Native Blackwell NVFP4 (`cuBLASLt` `CUDA_R_4F_E2M1`):** Swizzled `128×4` `VEC16_UE4M3` block scales hitting **195.6 TFLOPS** on GB10 for grouped MoE prefill with cached `fp4_plan_cache` descriptors — zero runtime weight dequantization.
@@ -74,14 +90,16 @@ Measured end-to-end over the live OpenAI-compatible HTTP/SSE server (`./warpgrid
 
 ## Quick Start
 
-### 1. Build (CUDA Backend)
-Requires CUDA Toolkit (12.8+ for `sm_121a`) and `g++` (C++20):
+### 1. Build (Auto-Detects macOS/Metal or Linux/CUDA)
+- **macOS (Apple Silicon M3/M4/M5):** Requires Xcode Command Line Tools (`clang++`, Metal framework; optional `xcrun metal` toolchain for precompiled `.metallib` embedding).
+- **Linux (NVIDIA Blackwell):** Requires CUDA Toolkit (12.8+ for `sm_121a`) and `g++` (C++20).
 
 ```bash
 make -j
+make test
 ```
 
-This builds a single standalone binary: `./warpgrid`.
+This builds a single standalone binary: `./warpgrid` (and runs the portable C++20 host + GPU kernel unit test suite).
 
 ### 2. Serve (OpenAI-Compatible API)
 

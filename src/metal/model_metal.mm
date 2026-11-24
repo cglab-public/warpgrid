@@ -45,8 +45,14 @@ struct AttnParams {
     uint32_t window_size; uint32_t n_heads; uint32_t n_kv_heads;
     uint32_t head_dim; uint32_t rel_extent;
 };
+struct AttnSplitKParams {
+    uint32_t start_pos; uint32_t T; uint32_t cache_cap; uint32_t is_local;
+    uint32_t window_size; uint32_t n_heads; uint32_t n_kv_heads;
+    uint32_t head_dim; uint32_t rel_extent; uint32_t num_splits;
+};
 struct RouterParams { uint32_t T; uint32_t D; uint32_t E; uint32_t K; float route_scale; };
 struct MoeParams { uint32_t T; uint32_t D; uint32_t inter; uint32_t K; float gate_cap; float up_cap; };
+struct MoeGroupParams { uint32_t total_tk; uint32_t E; };
 struct GemvParams { uint32_t M; uint32_t N; uint32_t K; uint32_t out_fp32; };
 struct QuantParams { uint32_t N; uint32_t K; };
 struct ArgmaxParams { uint32_t vocab_size; float softcap; };
@@ -185,12 +191,21 @@ struct Inkling2Model::Impl {
     id<MTLComputePipelineState> pso_rel_matmul = nil;
     id<MTLComputePipelineState> pso_attention = nil;
     id<MTLComputePipelineState> pso_attention_fp8 = nil;
+    id<MTLComputePipelineState> pso_attention_fp8_splitk = nil;
+    id<MTLComputePipelineState> pso_attention_fp8_reduce = nil;
+    id<MTLComputePipelineState> pso_attention_fp8_prefill4 = nil;
     id<MTLComputePipelineState> pso_router_logits = nil;
     id<MTLComputePipelineState> pso_router_topk = nil;
+    id<MTLComputePipelineState> pso_moe_group = nil;
     id<MTLComputePipelineState> pso_moe_nvfp4_w13 = nil;
     id<MTLComputePipelineState> pso_moe_nvfp4_w2 = nil;
+    id<MTLComputePipelineState> pso_moe_nvfp4_w13_grp = nil;
+    id<MTLComputePipelineState> pso_moe_nvfp4_w2_grp = nil;
+    id<MTLComputePipelineState> pso_moe_reduce_k = nil;
     id<MTLComputePipelineState> pso_moe_mxfp8_w13 = nil;
     id<MTLComputePipelineState> pso_moe_mxfp8_w2 = nil;
+    id<MTLComputePipelineState> pso_moe_mxfp8_w13_grp = nil;
+    id<MTLComputePipelineState> pso_moe_mxfp8_w2_grp = nil;
     id<MTLComputePipelineState> pso_bf16_gemv = nil;
     id<MTLComputePipelineState> pso_bf16_gemv_1sg = nil;
     id<MTLComputePipelineState> pso_quant_fp8 = nil;
@@ -255,6 +270,8 @@ struct Inkling2Model::Impl {
     id<MTLBuffer> b_gate = nil;
     id<MTLBuffer> b_sinks = nil;
     id<MTLBuffer> b_attn_raw = nil;
+    id<MTLBuffer> b_attn_split_ml = nil;
+    id<MTLBuffer> b_attn_split_acc = nil;
     id<MTLBuffer> b_attn_proj = nil;
     id<MTLBuffer> b_attn_out = nil;
     id<MTLBuffer> b_mlp_raw = nil;
@@ -263,6 +280,9 @@ struct Inkling2Model::Impl {
     id<MTLBuffer> b_topk_weights = nil;
     id<MTLBuffer> b_router_logits = nil;
     id<MTLBuffer> b_moe_act = nil;
+    id<MTLBuffer> b_moe_offsets = nil;
+    id<MTLBuffer> b_moe_sorted_tk = nil;
+    id<MTLBuffer> b_moe_w2_out = nil;
     id<MTLBuffer> b_logits = nil;
     id<MTLBuffer> b_out_token = nil;
     id<MTLBuffer> b_aux_states = nil;
@@ -539,8 +559,10 @@ struct Inkling2Model::Impl {
 
     void forward_internal(const InklingConfig& cfg, int max_batch_tokens,
                           const int32_t* h_tokens, int T, int start_pos, int slot_id, bool do_argmax,
-                          bool profile_stages, bool save_conv_snaps, int aux_tok_offset = 0)
+                          bool profile_stages, bool save_conv_snaps, int aux_tok_offset = 0,
+                          const int32_t* batch_slots = nullptr, const int32_t* batch_positions = nullptr)
     {
+        bool batched_seq = (batch_slots != nullptr && batch_positions != nullptr);
         if (T <= 0 || T > max_batch_tokens) {
             throw std::runtime_error("Invalid T for Metal forward_internal");
         }
@@ -732,99 +754,120 @@ struct Inkling2Model::Impl {
             }
             flush_stage(prof_dense_proj_ms);
 
-            size_t kv_slot_off = (size_t)slot_id * (size_t)vc.cap * kv_dim * (vc.is_local ? 2 : 1);
-            size_t sc_slot_off = (size_t)slot_id * (size_t)vc.cap * (size_t)cfg.num_key_value_heads * sizeof(float);
-            size_t k_cs_off = (size_t)slot_id * 3 * kv_dim * 2;
-            size_t d_cs_off = (size_t)slot_id * 3 * D * 2;
             uint32_t snap_flag = save_conv_snaps ? 1u : 0u;
-            size_t k_snap_off = (size_t)slot_id * 8 * 3 * kv_dim * 2;
-            size_t d_snap_off = (size_t)slot_id * 8 * 3 * D * 2;
+            int n_seq = batched_seq ? T : 1;
+            int t_seq = batched_seq ? 1 : T;
+            uint32_t dyn_dim = (uint32_t)cfg.num_key_value_heads * 4u;
 
-            if (lw.is_local) {
-                SconvStaticParams sp{(uint32_t)T, kv_dim, snap_flag};
-                [enc setComputePipelineState:pso_sconv_static];
-                [enc setBuffer:b_K offset:0 atIndex:0];
-                [enc setBuffer:lw.k_sconv_w offset:0 atIndex:1];
-                [enc setBuffer:vc.k_conv_state offset:k_cs_off atIndex:2];
-                [enc setBuffer:b_K_conv offset:0 atIndex:3];
-                [enc setBuffer:(save_conv_snaps ? vc.k_conv_snap : b_dummy) offset:(save_conv_snaps ? k_snap_off : 0) atIndex:4];
-                [enc setBytes:&sp length:sizeof(sp) atIndex:5];
-                [enc dispatchThreads:MTLSizeMake(kv_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-
-                [enc setBuffer:b_V offset:0 atIndex:0];
-                [enc setBuffer:lw.v_sconv_w offset:0 atIndex:1];
-                [enc setBuffer:vc.v_conv_state offset:k_cs_off atIndex:2];
-                [enc setBuffer:b_V_conv offset:0 atIndex:3];
-                [enc setBuffer:(save_conv_snaps ? vc.v_conv_snap : b_dummy) offset:(save_conv_snaps ? k_snap_off : 0) atIndex:4];
-                [enc setBytes:&sp length:sizeof(sp) atIndex:5];
-                [enc dispatchThreads:MTLSizeMake(kv_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-            } else {
-                uint32_t dyn_dim = (uint32_t)cfg.num_key_value_heads * 4u;
-                SconvDynamicParams dp{(uint32_t)T, (uint32_t)cfg.num_key_value_heads, (uint32_t)cfg.head_dim, snap_flag};
-
+            if (!lw.is_local) {
                 encode_linear_bf16(enc, b_attn_in, k_in_off, lw.k_sconv_proj, 0, b_dyn_w, 0, nil, 0, (uint32_t)T, dyn_dim, D, false);
-                [enc setComputePipelineState:pso_sconv_dynamic];
-                [enc setBuffer:b_K offset:0 atIndex:0];
-                [enc setBuffer:lw.k_sconv_w offset:0 atIndex:1];
-                [enc setBuffer:b_dyn_w offset:0 atIndex:2];
-                [enc setBuffer:vc.k_conv_state offset:k_cs_off atIndex:3];
-                [enc setBuffer:b_K_conv offset:0 atIndex:4];
-                [enc setBuffer:(save_conv_snaps ? vc.k_conv_snap : b_dummy) offset:(save_conv_snaps ? k_snap_off : 0) atIndex:5];
-                [enc setBytes:&dp length:sizeof(dp) atIndex:6];
-                [enc dispatchThreads:MTLSizeMake(kv_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            }
+            for (int b = 0; b < n_seq; ++b) {
+                int s_id = batched_seq ? batch_slots[b] : slot_id;
+                size_t k_cs_off = (size_t)s_id * 3 * kv_dim * 2;
+                size_t k_snap_off = (size_t)s_id * 8 * 3 * kv_dim * 2;
+                size_t tok_kv_off = (size_t)b * kv_dim * 2;
+                size_t tok_dyn_off = (size_t)b * dyn_dim * 2;
+                if (lw.is_local) {
+                    SconvStaticParams sp{(uint32_t)t_seq, kv_dim, snap_flag};
+                    [enc setComputePipelineState:pso_sconv_static];
+                    [enc setBuffer:b_K offset:tok_kv_off atIndex:0];
+                    [enc setBuffer:lw.k_sconv_w offset:0 atIndex:1];
+                    [enc setBuffer:vc.k_conv_state offset:k_cs_off atIndex:2];
+                    [enc setBuffer:b_K_conv offset:tok_kv_off atIndex:3];
+                    [enc setBuffer:(save_conv_snaps ? vc.k_conv_snap : b_dummy) offset:(save_conv_snaps ? k_snap_off : 0) atIndex:4];
+                    [enc setBytes:&sp length:sizeof(sp) atIndex:5];
+                    [enc dispatchThreads:MTLSizeMake(kv_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 
+                    [enc setBuffer:b_V offset:tok_kv_off atIndex:0];
+                    [enc setBuffer:lw.v_sconv_w offset:0 atIndex:1];
+                    [enc setBuffer:vc.v_conv_state offset:k_cs_off atIndex:2];
+                    [enc setBuffer:b_V_conv offset:tok_kv_off atIndex:3];
+                    [enc setBuffer:(save_conv_snaps ? vc.v_conv_snap : b_dummy) offset:(save_conv_snaps ? k_snap_off : 0) atIndex:4];
+                    [enc setBytes:&sp length:sizeof(sp) atIndex:5];
+                    [enc dispatchThreads:MTLSizeMake(kv_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                } else {
+                    SconvDynamicParams dp{(uint32_t)t_seq, (uint32_t)cfg.num_key_value_heads, (uint32_t)cfg.head_dim, snap_flag};
+                    [enc setComputePipelineState:pso_sconv_dynamic];
+                    [enc setBuffer:b_K offset:tok_kv_off atIndex:0];
+                    [enc setBuffer:lw.k_sconv_w offset:0 atIndex:1];
+                    [enc setBuffer:b_dyn_w offset:tok_dyn_off atIndex:2];
+                    [enc setBuffer:vc.k_conv_state offset:k_cs_off atIndex:3];
+                    [enc setBuffer:b_K_conv offset:tok_kv_off atIndex:4];
+                    [enc setBuffer:(save_conv_snaps ? vc.k_conv_snap : b_dummy) offset:(save_conv_snaps ? k_snap_off : 0) atIndex:5];
+                    [enc setBytes:&dp length:sizeof(dp) atIndex:6];
+                    [enc dispatchThreads:MTLSizeMake(kv_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                }
+            }
+            if (!lw.is_local) {
                 encode_linear_bf16(enc, b_attn_in, v_in_off, lw.v_sconv_proj, 0, b_dyn_w, 0, nil, 0, (uint32_t)T, dyn_dim, D, false);
-                [enc setComputePipelineState:pso_sconv_dynamic];
-                [enc setBuffer:b_V offset:0 atIndex:0];
-                [enc setBuffer:lw.v_sconv_w offset:0 atIndex:1];
-                [enc setBuffer:b_dyn_w offset:0 atIndex:2];
-                [enc setBuffer:vc.v_conv_state offset:k_cs_off atIndex:3];
-                [enc setBuffer:b_V_conv offset:0 atIndex:4];
-                [enc setBuffer:(save_conv_snaps ? vc.v_conv_snap : b_dummy) offset:(save_conv_snaps ? k_snap_off : 0) atIndex:5];
-                [enc setBytes:&dp length:sizeof(dp) atIndex:6];
-                [enc dispatchThreads:MTLSizeMake(kv_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                for (int b = 0; b < n_seq; ++b) {
+                    int s_id = batched_seq ? batch_slots[b] : slot_id;
+                    size_t k_cs_off = (size_t)s_id * 3 * kv_dim * 2;
+                    size_t k_snap_off = (size_t)s_id * 8 * 3 * kv_dim * 2;
+                    size_t tok_kv_off = (size_t)b * kv_dim * 2;
+                    size_t tok_dyn_off = (size_t)b * dyn_dim * 2;
+                    SconvDynamicParams dp{(uint32_t)t_seq, (uint32_t)cfg.num_key_value_heads, (uint32_t)cfg.head_dim, snap_flag};
+                    [enc setComputePipelineState:pso_sconv_dynamic];
+                    [enc setBuffer:b_V offset:tok_kv_off atIndex:0];
+                    [enc setBuffer:lw.v_sconv_w offset:0 atIndex:1];
+                    [enc setBuffer:b_dyn_w offset:tok_dyn_off atIndex:2];
+                    [enc setBuffer:vc.v_conv_state offset:k_cs_off atIndex:3];
+                    [enc setBuffer:b_V_conv offset:tok_kv_off atIndex:4];
+                    [enc setBuffer:(save_conv_snaps ? vc.v_conv_snap : b_dummy) offset:(save_conv_snaps ? k_snap_off : 0) atIndex:5];
+                    [enc setBytes:&dp length:sizeof(dp) atIndex:6];
+                    [enc dispatchThreads:MTLSizeMake(kv_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                }
             }
 
-            {
+            for (int b = 0; b < n_seq; ++b) {
+                int s_id = batched_seq ? batch_slots[b] : slot_id;
+                int pos_b = batched_seq ? batch_positions[b] : start_pos;
+                size_t kv_slot_off = (size_t)s_id * (size_t)vc.cap * kv_dim * (vc.is_local ? 2 : 1);
+                size_t sc_slot_off = (size_t)s_id * (size_t)vc.cap * (size_t)cfg.num_key_value_heads * sizeof(float);
+                size_t tok_q_off = (size_t)b * q_dim * 2;
+                size_t tok_r_off = (size_t)b * r_dim * 2;
+                size_t tok_kv_off = (size_t)b * kv_dim * 2;
+
                 AttnPrepQRParams qrp{
-                    (uint32_t)start_pos, (uint32_t)T, lw.is_local ? 1u : 0u,
+                    (uint32_t)pos_b, (uint32_t)t_seq, lw.is_local ? 1u : 0u,
                     (uint32_t)cfg.num_attention_heads, (uint32_t)cfg.head_dim, (uint32_t)cfg.d_rel,
                     cfg.qk_l2_clip_threshold, cfg.rel_l2_clip_threshold,
                     cfg.log_scaling_n_floor, cfg.log_scaling_alpha
                 };
                 [enc setComputePipelineState:pso_attn_prep_qr];
-                [enc setBuffer:b_Q offset:0 atIndex:0];
-                [enc setBuffer:b_R offset:0 atIndex:1];
+                [enc setBuffer:b_Q offset:tok_q_off atIndex:0];
+                [enc setBuffer:b_R offset:tok_r_off atIndex:1];
                 [enc setBuffer:lw.q_clip_scale offset:0 atIndex:2];
                 [enc setBuffer:lw.rel_clip_scale offset:0 atIndex:3];
                 [enc setBytes:&qrp length:sizeof(qrp) atIndex:4];
-                [enc dispatchThreadgroups:MTLSizeMake((uint32_t)cfg.num_attention_heads, (uint32_t)T, 1)
+                [enc dispatchThreadgroups:MTLSizeMake((uint32_t)cfg.num_attention_heads, (uint32_t)t_seq, 1)
                     threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 
                 AttnPrepKVParams kvp{
-                    (uint32_t)start_pos, (uint32_t)T, (uint32_t)vc.cap, lw.is_local ? 1u : 0u,
+                    (uint32_t)pos_b, (uint32_t)t_seq, (uint32_t)vc.cap, lw.is_local ? 1u : 0u,
                     (uint32_t)cfg.num_key_value_heads, (uint32_t)cfg.head_dim,
                     cfg.qk_l2_clip_threshold, cfg.rms_norm_eps
                 };
                 if (vc.is_local) {
                     [enc setComputePipelineState:pso_attn_prep_kv];
-                    [enc setBuffer:b_K_conv offset:0 atIndex:0];
-                    [enc setBuffer:b_V_conv offset:0 atIndex:1];
+                    [enc setBuffer:b_K_conv offset:tok_kv_off atIndex:0];
+                    [enc setBuffer:b_V_conv offset:tok_kv_off atIndex:1];
                     [enc setBuffer:vc.k_cache offset:kv_slot_off atIndex:2];
                     [enc setBuffer:vc.v_cache offset:kv_slot_off atIndex:3];
                     [enc setBytes:&kvp length:sizeof(kvp) atIndex:4];
-                    [enc dispatchThreadgroups:MTLSizeMake((uint32_t)cfg.num_key_value_heads, (uint32_t)T, 1)
+                    [enc dispatchThreadgroups:MTLSizeMake((uint32_t)cfg.num_key_value_heads, (uint32_t)t_seq, 1)
                         threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
                 } else {
                     [enc setComputePipelineState:pso_attn_prep_kv_fp8];
-                    [enc setBuffer:b_K_conv offset:0 atIndex:0];
-                    [enc setBuffer:b_V_conv offset:0 atIndex:1];
+                    [enc setBuffer:b_K_conv offset:tok_kv_off atIndex:0];
+                    [enc setBuffer:b_V_conv offset:tok_kv_off atIndex:1];
                     [enc setBuffer:vc.k_cache_fp8 offset:kv_slot_off atIndex:2];
                     [enc setBuffer:vc.v_cache_fp8 offset:kv_slot_off atIndex:3];
                     [enc setBuffer:vc.k_scale_fp8 offset:sc_slot_off atIndex:4];
                     [enc setBuffer:vc.v_scale_fp8 offset:sc_slot_off atIndex:5];
                     [enc setBytes:&kvp length:sizeof(kvp) atIndex:6];
-                    [enc dispatchThreadgroups:MTLSizeMake((uint32_t)cfg.num_key_value_heads, (uint32_t)T, 1)
+                    [enc dispatchThreadgroups:MTLSizeMake((uint32_t)cfg.num_key_value_heads, (uint32_t)t_seq, 1)
                         threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
                 }
             }
@@ -840,37 +883,100 @@ struct Inkling2Model::Impl {
                     threadsPerThreadgroup:MTLSizeMake(64, 4, 1)];
             }
 
-            {
-                AttnParams ap{
-                    (uint32_t)start_pos, (uint32_t)T, (uint32_t)vc.cap, lw.is_local ? 1u : 0u,
-                    (uint32_t)cfg.sliding_window_size, (uint32_t)cfg.num_attention_heads,
-                    (uint32_t)cfg.num_key_value_heads, (uint32_t)cfg.head_dim, (uint32_t)cfg.rel_extent
-                };
+            for (int b = 0; b < n_seq; ++b) {
+                int s_id = batched_seq ? batch_slots[b] : slot_id;
+                int pos_b = batched_seq ? batch_positions[b] : start_pos;
+                size_t kv_slot_off = (size_t)s_id * (size_t)vc.cap * kv_dim * (vc.is_local ? 2 : 1);
+                size_t sc_slot_off = (size_t)s_id * (size_t)vc.cap * (size_t)cfg.num_key_value_heads * sizeof(float);
+                size_t tok_q_off = (size_t)b * q_dim * 2;
+                size_t tok_rel_off = (size_t)b * (size_t)cfg.num_attention_heads * (size_t)cfg.rel_extent * 2;
+                size_t tok_sink_off = (size_t)b * (size_t)cfg.num_attention_heads * 2;
+
                 if (vc.is_local) {
+                    AttnParams ap{
+                        (uint32_t)pos_b, (uint32_t)t_seq, (uint32_t)vc.cap, 1u,
+                        (uint32_t)cfg.sliding_window_size, (uint32_t)cfg.num_attention_heads,
+                        (uint32_t)cfg.num_key_value_heads, (uint32_t)cfg.head_dim, (uint32_t)cfg.rel_extent
+                    };
                     [enc setComputePipelineState:pso_attention];
-                    [enc setBuffer:b_Q offset:0 atIndex:0];
+                    [enc setBuffer:b_Q offset:tok_q_off atIndex:0];
                     [enc setBuffer:vc.k_cache offset:kv_slot_off atIndex:1];
                     [enc setBuffer:vc.v_cache offset:kv_slot_off atIndex:2];
-                    [enc setBuffer:b_rel_logits offset:0 atIndex:3];
-                    [enc setBuffer:b_gate offset:0 atIndex:4];
-                    [enc setBuffer:b_sinks offset:0 atIndex:5];
-                    [enc setBuffer:b_attn_raw offset:0 atIndex:6];
+                    [enc setBuffer:b_rel_logits offset:tok_rel_off atIndex:3];
+                    [enc setBuffer:b_gate offset:tok_q_off atIndex:4];
+                    [enc setBuffer:b_sinks offset:tok_sink_off atIndex:5];
+                    [enc setBuffer:b_attn_raw offset:tok_q_off atIndex:6];
                     [enc setBytes:&ap length:sizeof(ap) atIndex:7];
-                    [enc dispatchThreadgroups:MTLSizeMake((uint32_t)cfg.num_attention_heads, (uint32_t)T, 1)
+                    [enc dispatchThreadgroups:MTLSizeMake((uint32_t)cfg.num_attention_heads, (uint32_t)t_seq, 1)
                         threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-                } else {
-                    [enc setComputePipelineState:pso_attention_fp8];
-                    [enc setBuffer:b_Q offset:0 atIndex:0];
+                } else if (t_seq <= 8 && (pos_b + t_seq) >= 512) {
+                    uint32_t k_end = (uint32_t)(pos_b + t_seq);
+                    uint32_t num_splits = std::min(64u, std::max(4u, k_end / 512u));
+                    AttnSplitKParams skp{
+                        (uint32_t)pos_b, (uint32_t)t_seq, (uint32_t)vc.cap, 0u,
+                        (uint32_t)cfg.sliding_window_size, (uint32_t)cfg.num_attention_heads,
+                        (uint32_t)cfg.num_key_value_heads, (uint32_t)cfg.head_dim,
+                        (uint32_t)cfg.rel_extent, num_splits
+                    };
+                    [enc setComputePipelineState:pso_attention_fp8_splitk];
+                    [enc setBuffer:b_Q offset:tok_q_off atIndex:0];
                     [enc setBuffer:vc.k_cache_fp8 offset:kv_slot_off atIndex:1];
                     [enc setBuffer:vc.v_cache_fp8 offset:kv_slot_off atIndex:2];
                     [enc setBuffer:vc.k_scale_fp8 offset:sc_slot_off atIndex:3];
                     [enc setBuffer:vc.v_scale_fp8 offset:sc_slot_off atIndex:4];
-                    [enc setBuffer:b_rel_logits offset:0 atIndex:5];
-                    [enc setBuffer:b_gate offset:0 atIndex:6];
-                    [enc setBuffer:b_sinks offset:0 atIndex:7];
-                    [enc setBuffer:b_attn_raw offset:0 atIndex:8];
+                    [enc setBuffer:b_rel_logits offset:tok_rel_off atIndex:5];
+                    [enc setBuffer:b_attn_split_ml offset:0 atIndex:6];
+                    [enc setBuffer:b_attn_split_acc offset:0 atIndex:7];
+                    [enc setBytes:&skp length:sizeof(skp) atIndex:8];
+                    [enc dispatchThreadgroups:MTLSizeMake((uint32_t)cfg.num_attention_heads, (uint32_t)t_seq, num_splits)
+                        threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+                    [enc setComputePipelineState:pso_attention_fp8_reduce];
+                    [enc setBuffer:b_attn_split_ml offset:0 atIndex:0];
+                    [enc setBuffer:b_attn_split_acc offset:0 atIndex:1];
+                    [enc setBuffer:b_gate offset:tok_q_off atIndex:2];
+                    [enc setBuffer:b_sinks offset:tok_sink_off atIndex:3];
+                    [enc setBuffer:b_attn_raw offset:tok_q_off atIndex:4];
+                    [enc setBytes:&skp length:sizeof(skp) atIndex:5];
+                    [enc dispatchThreadgroups:MTLSizeMake((uint32_t)cfg.num_attention_heads, (uint32_t)t_seq, 1)
+                        threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                } else if (t_seq >= 16) {
+                    AttnParams ap{
+                        (uint32_t)pos_b, (uint32_t)t_seq, (uint32_t)vc.cap, 0u,
+                        (uint32_t)cfg.sliding_window_size, (uint32_t)cfg.num_attention_heads,
+                        (uint32_t)cfg.num_key_value_heads, (uint32_t)cfg.head_dim, (uint32_t)cfg.rel_extent
+                    };
+                    [enc setComputePipelineState:pso_attention_fp8_prefill4];
+                    [enc setBuffer:b_Q offset:tok_q_off atIndex:0];
+                    [enc setBuffer:vc.k_cache_fp8 offset:kv_slot_off atIndex:1];
+                    [enc setBuffer:vc.v_cache_fp8 offset:kv_slot_off atIndex:2];
+                    [enc setBuffer:vc.k_scale_fp8 offset:sc_slot_off atIndex:3];
+                    [enc setBuffer:vc.v_scale_fp8 offset:sc_slot_off atIndex:4];
+                    [enc setBuffer:b_rel_logits offset:tok_rel_off atIndex:5];
+                    [enc setBuffer:b_gate offset:tok_q_off atIndex:6];
+                    [enc setBuffer:b_sinks offset:tok_sink_off atIndex:7];
+                    [enc setBuffer:b_attn_raw offset:tok_q_off atIndex:8];
                     [enc setBytes:&ap length:sizeof(ap) atIndex:9];
-                    [enc dispatchThreadgroups:MTLSizeMake((uint32_t)cfg.num_attention_heads, (uint32_t)T, 1)
+                    [enc dispatchThreadgroups:MTLSizeMake((uint32_t)cfg.num_attention_heads, (uint32_t)((t_seq + 15) / 16), 1)
+                        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                } else {
+                    AttnParams ap{
+                        (uint32_t)pos_b, (uint32_t)t_seq, (uint32_t)vc.cap, 0u,
+                        (uint32_t)cfg.sliding_window_size, (uint32_t)cfg.num_attention_heads,
+                        (uint32_t)cfg.num_key_value_heads, (uint32_t)cfg.head_dim, (uint32_t)cfg.rel_extent
+                    };
+                    [enc setComputePipelineState:pso_attention_fp8];
+                    [enc setBuffer:b_Q offset:tok_q_off atIndex:0];
+                    [enc setBuffer:vc.k_cache_fp8 offset:kv_slot_off atIndex:1];
+                    [enc setBuffer:vc.v_cache_fp8 offset:kv_slot_off atIndex:2];
+                    [enc setBuffer:vc.k_scale_fp8 offset:sc_slot_off atIndex:3];
+                    [enc setBuffer:vc.v_scale_fp8 offset:sc_slot_off atIndex:4];
+                    [enc setBuffer:b_rel_logits offset:tok_rel_off atIndex:5];
+                    [enc setBuffer:b_gate offset:tok_q_off atIndex:6];
+                    [enc setBuffer:b_sinks offset:tok_sink_off atIndex:7];
+                    [enc setBuffer:b_attn_raw offset:tok_q_off atIndex:8];
+                    [enc setBytes:&ap length:sizeof(ap) atIndex:9];
+                    [enc dispatchThreadgroups:MTLSizeMake((uint32_t)cfg.num_attention_heads, (uint32_t)t_seq, 1)
                         threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
                 }
             }
@@ -883,13 +989,17 @@ struct Inkling2Model::Impl {
             }
             flush_stage(prof_dense_proj_ms);
 
-            {
-                SconvStaticParams sp{(uint32_t)T, D, snap_flag};
+            for (int b = 0; b < n_seq; ++b) {
+                int s_id = batched_seq ? batch_slots[b] : slot_id;
+                size_t d_cs_off = (size_t)s_id * 3 * D * 2;
+                size_t d_snap_off = (size_t)s_id * 8 * 3 * D * 2;
+                size_t tok_d_off = (size_t)b * D * 2;
+                SconvStaticParams sp{(uint32_t)t_seq, D, snap_flag};
                 [enc setComputePipelineState:pso_sconv_static];
-                [enc setBuffer:b_attn_proj offset:0 atIndex:0];
+                [enc setBuffer:b_attn_proj offset:tok_d_off atIndex:0];
                 [enc setBuffer:lw.attn_sconv_w offset:0 atIndex:1];
                 [enc setBuffer:vc.attn_conv_state offset:d_cs_off atIndex:2];
-                [enc setBuffer:b_attn_out offset:0 atIndex:3];
+                [enc setBuffer:b_attn_out offset:tok_d_off atIndex:3];
                 [enc setBuffer:(save_conv_snaps ? vc.attn_conv_snap : b_dummy) offset:(save_conv_snaps ? d_snap_off : 0) atIndex:4];
                 [enc setBytes:&sp length:sizeof(sp) atIndex:5];
                 [enc dispatchThreads:MTLSizeMake(D, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
@@ -943,7 +1053,45 @@ struct Inkling2Model::Impl {
             {
                 MoeParams mp{(uint32_t)T, D, (uint32_t)cfg.intermediate_size, (uint32_t)cfg.num_experts_per_tok,
                              cfg.mlp_gate_softcap, cfg.mlp_up_softcap};
-                if (lw.is_mxfp8) {
+                if (lw.is_mxfp8 && T >= 16) {
+                    MoeGroupParams gp{(uint32_t)(T * cfg.num_experts_per_tok), (uint32_t)cfg.n_routed_experts};
+                    [enc setComputePipelineState:pso_moe_group];
+                    [enc setBuffer:b_topk_ids offset:0 atIndex:0];
+                    [enc setBuffer:b_moe_offsets offset:0 atIndex:1];
+                    [enc setBuffer:b_moe_sorted_tk offset:0 atIndex:2];
+                    [enc setBytes:&gp length:sizeof(gp) atIndex:3];
+                    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+                    [enc setComputePipelineState:pso_moe_mxfp8_w13_grp];
+                    [enc setBuffer:b_mlp_in offset:0 atIndex:0];
+                    [enc setBuffer:b_topk_weights offset:0 atIndex:1];
+                    [enc setBuffer:b_moe_offsets offset:0 atIndex:2];
+                    [enc setBuffer:b_moe_sorted_tk offset:0 atIndex:3];
+                    [enc setBuffer:lw.w13_weight offset:0 atIndex:4];
+                    [enc setBuffer:lw.w13_scale offset:0 atIndex:5];
+                    [enc setBuffer:b_moe_act offset:0 atIndex:6];
+                    [enc setBytes:&mp length:sizeof(mp) atIndex:7];
+                    [enc dispatchThreadgroups:MTLSizeMake((mp.inter + 15u) / 16u, (uint32_t)cfg.n_routed_experts, 1)
+                        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+                    [enc setComputePipelineState:pso_moe_mxfp8_w2_grp];
+                    [enc setBuffer:b_moe_act offset:0 atIndex:0];
+                    [enc setBuffer:b_moe_offsets offset:0 atIndex:1];
+                    [enc setBuffer:b_moe_sorted_tk offset:0 atIndex:2];
+                    [enc setBuffer:lw.w2_weight offset:0 atIndex:3];
+                    [enc setBuffer:lw.w2_scale offset:0 atIndex:4];
+                    [enc setBuffer:b_moe_w2_out offset:0 atIndex:5];
+                    [enc setBytes:&mp length:sizeof(mp) atIndex:6];
+                    [enc dispatchThreadgroups:MTLSizeMake((D + 31u) / 32u, (uint32_t)cfg.n_routed_experts, 1)
+                        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+                    [enc setComputePipelineState:pso_moe_reduce_k];
+                    [enc setBuffer:b_moe_w2_out offset:0 atIndex:0];
+                    [enc setBuffer:b_mlp_raw offset:0 atIndex:1];
+                    [enc setBytes:&mp length:sizeof(mp) atIndex:2];
+                    [enc dispatchThreads:MTLSizeMake(D, mp.T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    flush_stage(prof_moe_mxfp8_ms);
+                } else if (lw.is_mxfp8) {
                     [enc setComputePipelineState:pso_moe_mxfp8_w13];
                     [enc setBuffer:b_mlp_in offset:0 atIndex:0];
                     [enc setBuffer:b_topk_ids offset:0 atIndex:1];
@@ -965,6 +1113,48 @@ struct Inkling2Model::Impl {
                     [enc dispatchThreadgroups:MTLSizeMake((D + 3u) / 4u, mp.T, 1)
                         threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
                     flush_stage(prof_moe_mxfp8_ms);
+                } else if (T >= 16) {
+                    MoeGroupParams gp{(uint32_t)(T * cfg.num_experts_per_tok), (uint32_t)cfg.n_routed_experts};
+                    [enc setComputePipelineState:pso_moe_group];
+                    [enc setBuffer:b_topk_ids offset:0 atIndex:0];
+                    [enc setBuffer:b_moe_offsets offset:0 atIndex:1];
+                    [enc setBuffer:b_moe_sorted_tk offset:0 atIndex:2];
+                    [enc setBytes:&gp length:sizeof(gp) atIndex:3];
+                    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+                    [enc setComputePipelineState:pso_moe_nvfp4_w13_grp];
+                    [enc setBuffer:b_mlp_in offset:0 atIndex:0];
+                    [enc setBuffer:b_topk_weights offset:0 atIndex:1];
+                    [enc setBuffer:b_moe_offsets offset:0 atIndex:2];
+                    [enc setBuffer:b_moe_sorted_tk offset:0 atIndex:3];
+                    [enc setBuffer:lw.w13_weight offset:0 atIndex:4];
+                    [enc setBuffer:lw.w13_scale offset:0 atIndex:5];
+                    [enc setBuffer:lw.w13_amax offset:0 atIndex:6];
+                    [enc setBuffer:lw.w13_denom offset:0 atIndex:7];
+                    [enc setBuffer:b_moe_act offset:0 atIndex:8];
+                    [enc setBytes:&mp length:sizeof(mp) atIndex:9];
+                    [enc dispatchThreadgroups:MTLSizeMake((mp.inter + 15u) / 16u, (uint32_t)cfg.n_routed_experts, 1)
+                        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+                    [enc setComputePipelineState:pso_moe_nvfp4_w2_grp];
+                    [enc setBuffer:b_moe_act offset:0 atIndex:0];
+                    [enc setBuffer:b_moe_offsets offset:0 atIndex:1];
+                    [enc setBuffer:b_moe_sorted_tk offset:0 atIndex:2];
+                    [enc setBuffer:lw.w2_weight offset:0 atIndex:3];
+                    [enc setBuffer:lw.w2_scale offset:0 atIndex:4];
+                    [enc setBuffer:lw.w2_amax offset:0 atIndex:5];
+                    [enc setBuffer:lw.w2_denom offset:0 atIndex:6];
+                    [enc setBuffer:b_moe_w2_out offset:0 atIndex:7];
+                    [enc setBytes:&mp length:sizeof(mp) atIndex:8];
+                    [enc dispatchThreadgroups:MTLSizeMake((D + 31u) / 32u, (uint32_t)cfg.n_routed_experts, 1)
+                        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+                    [enc setComputePipelineState:pso_moe_reduce_k];
+                    [enc setBuffer:b_moe_w2_out offset:0 atIndex:0];
+                    [enc setBuffer:b_mlp_raw offset:0 atIndex:1];
+                    [enc setBytes:&mp length:sizeof(mp) atIndex:2];
+                    [enc dispatchThreads:MTLSizeMake(D, mp.T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    flush_stage(prof_moe_nvfp4_ms);
                 } else {
                     [enc setComputePipelineState:pso_moe_nvfp4_w13];
                     [enc setBuffer:b_mlp_in offset:0 atIndex:0];
@@ -994,13 +1184,17 @@ struct Inkling2Model::Impl {
                 }
             }
 
-            {
-                SconvStaticParams sp{(uint32_t)T, D, snap_flag};
+            for (int b = 0; b < n_seq; ++b) {
+                int s_id = batched_seq ? batch_slots[b] : slot_id;
+                size_t d_cs_off = (size_t)s_id * 3 * D * 2;
+                size_t d_snap_off = (size_t)s_id * 8 * 3 * D * 2;
+                size_t tok_d_off = (size_t)b * D * 2;
+                SconvStaticParams sp{(uint32_t)t_seq, D, snap_flag};
                 [enc setComputePipelineState:pso_sconv_static];
-                [enc setBuffer:b_mlp_raw offset:0 atIndex:0];
+                [enc setBuffer:b_mlp_raw offset:tok_d_off atIndex:0];
                 [enc setBuffer:lw.mlp_sconv_w offset:0 atIndex:1];
                 [enc setBuffer:vc.mlp_conv_state offset:d_cs_off atIndex:2];
-                [enc setBuffer:b_mlp_out offset:0 atIndex:3];
+                [enc setBuffer:b_mlp_out offset:tok_d_off atIndex:3];
                 [enc setBuffer:(save_conv_snaps ? vc.mlp_conv_snap : b_dummy) offset:(save_conv_snaps ? d_snap_off : 0) atIndex:4];
                 [enc setBytes:&sp length:sizeof(sp) atIndex:5];
                 [enc dispatchThreads:MTLSizeMake(D, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
@@ -1044,7 +1238,7 @@ struct Inkling2Model::Impl {
         }
         flush_stage(prof_attn_res_ctrl_ms);
 
-        if (save_conv_snaps) {
+        if (save_conv_snaps || batched_seq) {
             encode_linear_fp8(enc, b_mlp_in, 0, unembed_fp8, 0, unembed_sc, 0, nil, 0, b_logits, 0,
                               (uint32_t)T, (uint32_t)cfg.unpadded_vocab_size, D, true);
             BatchArgParams bap{(uint32_t)T, (uint32_t)cfg.unpadded_vocab_size};
@@ -1475,6 +1669,41 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
         impl_->gpu_low_mem = (impl_->gpu_ws_gib <= 24.0);
         impl_->queue = [impl_->device newCommandQueue];
 
+        {
+            int n_global_visits = 0;
+            int n_local_visits = 0;
+            for (int i = 0; i < cfg.loop_core_start; ++i) (cfg.is_local(i) ? n_local_visits : n_global_visits)++;
+            for (int p = 0; p < cfg.loop_num_passes; ++p)
+                for (int i = cfg.loop_core_start; i < cfg.loop_core_end; ++i) (cfg.is_local(i) ? n_local_visits : n_global_visits)++;
+            for (int i = cfg.loop_core_end; i < cfg.num_hidden_layers; ++i) (cfg.is_local(i) ? n_local_visits : n_global_visits)++;
+
+            int kv_dim_est = cfg.num_key_value_heads * cfg.head_dim;
+            double weight_gib = 21.2 + (draft_k > 0 ? 0.8 : 0.0);
+            double avail_kv_gib = std::max(0.5, impl_->gpu_ws_gib * 0.90 - weight_gib);
+            auto est_kv_gib = [&](int slots, int seq) -> double {
+                double g_bytes = (double)n_global_visits * slots * seq * (2.0 * kv_dim_est + 2.0 * cfg.num_key_value_heads * 4.0);
+                double l_bytes = (double)n_local_visits * slots * (cfg.sliding_window_size + max_batch_tokens) * 4.0 * kv_dim_est * 2.0;
+                double d_bytes = (draft_k > 0) ? ((double)std::min(2, slots) * (seq + 24) * 2.0 * kv_dim_est * 2.0) : 0.0;
+                return (g_bytes + l_bytes + d_bytes) / (1024.0 * 1024.0 * 1024.0);
+            };
+            int orig_slots = max_slots;
+            int orig_seq = max_seq_len;
+            while (max_slots > 1 && est_kv_gib(max_slots, max_seq_len) > avail_kv_gib) {
+                max_slots -= 1;
+            }
+            while (max_seq_len > 2048 && est_kv_gib(max_slots, max_seq_len) > avail_kv_gib) {
+                max_seq_len = std::max(2048, max_seq_len / 2);
+            }
+            fprintf(stderr, "[warpgrid-metal] GPU shape: %s (ws=%.2f GiB, max_tg=%u, apple9=%d, low_mem=%d)\n",
+                    impl_->device.name.UTF8String, impl_->gpu_ws_gib, impl_->gpu_max_tg,
+                    impl_->gpu_is_apple9 ? 1 : 0, impl_->gpu_low_mem ? 1 : 0);
+            if (max_slots != orig_slots || max_seq_len != orig_seq) {
+                fprintf(stderr, "[warpgrid-metal] Memory budget clamped slots %d->%d, max_seq %d->%d (est KV %.2f GiB <= %.2f GiB)\n",
+                        orig_slots, max_slots, orig_seq, max_seq_len,
+                        est_kv_gib(max_slots, max_seq_len), avail_kv_gib);
+            }
+        }
+
         NSError* err = nil;
 #ifdef WARPGRID_METAL_PRECOMPILED
         dispatch_data_t data = dispatch_data_create(
@@ -1513,12 +1742,21 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
         impl_->pso_rel_matmul = impl_->make_pso("rel_logits_matmul_kernel");
         impl_->pso_attention = impl_->make_pso("attention_kernel");
         impl_->pso_attention_fp8 = impl_->make_pso("attention_fp8_kernel");
+        impl_->pso_attention_fp8_splitk = impl_->make_pso("attention_fp8_splitk_kernel");
+        impl_->pso_attention_fp8_reduce = impl_->make_pso("attention_fp8_reduce_kernel");
+        impl_->pso_attention_fp8_prefill4 = impl_->make_pso("attention_fp8_prefill4_kernel");
         impl_->pso_router_logits = impl_->make_pso("moe_router_logits_kernel");
         impl_->pso_router_topk = impl_->make_pso("moe_router_topk_kernel");
+        impl_->pso_moe_group = impl_->make_pso("moe_group_tokens_kernel");
         impl_->pso_moe_nvfp4_w13 = impl_->make_pso("moe_nvfp4_w13_kernel");
         impl_->pso_moe_nvfp4_w2 = impl_->make_pso("moe_nvfp4_w2_kernel");
+        impl_->pso_moe_nvfp4_w13_grp = impl_->make_pso("moe_nvfp4_w13_grouped_kernel");
+        impl_->pso_moe_nvfp4_w2_grp = impl_->make_pso("moe_nvfp4_w2_grouped_kernel");
+        impl_->pso_moe_reduce_k = impl_->make_pso("moe_reduce_k_kernel");
         impl_->pso_moe_mxfp8_w13 = impl_->make_pso("moe_mxfp8_w13_kernel");
         impl_->pso_moe_mxfp8_w2 = impl_->make_pso("moe_mxfp8_w2_kernel");
+        impl_->pso_moe_mxfp8_w13_grp = impl_->make_pso("moe_mxfp8_w13_grouped_kernel");
+        impl_->pso_moe_mxfp8_w2_grp = impl_->make_pso("moe_mxfp8_w2_grouped_kernel");
         impl_->pso_bf16_gemv = impl_->make_pso("bf16_gemv_kernel");
         impl_->pso_bf16_gemv_1sg = impl_->make_pso("bf16_gemv_1sg_kernel");
         impl_->pso_quant_fp8 = impl_->make_pso("quantize_bf16_to_fp8_rowwise_kernel");
@@ -1758,6 +1996,8 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
         impl_->b_gate = impl_->alloc_shared((size_t)T * q_dim * 2);
         impl_->b_sinks = impl_->alloc_shared((size_t)T * cfg.num_attention_heads * 2);
         impl_->b_attn_raw = impl_->alloc_shared((size_t)T * q_dim * 2);
+        impl_->b_attn_split_ml = impl_->alloc_shared((size_t)8 * cfg.num_attention_heads * 64 * 2 * sizeof(float));
+        impl_->b_attn_split_acc = impl_->alloc_shared((size_t)8 * cfg.num_attention_heads * 64 * cfg.head_dim * sizeof(float));
         impl_->b_attn_proj = impl_->alloc_shared((size_t)T * D * 2);
         impl_->b_attn_out = impl_->alloc_shared((size_t)T * D * 2);
         impl_->b_mlp_raw = impl_->alloc_shared((size_t)T * D * 2);
@@ -1766,6 +2006,9 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
         impl_->b_topk_weights = impl_->alloc_shared((size_t)T * cfg.num_experts_per_tok * sizeof(float));
         impl_->b_router_logits = impl_->alloc_shared((size_t)T * cfg.n_routed_experts * sizeof(float));
         impl_->b_moe_act = impl_->alloc_shared((size_t)T * cfg.num_experts_per_tok * cfg.intermediate_size * sizeof(float));
+        impl_->b_moe_offsets = impl_->alloc_shared((size_t)(cfg.n_routed_experts + 1) * sizeof(uint32_t));
+        impl_->b_moe_sorted_tk = impl_->alloc_shared((size_t)T * cfg.num_experts_per_tok * sizeof(uint32_t));
+        impl_->b_moe_w2_out = impl_->alloc_shared((size_t)T * cfg.num_experts_per_tok * D * 2);
         impl_->b_logits = impl_->alloc_shared((size_t)8 * cfg.vocab_size * sizeof(float));
         impl_->b_out_token = impl_->alloc_shared(16 * sizeof(int32_t));
         impl_->b_aux_states = impl_->alloc_shared((size_t)4 * T * D * 2);
@@ -1873,8 +2116,25 @@ void Inkling2Model::forward_batch_decode_greedy(
     const int32_t* h_tokens, const int32_t* h_slots, const int32_t* h_positions,
     int B, int32_t* h_out_tokens)
 {
-    for (int b = 0; b < B; ++b) {
-        h_out_tokens[b] = forward_and_greedy(&h_tokens[b], 1, h_positions[b], h_slots[b]);
+    @autoreleasepool {
+        if (B <= 0) return;
+        if (B == 1) {
+            h_out_tokens[0] = forward_and_greedy(&h_tokens[0], 1, h_positions[0], h_slots[0]);
+            return;
+        }
+        int off = 0;
+        int max_b = std::max(1, std::min(8, max_batch_tokens));
+        while (off < B) {
+            int chunk = std::min(max_b, B - off);
+            if (chunk == 1) {
+                h_out_tokens[off] = forward_and_greedy(&h_tokens[off], 1, h_positions[off], h_slots[off]);
+            } else {
+                impl_->forward_internal(cfg, max_batch_tokens, h_tokens + off, chunk, 0, 0, true,
+                                        profile_stages, false, 0, h_slots + off, h_positions + off);
+                memcpy(h_out_tokens + off, impl_->b_out_token.contents, (size_t)chunk * sizeof(int32_t));
+            }
+            off += chunk;
+        }
     }
 }
 

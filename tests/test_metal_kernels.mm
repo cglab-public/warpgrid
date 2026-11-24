@@ -522,6 +522,163 @@ static void test_dspark_and_verify_kernels() {
     }
 }
 
+static void test_attention_fp8_splitk() {
+    struct AttnPrepKVParams {
+        uint32_t start_pos, T, cache_cap, is_local, n_kv_heads, head_dim;
+        float clip_thresh, eps;
+    };
+    struct AttnParams {
+        uint32_t start_pos, T, cache_cap, is_local, window_size, n_heads, n_kv_heads, head_dim, rel_extent;
+    };
+    struct AttnSplitKParams {
+        uint32_t start_pos, T, cache_cap, is_local, window_size, n_heads, n_kv_heads, head_dim, rel_extent, num_splits;
+    };
+
+    const uint32_t S = 1024;
+    const uint32_t T = 2;
+    const uint32_t n_heads = 6;
+    const uint32_t n_kv_heads = 2;
+    const uint32_t head_dim = 128;
+    const uint32_t rel_extent = 16;
+    const uint32_t num_splits = 8;
+
+    id<MTLBuffer> bKraw = g_ctx.buf(S * n_kv_heads * head_dim * 2);
+    id<MTLBuffer> bVraw = g_ctx.buf(S * n_kv_heads * head_dim * 2);
+    id<MTLBuffer> bKfp8 = g_ctx.buf(S * n_kv_heads * head_dim);
+    id<MTLBuffer> bVfp8 = g_ctx.buf(S * n_kv_heads * head_dim);
+    id<MTLBuffer> bKsc = g_ctx.buf(S * n_kv_heads * 4);
+    id<MTLBuffer> bVsc = g_ctx.buf(S * n_kv_heads * 4);
+    id<MTLBuffer> bQ = g_ctx.buf(T * n_heads * head_dim * 2);
+    id<MTLBuffer> bRel = g_ctx.buf(T * n_heads * rel_extent * 2);
+    id<MTLBuffer> bGate = g_ctx.buf(T * n_heads * head_dim * 2);
+    id<MTLBuffer> bSinks = g_ctx.buf(T * n_heads * 2);
+    id<MTLBuffer> bOutRef = g_ctx.buf(T * n_heads * head_dim * 2);
+    id<MTLBuffer> bOutSplit = g_ctx.buf(T * n_heads * head_dim * 2);
+    id<MTLBuffer> bPartML = g_ctx.buf(T * n_heads * num_splits * 2 * 4);
+    id<MTLBuffer> bPartAcc = g_ctx.buf(T * n_heads * num_splits * head_dim * 4);
+
+    uint16_t* kr = (uint16_t*)bKraw.contents;
+    uint16_t* vr = (uint16_t*)bVraw.contents;
+    for (uint32_t i = 0; i < S * n_kv_heads * head_dim; ++i) {
+        kr[i] = f32_to_bf16(0.5f * sinf(0.013f * (float)i));
+        vr[i] = f32_to_bf16(0.4f * cosf(0.017f * (float)i));
+    }
+    uint16_t* qp = (uint16_t*)bQ.contents;
+    uint16_t* gp = (uint16_t*)bGate.contents;
+    for (uint32_t i = 0; i < T * n_heads * head_dim; ++i) {
+        qp[i] = f32_to_bf16(0.6f * sinf(0.029f * (float)i + 0.3f));
+        gp[i] = f32_to_bf16(0.3f * cosf(0.011f * (float)i));
+    }
+    uint16_t* rp = (uint16_t*)bRel.contents;
+    for (uint32_t i = 0; i < T * n_heads * rel_extent; ++i) {
+        rp[i] = f32_to_bf16(0.1f * sinf(0.1f * (float)i));
+    }
+    uint16_t* sp = (uint16_t*)bSinks.contents;
+    for (uint32_t i = 0; i < T * n_heads; ++i) {
+        sp[i] = f32_to_bf16(-0.5f + 0.1f * (float)i);
+    }
+
+    id<MTLComputePipelineState> p_prep = g_ctx.pso("attn_prep_kv_fp8_kernel");
+    id<MTLComputePipelineState> p_ref = g_ctx.pso("attention_fp8_kernel");
+    id<MTLComputePipelineState> p_sk = g_ctx.pso("attention_fp8_splitk_kernel");
+    id<MTLComputePipelineState> p_red = g_ctx.pso("attention_fp8_reduce_kernel");
+    id<MTLComputePipelineState> p_fl = g_ctx.pso("attention_fp8_prefill4_kernel");
+    EXPECT_TRUE(p_prep != nil && p_ref != nil && p_sk != nil && p_red != nil && p_fl != nil);
+
+    id<MTLCommandBuffer> cb = [g_ctx.q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+
+    AttnPrepKVParams kvp{0u, S, S, 0u, n_kv_heads, head_dim, 100.0f, 1e-6f};
+    [enc setComputePipelineState:p_prep];
+    [enc setBuffer:bKraw offset:0 atIndex:0];
+    [enc setBuffer:bVraw offset:0 atIndex:1];
+    [enc setBuffer:bKfp8 offset:0 atIndex:2];
+    [enc setBuffer:bVfp8 offset:0 atIndex:3];
+    [enc setBuffer:bKsc offset:0 atIndex:4];
+    [enc setBuffer:bVsc offset:0 atIndex:5];
+    [enc setBytes:&kvp length:sizeof(kvp) atIndex:6];
+    [enc dispatchThreadgroups:MTLSizeMake(n_kv_heads, S, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+    uint32_t start_pos = S - T;
+    AttnParams ap{start_pos, T, S, 0u, 128u, n_heads, n_kv_heads, head_dim, rel_extent};
+    [enc setComputePipelineState:p_ref];
+    [enc setBuffer:bQ offset:0 atIndex:0];
+    [enc setBuffer:bKfp8 offset:0 atIndex:1];
+    [enc setBuffer:bVfp8 offset:0 atIndex:2];
+    [enc setBuffer:bKsc offset:0 atIndex:3];
+    [enc setBuffer:bVsc offset:0 atIndex:4];
+    [enc setBuffer:bRel offset:0 atIndex:5];
+    [enc setBuffer:bGate offset:0 atIndex:6];
+    [enc setBuffer:bSinks offset:0 atIndex:7];
+    [enc setBuffer:bOutRef offset:0 atIndex:8];
+    [enc setBytes:&ap length:sizeof(ap) atIndex:9];
+    [enc dispatchThreadgroups:MTLSizeMake(n_heads, T, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+    AttnSplitKParams skp{start_pos, T, S, 0u, 128u, n_heads, n_kv_heads, head_dim, rel_extent, num_splits};
+    [enc setComputePipelineState:p_sk];
+    [enc setBuffer:bQ offset:0 atIndex:0];
+    [enc setBuffer:bKfp8 offset:0 atIndex:1];
+    [enc setBuffer:bVfp8 offset:0 atIndex:2];
+    [enc setBuffer:bKsc offset:0 atIndex:3];
+    [enc setBuffer:bVsc offset:0 atIndex:4];
+    [enc setBuffer:bRel offset:0 atIndex:5];
+    [enc setBuffer:bPartML offset:0 atIndex:6];
+    [enc setBuffer:bPartAcc offset:0 atIndex:7];
+    [enc setBytes:&skp length:sizeof(skp) atIndex:8];
+    [enc dispatchThreadgroups:MTLSizeMake(n_heads, T, num_splits) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+    [enc setComputePipelineState:p_red];
+    [enc setBuffer:bPartML offset:0 atIndex:0];
+    [enc setBuffer:bPartAcc offset:0 atIndex:1];
+    [enc setBuffer:bGate offset:0 atIndex:2];
+    [enc setBuffer:bSinks offset:0 atIndex:3];
+    [enc setBuffer:bOutSplit offset:0 atIndex:4];
+    [enc setBytes:&skp length:sizeof(skp) atIndex:5];
+    [enc dispatchThreadgroups:MTLSizeMake(n_heads, T, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+    [enc endEncoding];
+    EXPECT_TRUE(g_ctx.run_cb(cb));
+
+    const uint16_t* o_ref = (const uint16_t*)bOutRef.contents;
+    const uint16_t* o_spl = (const uint16_t*)bOutSplit.contents;
+    float max_err = 0.0f;
+    for (uint32_t i = 0; i < T * n_heads * head_dim; ++i) {
+        float vr0 = bf16_to_f32(o_ref[i]);
+        float vs0 = bf16_to_f32(o_spl[i]);
+        EXPECT_TRUE(std::isfinite(vr0) && std::isfinite(vs0));
+        max_err = std::max(max_err, std::fabs(vr0 - vs0));
+    }
+    EXPECT_TRUE(max_err < 1e-2f);
+
+    id<MTLBuffer> bOutFlash = g_ctx.buf(T * n_heads * head_dim * 2);
+    id<MTLCommandBuffer> cb2 = [g_ctx.q commandBuffer];
+    id<MTLComputeCommandEncoder> enc2 = [cb2 computeCommandEncoder];
+    [enc2 setComputePipelineState:p_fl];
+    [enc2 setBuffer:bQ offset:0 atIndex:0];
+    [enc2 setBuffer:bKfp8 offset:0 atIndex:1];
+    [enc2 setBuffer:bVfp8 offset:0 atIndex:2];
+    [enc2 setBuffer:bKsc offset:0 atIndex:3];
+    [enc2 setBuffer:bVsc offset:0 atIndex:4];
+    [enc2 setBuffer:bRel offset:0 atIndex:5];
+    [enc2 setBuffer:bGate offset:0 atIndex:6];
+    [enc2 setBuffer:bSinks offset:0 atIndex:7];
+    [enc2 setBuffer:bOutFlash offset:0 atIndex:8];
+    [enc2 setBytes:&ap length:sizeof(ap) atIndex:9];
+    [enc2 dispatchThreadgroups:MTLSizeMake(n_heads, (T + 15u) / 16u, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    [enc2 endEncoding];
+    EXPECT_TRUE(g_ctx.run_cb(cb2));
+
+    const uint16_t* o_fl = (const uint16_t*)bOutFlash.contents;
+    float max_err_fl = 0.0f;
+    for (uint32_t i = 0; i < T * n_heads * head_dim; ++i) {
+        float vr0 = bf16_to_f32(o_ref[i]);
+        float vf0 = bf16_to_f32(o_fl[i]);
+        EXPECT_TRUE(std::isfinite(vr0) && std::isfinite(vf0));
+        max_err_fl = std::max(max_err_fl, std::fabs(vr0 - vf0));
+    }
+    EXPECT_TRUE(max_err_fl < 2e-2f);
+}
+
 int main() {
     @autoreleasepool {
         if (!g_ctx.init()) {
@@ -536,6 +693,7 @@ int main() {
         run_test("test_w8a16_fp8_quant_and_gemv", test_w8a16_fp8_quant_and_gemv);
         run_test("test_bf16_gemm_tiled", test_bf16_gemm_tiled);
         run_test("test_dspark_and_verify_kernels", test_dspark_and_verify_kernels);
+        run_test("test_attention_fp8_splitk", test_attention_fp8_splitk);
         printf("Metal kernel tests: %d passed, %d failed\n", g_passed, g_failed);
         return g_failed == 0 ? 0 : 1;
     }

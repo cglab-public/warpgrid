@@ -66,6 +66,7 @@ int main(int argc, char** argv) {
             std::vector<int32_t> ptoks(bench_prefill);
             for (int i = 0; i < bench_prefill; ++i) ptoks[i] = 1000 + (i % 5000);
             model.reset_cache();
+            if (profile_mode) { model.reset_profile(); model.profile_stages = true; }
             auto t0 = std::chrono::steady_clock::now();
             int pos = 0;
             while (pos < bench_prefill) {
@@ -74,6 +75,7 @@ int main(int argc, char** argv) {
                 pos += n;
             }
             auto t1 = std::chrono::steady_clock::now();
+            if (profile_mode) { model.print_profile(); model.profile_stages = false; }
             double s = std::chrono::duration<double>(t1 - t0).count();
             printf("Prefill %d tokens (chunk=%d): %.3f s -> %.1f tok/s\n",
                    bench_prefill, model.max_batch_tokens, s, bench_prefill / s);
