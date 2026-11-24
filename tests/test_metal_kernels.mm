@@ -679,6 +679,204 @@ static void test_attention_fp8_splitk() {
     EXPECT_TRUE(max_err_fl < 2e-2f);
 }
 
+static void test_moe_router_and_grouped_parity() {
+    auto p_rlog = g_ctx.pso("moe_router_logits_kernel");
+    auto p_rtop = g_ctx.pso("moe_router_topk_kernel");
+    auto p_grp  = g_ctx.pso("moe_group_tokens_kernel");
+    auto p_nv13 = g_ctx.pso("moe_nvfp4_w13_kernel");
+    auto p_nv2  = g_ctx.pso("moe_nvfp4_w2_kernel");
+    auto p_g13  = g_ctx.pso("moe_nvfp4_w13_grouped_kernel");
+    auto p_g2   = g_ctx.pso("moe_nvfp4_w2_grouped_kernel");
+    auto p_red  = g_ctx.pso("moe_reduce_k_kernel");
+    EXPECT_TRUE(p_rlog && p_rtop && p_grp && p_nv13 && p_nv2 && p_g13 && p_g2 && p_red);
+
+    const uint32_t T = 16, D = 64, inter = 32, E = 16, K = 4;
+    const float route_scale = 2.0f;
+    std::vector<uint16_t> x(T * D), gw(E * D);
+    std::vector<float> gb(E);
+    for (uint32_t i = 0; i < T * D; ++i) x[i] = f32_to_bf16(0.3f * sinf(0.13f * (float)i));
+    for (uint32_t i = 0; i < E * D; ++i) gw[i] = f32_to_bf16(0.25f * cosf(0.07f * (float)i));
+    for (uint32_t e = 0; e < E; ++e) gb[e] = 0.05f * (float)((int)e - 8);
+
+    std::vector<uint8_t> w13_u8(E * 2 * inter * (D / 2));
+    std::vector<uint8_t> w13_sc(E * 2 * inter * (D / 16), 0x38);
+    std::vector<float> w13_amax(E), w13_denom = {1.0f};
+    std::vector<uint8_t> w2_u8(E * D * (inter / 2));
+    std::vector<uint8_t> w2_sc(E * D * (inter / 16), 0x38);
+    std::vector<float> w2_amax(E), w2_denom = {1.0f};
+    for (uint32_t e = 0; e < E; ++e) {
+        w13_amax[e] = 0.5f + 0.1f * (float)e;
+        w2_amax[e] = 0.4f + 0.08f * (float)((e * 5u + 3u) % E);
+    }
+    size_t w13_e_stride = 2 * inter * (D / 2);
+    size_t w2_e_stride = D * (inter / 2);
+    for (size_t i = 0; i < w13_u8.size(); ++i) {
+        size_t e = i / w13_e_stride;
+        w13_u8[i] = (uint8_t)((((i * 3u + e * 5u + 1u) & 15u)) | ((((i * 5u + e * 3u + 2u) & 15u)) << 4));
+    }
+    for (size_t i = 0; i < w2_u8.size(); ++i) {
+        size_t e = i / w2_e_stride;
+        w2_u8[i] = (uint8_t)((((i * 7u + e * 3u + 1u) & 15u)) | ((((i * 3u + e * 7u + 2u) & 15u)) << 4));
+    }
+
+    auto bx = g_ctx.buf(x.size() * 2, x.data());
+    auto bgw = g_ctx.buf(gw.size() * 2, gw.data());
+    auto bgb = g_ctx.buf(gb.size() * 4, gb.data());
+    auto brlog = g_ctx.buf(T * E * 4);
+    auto bids = g_ctx.buf(T * K * 4);
+    auto bwts = g_ctx.buf(T * K * 4);
+    auto boffs = g_ctx.buf((E + 1) * 4);
+    auto bsort = g_ctx.buf(T * K * 4);
+    auto bw13 = g_ctx.buf(w13_u8.size(), w13_u8.data());
+    auto bs13 = g_ctx.buf(w13_sc.size(), w13_sc.data());
+    auto ba13 = g_ctx.buf(w13_amax.size() * 4, w13_amax.data());
+    auto bd13 = g_ctx.buf(4, w13_denom.data());
+    auto bw2 = g_ctx.buf(w2_u8.size(), w2_u8.data());
+    auto bs2 = g_ctx.buf(w2_sc.size(), w2_sc.data());
+    auto ba2 = g_ctx.buf(w2_amax.size() * 4, w2_amax.data());
+    auto bd2 = g_ctx.buf(4, w2_denom.data());
+    auto bact_ref = g_ctx.buf(T * K * inter * 4);
+    auto bout_ref = g_ctx.buf(T * D * 2);
+    auto bact_grp = g_ctx.buf(T * K * inter * 4);
+    auto bw2_grp = g_ctx.buf(T * K * D * 2);
+    auto bout_grp = g_ctx.buf(T * D * 2);
+
+    struct RouterParams { uint32_t T; uint32_t D; uint32_t E; uint32_t K; float route_scale; } rp{T, D, E, K, route_scale};
+    struct MoeGroupParams { uint32_t total_tk; uint32_t E; } gp{T * K, E};
+    struct MoeParams { uint32_t T; uint32_t D; uint32_t inter; uint32_t K; float gate_cap; float up_cap; } mp{T, D, inter, K, 4.0f, 25.0f};
+
+    id<MTLCommandBuffer> cb = [g_ctx.q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+
+    [enc setComputePipelineState:p_rlog];
+    [enc setBuffer:bx offset:0 atIndex:0];
+    [enc setBuffer:bgw offset:0 atIndex:1];
+    [enc setBuffer:brlog offset:0 atIndex:2];
+    [enc setBytes:&rp length:sizeof(rp) atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake(E, T, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+    [enc setComputePipelineState:p_rtop];
+    [enc setBuffer:brlog offset:0 atIndex:0];
+    [enc setBuffer:bgb offset:0 atIndex:1];
+    [enc setBuffer:bids offset:0 atIndex:2];
+    [enc setBuffer:bwts offset:0 atIndex:3];
+    [enc setBytes:&rp length:sizeof(rp) atIndex:4];
+    [enc dispatchThreadgroups:MTLSizeMake(T, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+    [enc setComputePipelineState:p_nv13];
+    [enc setBuffer:bx offset:0 atIndex:0];
+    [enc setBuffer:bids offset:0 atIndex:1];
+    [enc setBuffer:bwts offset:0 atIndex:2];
+    [enc setBuffer:bw13 offset:0 atIndex:3];
+    [enc setBuffer:bs13 offset:0 atIndex:4];
+    [enc setBuffer:ba13 offset:0 atIndex:5];
+    [enc setBuffer:bd13 offset:0 atIndex:6];
+    [enc setBuffer:bact_ref offset:0 atIndex:7];
+    [enc setBytes:&mp length:sizeof(mp) atIndex:8];
+    [enc dispatchThreadgroups:MTLSizeMake((inter + 3u) / 4u, T * K, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+    [enc setComputePipelineState:p_nv2];
+    [enc setBuffer:bact_ref offset:0 atIndex:0];
+    [enc setBuffer:bids offset:0 atIndex:1];
+    [enc setBuffer:bw2 offset:0 atIndex:2];
+    [enc setBuffer:bs2 offset:0 atIndex:3];
+    [enc setBuffer:ba2 offset:0 atIndex:4];
+    [enc setBuffer:bd2 offset:0 atIndex:5];
+    [enc setBuffer:bout_ref offset:0 atIndex:6];
+    [enc setBytes:&mp length:sizeof(mp) atIndex:7];
+    [enc dispatchThreadgroups:MTLSizeMake((D + 3u) / 4u, T, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+    [enc setComputePipelineState:p_grp];
+    [enc setBuffer:bids offset:0 atIndex:0];
+    [enc setBuffer:boffs offset:0 atIndex:1];
+    [enc setBuffer:bsort offset:0 atIndex:2];
+    [enc setBytes:&gp length:sizeof(gp) atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+    [enc setComputePipelineState:p_g13];
+    [enc setBuffer:bx offset:0 atIndex:0];
+    [enc setBuffer:bwts offset:0 atIndex:1];
+    [enc setBuffer:boffs offset:0 atIndex:2];
+    [enc setBuffer:bsort offset:0 atIndex:3];
+    [enc setBuffer:bw13 offset:0 atIndex:4];
+    [enc setBuffer:bs13 offset:0 atIndex:5];
+    [enc setBuffer:ba13 offset:0 atIndex:6];
+    [enc setBuffer:bd13 offset:0 atIndex:7];
+    [enc setBuffer:bact_grp offset:0 atIndex:8];
+    [enc setBytes:&mp length:sizeof(mp) atIndex:9];
+    [enc dispatchThreadgroups:MTLSizeMake((inter + 15u) / 16u, E, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+    [enc setComputePipelineState:p_g2];
+    [enc setBuffer:bact_grp offset:0 atIndex:0];
+    [enc setBuffer:boffs offset:0 atIndex:1];
+    [enc setBuffer:bsort offset:0 atIndex:2];
+    [enc setBuffer:bw2 offset:0 atIndex:3];
+    [enc setBuffer:bs2 offset:0 atIndex:4];
+    [enc setBuffer:ba2 offset:0 atIndex:5];
+    [enc setBuffer:bd2 offset:0 atIndex:6];
+    [enc setBuffer:bw2_grp offset:0 atIndex:7];
+    [enc setBytes:&mp length:sizeof(mp) atIndex:8];
+    [enc dispatchThreadgroups:MTLSizeMake((D + 31u) / 32u, E, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+    [enc setComputePipelineState:p_red];
+    [enc setBuffer:bw2_grp offset:0 atIndex:0];
+    [enc setBuffer:bout_grp offset:0 atIndex:1];
+    [enc setBytes:&mp length:sizeof(mp) atIndex:2];
+    [enc dispatchThreads:MTLSizeMake(D, T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+    [enc endEncoding];
+    EXPECT_TRUE(g_ctx.run_cb(cb));
+
+    const int32_t* gids = (const int32_t*)bids.contents;
+    const float* gwts = (const float*)bwts.contents;
+    for (uint32_t t = 0; t < T; ++t) {
+        std::vector<float> sigs(E), sels(E);
+        for (uint32_t e = 0; e < E; ++e) {
+            float acc = 0.0f;
+            for (uint32_t d = 0; d < D; ++d) {
+                acc += bf16_to_f32(x[t * D + d]) * bf16_to_f32(gw[e * D + d]);
+            }
+            float s = 1.0f / (1.0f + std::exp(-acc));
+            sigs[e] = s;
+            sels[e] = s + gb[e];
+        }
+        std::vector<int32_t> ref_ids(K);
+        std::vector<float> ref_wts(K);
+        float ref_sum = 0.0f;
+        for (uint32_t k = 0; k < K; ++k) {
+            uint32_t best = 0;
+            float bv = -1e30f;
+            for (uint32_t e = 0; e < E; ++e) {
+                if (sels[e] > bv) {
+                    bv = sels[e];
+                    best = e;
+                }
+            }
+            ref_ids[k] = (int32_t)best;
+            ref_wts[k] = sigs[best];
+            ref_sum += sigs[best];
+            sels[best] = -1e30f;
+        }
+        for (uint32_t k = 0; k < K; ++k) {
+            float exp_w = ref_wts[k] * (route_scale / (ref_sum + 1e-20f));
+            EXPECT_TRUE(gids[t * K + k] == ref_ids[k]);
+            EXPECT_TRUE(std::fabs(gwts[t * K + k] - exp_w) < 2e-3f);
+        }
+    }
+
+    const uint16_t* o_ref = (const uint16_t*)bout_ref.contents;
+    const uint16_t* o_grp = (const uint16_t*)bout_grp.contents;
+    float max_rel = 0.0f;
+    for (uint32_t i = 0; i < T * D; ++i) {
+        float vr = bf16_to_f32(o_ref[i]);
+        float vg = bf16_to_f32(o_grp[i]);
+        EXPECT_TRUE(std::isfinite(vr) && std::isfinite(vg));
+        float rel = std::fabs(vr - vg) / std::max(1.0f, std::fabs(vr));
+        max_rel = std::max(max_rel, rel);
+    }
+    EXPECT_TRUE(max_rel < 2e-2f);
+}
+
 int main() {
     @autoreleasepool {
         if (!g_ctx.init()) {
@@ -694,6 +892,7 @@ int main() {
         run_test("test_bf16_gemm_tiled", test_bf16_gemm_tiled);
         run_test("test_dspark_and_verify_kernels", test_dspark_and_verify_kernels);
         run_test("test_attention_fp8_splitk", test_attention_fp8_splitk);
+        run_test("test_moe_router_and_grouped_parity", test_moe_router_and_grouped_parity);
         printf("Metal kernel tests: %d passed, %d failed\n", g_passed, g_failed);
         return g_failed == 0 ? 0 : 1;
     }
