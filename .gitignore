@@ -1,0 +1,9 @@
+warpgrid
+*.o
+*.air
+*.metallib
+src/metal/kernels_embed.hpp
+bench_hw/hw_probe_metal
+tests/test_host
+tests/test_metal_kernels
+.agenfk/
