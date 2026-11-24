@@ -155,6 +155,76 @@ def quantize_q2_g64_mse(w_f32, imp_f32=None):
     ).astype(np.uint8)
     return packed, best_sc.astype(np.float16), best_lo.astype(np.float16)
 
+def quantize_q3_g64_mse(w_f32, imp_f32=None):
+    R, K = w_f32.shape
+    assert K % 64 == 0
+    G = K // 64
+    wg = w_f32.reshape(R, G, 64)
+    if imp_f32 is not None:
+        iw = np.maximum(imp_f32.reshape(1, G, 64), 1e-8).astype(np.float32)
+    else:
+        iw = np.ones((1, G, 64), dtype=np.float32)
+
+    w_min = wg.min(axis=2, keepdims=True)
+    w_max = wg.max(axis=2, keepdims=True)
+    w_mid = 0.5 * (w_min + w_max)
+    half_r = np.maximum(0.5 * (w_max - w_min), 1e-8)
+
+    best_err = np.full((R, G), np.inf, dtype=np.float32)
+    best_lo = np.zeros((R, G), dtype=np.float32)
+    best_sc = np.zeros((R, G), dtype=np.float32)
+    best_q = np.zeros((R, G, 64), dtype=np.uint8)
+
+    for shrink in (1.0, 0.92, 0.84, 0.76):
+        lo = w_mid - shrink * half_r
+        hi = w_mid + shrink * half_r
+        sc = np.maximum((hi - lo) / 7.0, 1e-8)
+        q = np.clip(np.rint((wg - lo) / sc), 0.0, 7.0).astype(np.uint8)
+        rec = q.astype(np.float32) * sc + lo
+        err = np.sum(iw * ((wg - rec) ** 2), axis=2)
+        mask = err < best_err
+        best_err = np.where(mask, err, best_err)
+        best_lo = np.where(mask, lo[:, :, 0], best_lo)
+        best_sc = np.where(mask, sc[:, :, 0], best_sc)
+        best_q = np.where(mask[:, :, None], q, best_q)
+
+    sum_w = np.sum(iw, axis=2)
+    sum_wx = np.sum(iw * wg, axis=2)
+    q_cur = best_q
+    lo_cur = best_lo
+    sc_cur = best_sc
+    for _ in range(3):
+        qf = q_cur.astype(np.float32)
+        sum_wq = np.sum(iw * qf, axis=2)
+        sum_wq2 = np.sum(iw * qf * qf, axis=2)
+        sum_wqx = np.sum(iw * qf * wg, axis=2)
+        det = sum_w * sum_wq2 - sum_wq * sum_wq
+        valid = det > 1e-10
+        new_sc = np.where(valid, (sum_w * sum_wqx - sum_wq * sum_wx) / np.where(valid, det, 1.0), sc_cur)
+        new_sc = np.maximum(new_sc, 1e-8)
+        new_lo = np.where(valid, (sum_wx - new_sc * sum_wq) / sum_w, lo_cur)
+        new_q = np.clip(np.rint((wg - new_lo[:, :, None]) / new_sc[:, :, None]), 0.0, 7.0).astype(np.uint8)
+        rec = new_q.astype(np.float32) * new_sc[:, :, None] + new_lo[:, :, None]
+        err = np.sum(iw * ((wg - rec) ** 2), axis=2)
+        imp_mask = err < best_err
+        best_err = np.where(imp_mask, err, best_err)
+        best_lo = np.where(imp_mask, new_lo, best_lo)
+        best_sc = np.where(imp_mask, new_sc, best_sc)
+        best_q = np.where(imp_mask[:, :, None], new_q, best_q)
+        lo_cur = np.where(imp_mask, new_lo, lo_cur)
+        sc_cur = np.where(imp_mask, new_sc, sc_cur)
+        q_cur = np.where(imp_mask[:, :, None], new_q, q_cur)
+
+    q_flat = best_q.reshape(R, K)
+    lo2 = (q_flat & 3).reshape(R, K // 4, 4)
+    packed_lo = (lo2[:, :, 0] | (lo2[:, :, 1] << 2) | (lo2[:, :, 2] << 4) | (lo2[:, :, 3] << 6)).astype(np.uint8)
+    hi1 = ((q_flat >> 2) & 1).reshape(R, K // 8, 8)
+    packed_hi = (
+        hi1[:, :, 0] | (hi1[:, :, 1] << 1) | (hi1[:, :, 2] << 2) | (hi1[:, :, 3] << 3)
+        | (hi1[:, :, 4] << 4) | (hi1[:, :, 5] << 5) | (hi1[:, :, 6] << 6) | (hi1[:, :, 7] << 7)
+    ).astype(np.uint8)
+    return packed_lo, packed_hi, best_sc.astype(np.float16), best_lo.astype(np.float16)
+
 def read_safetensors_header(path):
     with open(path, "rb") as f:
         hlen = struct.unpack("<Q", f.read(8))[0]
@@ -166,15 +236,22 @@ def main():
     ap.add_argument("--src", required=True, help="Source Inkling-2-Mini model directory")
     ap.add_argument("--dst", required=True, help="Output Q2 model directory")
     ap.add_argument("--keep-nvfp4-layers", default="0,1", help="Comma-separated layer IDs to keep or convert to NVFP4")
+    ap.add_argument("--q3-layers", default="", help="Comma-separated layer IDs to quantize to 3.5-bpw Q3_G64")
     ap.add_argument("--imatrix", default="", help="Optional [24, 2304] float32 activation importance matrix binary")
+    ap.add_argument("--imatrix-w2", default="", help="Optional [24, 128, 1152] float32 per-expert w2 importance matrix binary")
     ap.add_argument("--drop-vision", action="store_true", help="Drop model.vision.* tensors to save ~1.1 GiB on disk")
     args = ap.parse_args()
 
     nvfp4_layers = set(int(x) for x in args.keep_nvfp4_layers.split(",") if x.strip())
+    q3_layers_set = set(int(x) for x in args.q3_layers.split(",") if x.strip())
     imatrix = None
     if args.imatrix:
         imatrix = np.fromfile(args.imatrix, dtype=np.float32).reshape(24, 2304)
         print(f"Loaded imatrix {args.imatrix}: shape={imatrix.shape}, mean={imatrix.mean():.4f}")
+    imatrix_w2 = None
+    if args.imatrix_w2:
+        imatrix_w2 = np.fromfile(args.imatrix_w2, dtype=np.float32).reshape(24, 128, 1152)
+        print(f"Loaded imatrix_w2 {args.imatrix_w2}: shape={imatrix_w2.shape}, mean={imatrix_w2.mean():.6f}")
 
     os.makedirs(args.dst, exist_ok=True)
     for fn in ("config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json"):
@@ -195,6 +272,7 @@ def main():
 
     skip_names = set()
     q2_layers = []
+    q3_layers = []
     conv_nvfp4_layers = []
     for i in range(24):
         p = f"model.llm.layers.{i}.mlp.experts."
@@ -205,6 +283,8 @@ def main():
             continue
         if i in nvfp4_layers and is_mxfp8:
             conv_nvfp4_layers.append(i)
+        elif i in q3_layers_set:
+            q3_layers.append(i)
         else:
             q2_layers.append(i)
         for suf in (
@@ -249,6 +329,27 @@ def main():
         add_entry(p + "w2_weight_outer_scale_denominator", "F32", [1], 4)
         nvfp4_specs.append((i, p, E, R13, K13, R2, K2))
 
+    q3_specs = []
+    for i in q3_layers:
+        p = f"model.llm.layers.{i}.mlp.experts."
+        w13_info = hdr[p + "w13_weight"]
+        w2_info = hdr[p + "w2_weight"]
+        is_mxfp8 = (w13_info["dtype"] == "F8_E4M3")
+        E, R13, K13_raw = w13_info["shape"]
+        K13 = K13_raw if is_mxfp8 else K13_raw * 2
+        _, R2, K2_raw = w2_info["shape"]
+        K2 = K2_raw if is_mxfp8 else K2_raw * 2
+
+        add_entry(p + "w13_q3_lo", "U8", [E, R13, K13 // 4], E * R13 * (K13 // 4))
+        add_entry(p + "w13_q3_hi", "U8", [E, R13, K13 // 8], E * R13 * (K13 // 8))
+        add_entry(p + "w13_q3_scale", "F16", [E, R13, K13 // 64], E * R13 * (K13 // 64) * 2)
+        add_entry(p + "w13_q3_min", "F16", [E, R13, K13 // 64], E * R13 * (K13 // 64) * 2)
+        add_entry(p + "w2_q3_lo", "U8", [E, R2, K2 // 4], E * R2 * (K2 // 4))
+        add_entry(p + "w2_q3_hi", "U8", [E, R2, K2 // 8], E * R2 * (K2 // 8))
+        add_entry(p + "w2_q3_scale", "F16", [E, R2, K2 // 64], E * R2 * (K2 // 64) * 2)
+        add_entry(p + "w2_q3_min", "F16", [E, R2, K2 // 64], E * R2 * (K2 // 64) * 2)
+        q3_specs.append((i, p, is_mxfp8, E, R13, K13, R2, K2))
+
     q2_specs = []
     for i in q2_layers:
         p = f"model.llm.layers.{i}.mlp.experts."
@@ -274,7 +375,8 @@ def main():
 
     print(
         f"Writing {dst_st} ({(cur_off + len(hdr_bytes) + 8) / (1024**3):.2f} GiB): "
-        f"{len(nvfp4_specs)} mxfp8->nvfp4, {len(q2_specs)} -> q2_g64 (imatrix={'on' if imatrix is not None else 'off'})...",
+        f"{len(nvfp4_specs)} mxfp8->nvfp4, {len(q3_specs)} -> q3_g64, {len(q2_specs)} -> q2_g64 "
+        f"(imatrix={'on' if imatrix is not None else 'off'})...",
         flush=True,
     )
     with open(src_st, "rb") as fin, open(dst_st, "wb") as fout:
@@ -314,6 +416,32 @@ def main():
                 fout.write(denom_arr.tobytes())
             print(f"  layer {i:2d} (mxfp8 -> nvfp4) done in {time.time() - tl:.2f}s", flush=True)
 
+        for i, p, is_mxfp8, E, R13, K13, R2, K2 in q3_specs:
+            tl = time.time()
+            for mat, R, K in (("w13", R13, K13), ("w2", R2, K2)):
+                w_raw = load_np(p + f"{mat}_weight", np.uint8)
+                sc_raw = load_np(p + f"{mat}_weight_scale", np.uint8)
+                if not is_mxfp8:
+                    amax = load_np(p + f"{mat}_weight_amax", np.float32)
+                    denom = float(load_np(p + f"{mat}_weight_outer_scale_denominator", np.float32).reshape(-1)[0])
+                imp = imatrix[i] if (imatrix is not None and mat == "w13") else None
+                lo_all = np.empty((E, R, K // 4), dtype=np.uint8)
+                hi_all = np.empty((E, R, K // 8), dtype=np.uint8)
+                s_all = np.empty((E, R, K // 64), dtype=np.float16)
+                m_all = np.empty((E, R, K // 64), dtype=np.float16)
+                for e in range(E):
+                    if is_mxfp8:
+                        wf = dequant_mxfp8_expert(w_raw[e], sc_raw[e])
+                    else:
+                        wf = dequant_nvfp4_expert(w_raw[e], sc_raw[e], float(amax[e]), denom)
+                    imp_e = imp if mat == "w13" else (imatrix_w2[i, e] if imatrix_w2 is not None else None)
+                    lo_all[e], hi_all[e], s_all[e], m_all[e] = quantize_q3_g64_mse(wf, imp_e)
+                fout.write(lo_all.tobytes())
+                fout.write(hi_all.tobytes())
+                fout.write(s_all.tobytes())
+                fout.write(m_all.tobytes())
+            print(f"  layer {i:2d} ({'mxfp8' if is_mxfp8 else 'nvfp4'} -> q3_g64) done in {time.time() - tl:.2f}s", flush=True)
+
         for i, p, is_mxfp8, E, R13, K13, R2, K2 in q2_specs:
             tl = time.time()
             for mat, R, K in (("w13", R13, K13), ("w2", R2, K2)):
@@ -331,7 +459,8 @@ def main():
                         wf = dequant_mxfp8_expert(w_raw[e], sc_raw[e])
                     else:
                         wf = dequant_nvfp4_expert(w_raw[e], sc_raw[e], float(amax[e]), denom)
-                    q_all[e], s_all[e], m_all[e] = quantize_q2_g64_mse(wf, imp)
+                    imp_e = imp if mat == "w13" else (imatrix_w2[i, e] if imatrix_w2 is not None else None)
+                    q_all[e], s_all[e], m_all[e] = quantize_q2_g64_mse(wf, imp_e)
                 fout.write(q_all.tobytes())
                 fout.write(s_all.tobytes())
                 fout.write(m_all.tobytes())

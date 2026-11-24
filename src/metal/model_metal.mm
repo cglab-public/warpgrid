@@ -123,6 +123,7 @@ struct MetalLayerWeights {
     bool is_loop_core = false;
     bool is_mxfp8 = false;
     bool is_q2 = false;
+    bool is_q3 = false;
 
     id<MTLBuffer> attn_norm = nil;
     id<MTLBuffer> mlp_norm = nil;
@@ -155,11 +156,13 @@ struct MetalLayerWeights {
     id<MTLBuffer> gate_bias = nil;
 
     id<MTLBuffer> w13_weight = nil;
+    id<MTLBuffer> w13_hi = nil;
     id<MTLBuffer> w13_scale = nil;
     id<MTLBuffer> w13_min = nil;
     id<MTLBuffer> w13_amax = nil;
     id<MTLBuffer> w13_denom = nil;
     id<MTLBuffer> w2_weight = nil;
+    id<MTLBuffer> w2_hi = nil;
     id<MTLBuffer> w2_scale = nil;
     id<MTLBuffer> w2_min = nil;
     id<MTLBuffer> w2_amax = nil;
@@ -240,6 +243,10 @@ struct Inkling2Model::Impl {
     id<MTLComputePipelineState> pso_moe_q2_w2 = nil;
     id<MTLComputePipelineState> pso_moe_q2_w13_dedup = nil;
     id<MTLComputePipelineState> pso_moe_q2_w2_dedup = nil;
+    id<MTLComputePipelineState> pso_moe_q3_w13 = nil;
+    id<MTLComputePipelineState> pso_moe_q3_w2 = nil;
+    id<MTLComputePipelineState> pso_moe_q3_w13_dedup = nil;
+    id<MTLComputePipelineState> pso_moe_q3_w2_dedup = nil;
     id<MTLComputePipelineState> pso_bf16_gemv = nil;
     id<MTLComputePipelineState> pso_bf16_gemv_1sg = nil;
     id<MTLComputePipelineState> pso_quant_fp8 = nil;
@@ -440,6 +447,8 @@ struct Inkling2Model::Impl {
     int prof_steps = 0;
     bool capture_imatrix = false;
     std::vector<double> imatrix_sq;
+    std::vector<double> imatrix_w2_sq;
+    std::vector<int64_t> imatrix_w2_cnt;
     int64_t imatrix_tokens = 0;
 
     id<MTLBuffer> alloc_shared(size_t bytes) {
@@ -794,7 +803,7 @@ struct Inkling2Model::Impl {
             }
             flush_stage(prof_attn_res_ctrl_ms);
 
-            if (T <= 8) {
+            if (T <= 8 || !lw.w_qrgs) {
                 encode_linear_fp8(enc, b_attn_in, q_in_off, lw.w_qrgs_fp8, 0, lw.w_qrgs_sc, 0,
                                   b_qrgs, 0, nil, 0, (uint32_t)T, qrgs_dim, D, false);
             } else {
@@ -814,7 +823,7 @@ struct Inkling2Model::Impl {
             }
 
             if (k_in_off == v_in_off) {
-                if (T <= 8) {
+                if (T <= 8 || !lw.w_kv) {
                     encode_linear_fp8(enc, b_attn_in, k_in_off, lw.w_kv_fp8, 0, lw.w_kv_sc, 0,
                                       b_kv_out, 0, nil, 0, (uint32_t)T, 2u * kv_dim, D, false);
                 } else {
@@ -829,7 +838,7 @@ struct Inkling2Model::Impl {
                 [enc dispatchThreads:MTLSizeMake(2u * kv_dim, (uint32_t)T, 1)
                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             } else {
-                if (T <= 8) {
+                if (T <= 8 || !lw.w_kv) {
                     encode_linear_fp8(enc, b_attn_in, k_in_off, lw.w_kv_fp8, 0, lw.w_kv_sc, 0,
                                       b_K, 0, nil, 0, (uint32_t)T, kv_dim, D, false);
                     encode_linear_fp8(enc, b_attn_in, v_in_off, lw.w_kv_fp8, (size_t)kv_dim * D, lw.w_kv_sc, (size_t)kv_dim * sizeof(float),
@@ -1069,7 +1078,7 @@ struct Inkling2Model::Impl {
             }
             flush_stage(prof_attn_sconv_ms);
 
-            if (T <= 8) {
+            if (T <= 8 || !lw.wo) {
                 encode_linear_fp8(enc, b_attn_raw, 0, lw.wo_fp8, 0, lw.wo_sc, 0, b_attn_proj, 0, nil, 0, (uint32_t)T, D, q_dim, false);
             } else {
                 encode_linear_bf16(enc, b_attn_raw, 0, lw.wo, 0, b_attn_proj, 0, nil, 0, (uint32_t)T, D, q_dim, false);
@@ -1156,7 +1165,75 @@ struct Inkling2Model::Impl {
             {
                 MoeParams mp{(uint32_t)T, D, (uint32_t)cfg.intermediate_size, (uint32_t)cfg.num_experts_per_tok,
                              cfg.mlp_gate_softcap, cfg.mlp_up_softcap};
-                if (lw.is_q2 && T >= 2) {
+                if (lw.is_q3 && T >= 2) {
+                    MoeGroupParams gp{(uint32_t)(T * cfg.num_experts_per_tok), (uint32_t)cfg.n_routed_experts};
+                    [enc setComputePipelineState:pso_moe_group];
+                    [enc setBuffer:b_topk_ids offset:0 atIndex:0];
+                    [enc setBuffer:b_moe_offsets offset:0 atIndex:1];
+                    [enc setBuffer:b_moe_sorted_tk offset:0 atIndex:2];
+                    [enc setBytes:&gp length:sizeof(gp) atIndex:3];
+                    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+                    [enc setComputePipelineState:pso_moe_q3_w13_dedup];
+                    [enc setBuffer:b_mlp_in offset:0 atIndex:0];
+                    [enc setBuffer:b_topk_weights offset:0 atIndex:1];
+                    [enc setBuffer:b_moe_offsets offset:0 atIndex:2];
+                    [enc setBuffer:b_moe_sorted_tk offset:0 atIndex:3];
+                    [enc setBuffer:lw.w13_weight offset:0 atIndex:4];
+                    [enc setBuffer:lw.w13_hi offset:0 atIndex:5];
+                    [enc setBuffer:lw.w13_scale offset:0 atIndex:6];
+                    [enc setBuffer:lw.w13_min offset:0 atIndex:7];
+                    [enc setBuffer:b_moe_act offset:0 atIndex:8];
+                    [enc setBytes:&mp length:sizeof(mp) atIndex:9];
+                    [enc dispatchThreadgroups:MTLSizeMake((mp.inter + 3u) / 4u, (uint32_t)cfg.n_routed_experts, 1)
+                        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+                    [enc setComputePipelineState:pso_moe_q3_w2_dedup];
+                    [enc setBuffer:b_moe_act offset:0 atIndex:0];
+                    [enc setBuffer:b_moe_offsets offset:0 atIndex:1];
+                    [enc setBuffer:b_moe_sorted_tk offset:0 atIndex:2];
+                    [enc setBuffer:lw.w2_weight offset:0 atIndex:3];
+                    [enc setBuffer:lw.w2_hi offset:0 atIndex:4];
+                    [enc setBuffer:lw.w2_scale offset:0 atIndex:5];
+                    [enc setBuffer:lw.w2_min offset:0 atIndex:6];
+                    [enc setBuffer:b_moe_w2_out offset:0 atIndex:7];
+                    [enc setBytes:&mp length:sizeof(mp) atIndex:8];
+                    [enc dispatchThreadgroups:MTLSizeMake((D + 3u) / 4u, (uint32_t)cfg.n_routed_experts, 1)
+                        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+                    [enc setComputePipelineState:pso_moe_reduce_k];
+                    [enc setBuffer:b_moe_w2_out offset:0 atIndex:0];
+                    [enc setBuffer:b_mlp_raw offset:0 atIndex:1];
+                    [enc setBytes:&mp length:sizeof(mp) atIndex:2];
+                    [enc dispatchThreads:MTLSizeMake(D, mp.T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    flush_stage(prof_moe_nvfp4_ms);
+                } else if (lw.is_q3) {
+                    [enc setComputePipelineState:pso_moe_q3_w13];
+                    [enc setBuffer:b_mlp_in offset:0 atIndex:0];
+                    [enc setBuffer:b_topk_ids offset:0 atIndex:1];
+                    [enc setBuffer:b_topk_weights offset:0 atIndex:2];
+                    [enc setBuffer:lw.w13_weight offset:0 atIndex:3];
+                    [enc setBuffer:lw.w13_hi offset:0 atIndex:4];
+                    [enc setBuffer:lw.w13_scale offset:0 atIndex:5];
+                    [enc setBuffer:lw.w13_min offset:0 atIndex:6];
+                    [enc setBuffer:b_moe_act offset:0 atIndex:7];
+                    [enc setBytes:&mp length:sizeof(mp) atIndex:8];
+                    [enc dispatchThreadgroups:MTLSizeMake((mp.inter + 3u) / 4u, mp.T * mp.K, 1)
+                        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+                    [enc setComputePipelineState:pso_moe_q3_w2];
+                    [enc setBuffer:b_moe_act offset:0 atIndex:0];
+                    [enc setBuffer:b_topk_ids offset:0 atIndex:1];
+                    [enc setBuffer:lw.w2_weight offset:0 atIndex:2];
+                    [enc setBuffer:lw.w2_hi offset:0 atIndex:3];
+                    [enc setBuffer:lw.w2_scale offset:0 atIndex:4];
+                    [enc setBuffer:lw.w2_min offset:0 atIndex:5];
+                    [enc setBuffer:b_mlp_raw offset:0 atIndex:6];
+                    [enc setBytes:&mp length:sizeof(mp) atIndex:7];
+                    [enc dispatchThreadgroups:MTLSizeMake((D + 3u) / 4u, mp.T, 1)
+                        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                    flush_stage(prof_moe_nvfp4_ms);
+                } else if (lw.is_q2 && T >= 2) {
                     MoeGroupParams gp{(uint32_t)(T * cfg.num_experts_per_tok), (uint32_t)cfg.n_routed_experts};
                     [enc setComputePipelineState:pso_moe_group];
                     [enc setBuffer:b_topk_ids offset:0 atIndex:0];
@@ -1429,6 +1506,28 @@ struct Inkling2Model::Impl {
                         threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
                     flush_stage(prof_moe_nvfp4_ms);
                 }
+            }
+            if (capture_imatrix) {
+                [enc endEncoding];
+                commit_and_wait(cb);
+                const int32_t* tids = static_cast<const int32_t*>(b_topk_ids.contents);
+                const float* acts = static_cast<const float*>(b_moe_act.contents);
+                int total_tk = T * cfg.num_experts_per_tok;
+                int inter = cfg.intermediate_size;
+                int E = cfg.n_routed_experts;
+                for (int tk = 0; tk < total_tk; ++tk) {
+                    int e = tids[tk];
+                    if (e < 0 || e >= E) continue;
+                    imatrix_w2_cnt[(size_t)i * E + e] += 1;
+                    double* acc = imatrix_w2_sq.data() + ((size_t)i * E + e) * inter;
+                    const float* row = acts + (size_t)tk * inter;
+                    for (int j = 0; j < inter; ++j) {
+                        double val = (double)row[j];
+                        acc[j] += val * val;
+                    }
+                }
+                cb = [queue commandBuffer];
+                enc = [cb computeCommandEncoder];
             }
 
             for (int b = 0; b < n_seq; ++b) {
@@ -2394,6 +2493,10 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
         impl_->pso_moe_q2_w2 = impl_->make_pso("moe_q2_w2_kernel");
         impl_->pso_moe_q2_w13_dedup = impl_->make_pso("moe_q2_w13_dedup_kernel");
         impl_->pso_moe_q2_w2_dedup = impl_->make_pso("moe_q2_w2_dedup_kernel");
+        impl_->pso_moe_q3_w13 = impl_->make_pso("moe_q3_w13_kernel");
+        impl_->pso_moe_q3_w2 = impl_->make_pso("moe_q3_w2_kernel");
+        impl_->pso_moe_q3_w13_dedup = impl_->make_pso("moe_q3_w13_dedup_kernel");
+        impl_->pso_moe_q3_w2_dedup = impl_->make_pso("moe_q3_w2_dedup_kernel");
 
         impl_->b_dummy = impl_->alloc_shared(64);
         impl_->embed_w = impl_->load_tensor(st, "model.llm.embed.weight");
@@ -2522,8 +2625,18 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
             lw.gate_weight = impl_->load_tensor(st, p + "mlp.gate.weight");
             lw.gate_bias = impl_->load_tensor(st, p + "mlp.gate.bias");
 
-            lw.is_q2 = st.has(p + "mlp.experts.w13_q2_weight");
-            if (lw.is_q2) {
+            lw.is_q3 = st.has(p + "mlp.experts.w13_q3_lo");
+            lw.is_q2 = !lw.is_q3 && st.has(p + "mlp.experts.w13_q2_weight");
+            if (lw.is_q3) {
+                lw.w13_weight = impl_->load_tensor(st, p + "mlp.experts.w13_q3_lo");
+                lw.w13_hi = impl_->load_tensor(st, p + "mlp.experts.w13_q3_hi");
+                lw.w13_scale = impl_->load_tensor(st, p + "mlp.experts.w13_q3_scale");
+                lw.w13_min = impl_->load_tensor(st, p + "mlp.experts.w13_q3_min");
+                lw.w2_weight = impl_->load_tensor(st, p + "mlp.experts.w2_q3_lo");
+                lw.w2_hi = impl_->load_tensor(st, p + "mlp.experts.w2_q3_hi");
+                lw.w2_scale = impl_->load_tensor(st, p + "mlp.experts.w2_q3_scale");
+                lw.w2_min = impl_->load_tensor(st, p + "mlp.experts.w2_q3_min");
+            } else if (lw.is_q2) {
                 lw.w13_weight = impl_->load_tensor(st, p + "mlp.experts.w13_q2_weight");
                 lw.w13_scale = impl_->load_tensor(st, p + "mlp.experts.w13_q2_scale");
                 lw.w13_min = impl_->load_tensor(st, p + "mlp.experts.w13_q2_min");
@@ -2654,6 +2767,13 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
             }
             [qenc endEncoding];
             impl_->commit_and_wait(qcb);
+            if (impl_->device.recommendedMaxWorkingSetSize < (24ULL << 30)) {
+                for (int i = 0; i < cfg.num_hidden_layers; ++i) {
+                    impl_->layers[i].w_qrgs = nil;
+                    impl_->layers[i].w_kv = nil;
+                    impl_->layers[i].wo = nil;
+                }
+            }
         }
 
         for (int s = 0; s < max_slots; ++s) reset_cache(s);
@@ -2867,6 +2987,8 @@ void Inkling2Model::enable_imatrix_capture(bool enable) {
     impl_->capture_imatrix = enable;
     if (enable) {
         impl_->imatrix_sq.assign((size_t)cfg.num_hidden_layers * (size_t)cfg.hidden_size, 0.0);
+        impl_->imatrix_w2_sq.assign((size_t)cfg.num_hidden_layers * (size_t)cfg.n_routed_experts * (size_t)cfg.intermediate_size, 0.0);
+        impl_->imatrix_w2_cnt.assign((size_t)cfg.num_hidden_layers * (size_t)cfg.n_routed_experts, 0);
         impl_->imatrix_tokens = 0;
     }
 }
@@ -2880,8 +3002,26 @@ void Inkling2Model::save_imatrix(const std::string& path) const {
         out[idx] = (float)(impl_->imatrix_sq[idx] / denom);
     }
     f.write(reinterpret_cast<const char*>(out.data()), (std::streamsize)(out.size() * sizeof(float)));
-    fprintf(stderr, "[warpgrid-metal] Saved imatrix (%zu floats, %lld tokens) -> %s\n",
-            out.size(), (long long)impl_->imatrix_tokens, path.c_str());
+
+    std::string w2_path = path + ".w2";
+    std::ofstream f2(w2_path, std::ios::binary);
+    if (!f2) throw std::runtime_error("Cannot open w2 imatrix output: " + w2_path);
+    int E = cfg.n_routed_experts;
+    int inter = cfg.intermediate_size;
+    std::vector<float> out2(impl_->imatrix_w2_sq.size(), 1.0f);
+    for (int l = 0; l < cfg.num_hidden_layers; ++l) {
+        for (int e = 0; e < E; ++e) {
+            int64_t cnt = impl_->imatrix_w2_cnt[(size_t)l * E + e];
+            if (cnt <= 0) continue;
+            size_t base = ((size_t)l * E + e) * inter;
+            for (int j = 0; j < inter; ++j) {
+                out2[base + j] = (float)(impl_->imatrix_w2_sq[base + j] / (double)cnt);
+            }
+        }
+    }
+    f2.write(reinterpret_cast<const char*>(out2.data()), (std::streamsize)(out2.size() * sizeof(float)));
+    fprintf(stderr, "[warpgrid-metal] Saved imatrix (%zu w13 + %zu w2 floats, %lld tokens) -> %s\n",
+            out.size(), out2.size(), (long long)impl_->imatrix_tokens, path.c_str());
 }
 
 void Inkling2Model::print_profile() const {

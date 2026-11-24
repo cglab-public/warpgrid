@@ -1178,6 +1178,204 @@ static void test_moe_q2_parity() {
     EXPECT_TRUE(max_e2 < 2e-2f);
 }
 
+static void test_moe_q3_parity() {
+    auto p_w13 = g_ctx.pso("moe_q3_w13_kernel");
+    auto p_w2 = g_ctx.pso("moe_q3_w2_kernel");
+    auto p_grp = g_ctx.pso("moe_group_tokens_kernel");
+    auto p_d13 = g_ctx.pso("moe_q3_w13_dedup_kernel");
+    auto p_d2 = g_ctx.pso("moe_q3_w2_dedup_kernel");
+    auto p_red = g_ctx.pso("moe_reduce_k_kernel");
+    EXPECT_TRUE(p_w13 && p_w2 && p_grp && p_d13 && p_d2 && p_red);
+
+    const uint32_t T = 5, D = 128, inter = 64, E = 8, K = 2;
+    const float gate_cap = 4.0f, up_cap = 25.0f;
+    std::vector<uint16_t> x(T * D);
+    for (uint32_t i = 0; i < T * D; ++i) x[i] = f32_to_bf16(0.25f * sinf(0.09f * (float)i + 0.3f));
+
+    std::vector<int32_t> topk_ids = {0, 3, 3, 1, 0, 5, 3, 0, 1, 5};
+    std::vector<float> topk_wts = {0.6f, 0.4f, 0.7f, 0.3f, 0.55f, 0.45f, 0.5f, 0.5f, 0.65f, 0.35f};
+
+    std::vector<uint8_t> w13_lo(E * 2 * inter * (D / 4));
+    std::vector<uint8_t> w13_hi(E * 2 * inter * (D / 8));
+    std::vector<uint16_t> w13_sc(E * 2 * inter * (D / 64));
+    std::vector<uint16_t> w13_mn(E * 2 * inter * (D / 64));
+    std::vector<uint8_t> w2_lo(E * D * (inter / 4));
+    std::vector<uint8_t> w2_hi(E * D * (inter / 8));
+    std::vector<uint16_t> w2_sc(E * D * (inter / 64));
+    std::vector<uint16_t> w2_mn(E * D * (inter / 64));
+
+    auto f32_to_f16 = [](float v) -> uint16_t {
+        __fp16 h = (__fp16)v;
+        uint16_t bits;
+        memcpy(&bits, &h, 2);
+        return bits;
+    };
+    auto f16_to_f32 = [](uint16_t bits) -> float {
+        __fp16 h;
+        memcpy(&h, &bits, 2);
+        return (float)h;
+    };
+
+    for (size_t i = 0; i < w13_lo.size(); ++i) w13_lo[i] = (uint8_t)((i * 37u + 13u) & 0xFFu);
+    for (size_t i = 0; i < w13_hi.size(); ++i) w13_hi[i] = (uint8_t)((i * 71u + 5u) & 0xFFu);
+    for (size_t i = 0; i < w13_sc.size(); ++i) {
+        w13_sc[i] = f32_to_f16(0.04f + 0.01f * (float)(i % 5));
+        w13_mn[i] = f32_to_f16(-0.14f - 0.01f * (float)(i % 7));
+    }
+    for (size_t i = 0; i < w2_lo.size(); ++i) w2_lo[i] = (uint8_t)((i * 53u + 7u) & 0xFFu);
+    for (size_t i = 0; i < w2_hi.size(); ++i) w2_hi[i] = (uint8_t)((i * 29u + 11u) & 0xFFu);
+    for (size_t i = 0; i < w2_sc.size(); ++i) {
+        w2_sc[i] = f32_to_f16(0.045f + 0.008f * (float)(i % 4));
+        w2_mn[i] = f32_to_f16(-0.15f - 0.01f * (float)(i % 5));
+    }
+
+    std::vector<float> ref_out(T * D, 0.0f);
+    for (uint32_t t = 0; t < T; ++t) {
+        for (uint32_t k = 0; k < K; ++k) {
+            uint32_t tk = t * K + k;
+            int32_t e = topk_ids[tk];
+            float gamma = topk_wts[tk];
+            std::vector<float> act(inter, 0.0f);
+            for (uint32_t j = 0; j < inter; ++j) {
+                float ag = 0.0f, au = 0.0f;
+                size_t rg = (size_t)e * 2 * inter + 2 * j;
+                size_t ru = rg + 1;
+                for (uint32_t d = 0; d < D; ++d) {
+                    float xv = bf16_to_f32(x[t * D + d]);
+                    uint32_t blk = d / 64;
+                    uint8_t bg = ((w13_lo[rg * (D / 4) + (d / 4)] >> ((d & 3) * 2)) & 3u)
+                               | (((w13_hi[rg * (D / 8) + (d / 8)] >> (d & 7)) & 1u) << 2);
+                    uint8_t bu = ((w13_lo[ru * (D / 4) + (d / 4)] >> ((d & 3) * 2)) & 3u)
+                               | (((w13_hi[ru * (D / 8) + (d / 8)] >> (d & 7)) & 1u) << 2);
+                    float wg = (float)bg * f16_to_f32(w13_sc[rg * (D / 64) + blk]) + f16_to_f32(w13_mn[rg * (D / 64) + blk]);
+                    float wu = (float)bu * f16_to_f32(w13_sc[ru * (D / 64) + blk]) + f16_to_f32(w13_mn[ru * (D / 64) + blk]);
+                    ag += xv * wg;
+                    au += xv * wu;
+                }
+                float sig = 1.0f / (1.0f + expf(-ag));
+                float gc = tanhf(ag / gate_cap) * gate_cap;
+                float uc = tanhf(au / up_cap) * up_cap;
+                act[j] = bf16_to_f32(f32_to_bf16((gc * sig * uc) * gamma));
+            }
+            for (uint32_t d = 0; d < D; ++d) {
+                size_t r2 = (size_t)e * D + d;
+                float acc = 0.0f;
+                for (uint32_t j = 0; j < inter; ++j) {
+                    uint32_t blk = j / 64;
+                    uint8_t b2 = ((w2_lo[r2 * (inter / 4) + (j / 4)] >> ((j & 3) * 2)) & 3u)
+                               | (((w2_hi[r2 * (inter / 8) + (j / 8)] >> (j & 7)) & 1u) << 2);
+                    float w2v = (float)b2 * f16_to_f32(w2_sc[r2 * (inter / 64) + blk]) + f16_to_f32(w2_mn[r2 * (inter / 64) + blk]);
+                    acc += act[j] * w2v;
+                }
+                ref_out[t * D + d] += acc;
+            }
+        }
+    }
+
+    auto bx = g_ctx.buf(x.size() * 2, x.data());
+    auto bids = g_ctx.buf(topk_ids.size() * 4, topk_ids.data());
+    auto bwts = g_ctx.buf(topk_wts.size() * 4, topk_wts.data());
+    auto bw13l = g_ctx.buf(w13_lo.size(), w13_lo.data());
+    auto bw13h = g_ctx.buf(w13_hi.size(), w13_hi.data());
+    auto bs13 = g_ctx.buf(w13_sc.size() * 2, w13_sc.data());
+    auto bm13 = g_ctx.buf(w13_mn.size() * 2, w13_mn.data());
+    auto bw2l = g_ctx.buf(w2_lo.size(), w2_lo.data());
+    auto bw2h = g_ctx.buf(w2_hi.size(), w2_hi.data());
+    auto bs2 = g_ctx.buf(w2_sc.size() * 2, w2_sc.data());
+    auto bm2 = g_ctx.buf(w2_mn.size() * 2, w2_mn.data());
+    auto bact1 = g_ctx.buf(T * K * inter * 4);
+    auto bout1 = g_ctx.buf(T * D * 2);
+    auto boffs = g_ctx.buf((E + 1) * 4);
+    auto bsort = g_ctx.buf(T * K * 4);
+    auto bact2 = g_ctx.buf(T * K * inter * 4);
+    auto bw2_tmp = g_ctx.buf(T * K * D * 2);
+    auto bout2 = g_ctx.buf(T * D * 2);
+
+    struct MoeParams { uint32_t T; uint32_t D; uint32_t inter; uint32_t K; float gate_cap; float up_cap; } mp{T, D, inter, K, gate_cap, up_cap};
+    struct MoeGroupParams { uint32_t total_tk; uint32_t E; } gp{T * K, E};
+
+    id<MTLCommandBuffer> cb = [g_ctx.q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+
+    [enc setComputePipelineState:p_w13];
+    [enc setBuffer:bx offset:0 atIndex:0];
+    [enc setBuffer:bids offset:0 atIndex:1];
+    [enc setBuffer:bwts offset:0 atIndex:2];
+    [enc setBuffer:bw13l offset:0 atIndex:3];
+    [enc setBuffer:bw13h offset:0 atIndex:4];
+    [enc setBuffer:bs13 offset:0 atIndex:5];
+    [enc setBuffer:bm13 offset:0 atIndex:6];
+    [enc setBuffer:bact1 offset:0 atIndex:7];
+    [enc setBytes:&mp length:sizeof(mp) atIndex:8];
+    [enc dispatchThreadgroups:MTLSizeMake((inter + 3u) / 4u, T * K, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+    [enc setComputePipelineState:p_w2];
+    [enc setBuffer:bact1 offset:0 atIndex:0];
+    [enc setBuffer:bids offset:0 atIndex:1];
+    [enc setBuffer:bw2l offset:0 atIndex:2];
+    [enc setBuffer:bw2h offset:0 atIndex:3];
+    [enc setBuffer:bs2 offset:0 atIndex:4];
+    [enc setBuffer:bm2 offset:0 atIndex:5];
+    [enc setBuffer:bout1 offset:0 atIndex:6];
+    [enc setBytes:&mp length:sizeof(mp) atIndex:7];
+    [enc dispatchThreadgroups:MTLSizeMake((D + 3u) / 4u, T, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+    [enc setComputePipelineState:p_grp];
+    [enc setBuffer:bids offset:0 atIndex:0];
+    [enc setBuffer:boffs offset:0 atIndex:1];
+    [enc setBuffer:bsort offset:0 atIndex:2];
+    [enc setBytes:&gp length:sizeof(gp) atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+    [enc setComputePipelineState:p_d13];
+    [enc setBuffer:bx offset:0 atIndex:0];
+    [enc setBuffer:bwts offset:0 atIndex:1];
+    [enc setBuffer:boffs offset:0 atIndex:2];
+    [enc setBuffer:bsort offset:0 atIndex:3];
+    [enc setBuffer:bw13l offset:0 atIndex:4];
+    [enc setBuffer:bw13h offset:0 atIndex:5];
+    [enc setBuffer:bs13 offset:0 atIndex:6];
+    [enc setBuffer:bm13 offset:0 atIndex:7];
+    [enc setBuffer:bact2 offset:0 atIndex:8];
+    [enc setBytes:&mp length:sizeof(mp) atIndex:9];
+    [enc dispatchThreadgroups:MTLSizeMake((inter + 3u) / 4u, E, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+    [enc setComputePipelineState:p_d2];
+    [enc setBuffer:bact2 offset:0 atIndex:0];
+    [enc setBuffer:boffs offset:0 atIndex:1];
+    [enc setBuffer:bsort offset:0 atIndex:2];
+    [enc setBuffer:bw2l offset:0 atIndex:3];
+    [enc setBuffer:bw2h offset:0 atIndex:4];
+    [enc setBuffer:bs2 offset:0 atIndex:5];
+    [enc setBuffer:bm2 offset:0 atIndex:6];
+    [enc setBuffer:bw2_tmp offset:0 atIndex:7];
+    [enc setBytes:&mp length:sizeof(mp) atIndex:8];
+    [enc dispatchThreadgroups:MTLSizeMake((D + 3u) / 4u, E, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+    [enc setComputePipelineState:p_red];
+    [enc setBuffer:bw2_tmp offset:0 atIndex:0];
+    [enc setBuffer:bout2 offset:0 atIndex:1];
+    [enc setBytes:&mp length:sizeof(mp) atIndex:2];
+    [enc dispatchThreads:MTLSizeMake(D, T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+    [enc endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+
+    const uint16_t* o1 = (const uint16_t*)bout1.contents;
+    const uint16_t* o2 = (const uint16_t*)bout2.contents;
+    float max_e1 = 0.0f, max_e2 = 0.0f;
+    for (uint32_t i = 0; i < T * D; ++i) {
+        float v1 = bf16_to_f32(o1[i]);
+        float v2 = bf16_to_f32(o2[i]);
+        EXPECT_TRUE(std::isfinite(v1) && std::isfinite(v2));
+        max_e1 = std::max(max_e1, std::fabs(v1 - ref_out[i]));
+        max_e2 = std::max(max_e2, std::fabs(v2 - ref_out[i]));
+    }
+    EXPECT_TRUE(max_e1 < 2e-2f);
+    EXPECT_TRUE(max_e2 < 2e-2f);
+}
+
 int main() {
     @autoreleasepool {
         if (!g_ctx.init()) {
@@ -1196,6 +1394,7 @@ int main() {
         run_test("test_moe_router_and_grouped_parity", test_moe_router_and_grouped_parity);
         run_test("test_dflash2_kernels", test_dflash2_kernels);
         run_test("test_moe_q2_parity", test_moe_q2_parity);
+        run_test("test_moe_q3_parity", test_moe_q3_parity);
         printf("Metal kernel tests: %d passed, %d failed\n", g_passed, g_failed);
         return g_failed == 0 ? 0 : 1;
     }

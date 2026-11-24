@@ -73,7 +73,7 @@ Measured end-to-end over the live OpenAI-compatible HTTP/SSE server (`./warpgrid
 | **14.5K Needle-in-a-Haystack** | — | — | — | **443.3** prefill / **53.06** decode | **3/3 exact PASS** (Split-K FP8 attn) |
 | **132K Needle-in-a-Haystack** | — | — | — | **233.6** prefill / **18.8** decode | **3/3 exact PASS**, **860.9 ms** warm (**656.9×**) |
 | **Parallel Ladder (`c=1..8`)** | — | — | — | **68.81** (`c=1`) → **74.92 agg** (`c=8`) | Batched continuous decode |
-| **Apple M4 Mac mini (16 GB, [`Q2_G64`](https://huggingface.co/cglab-org/Inkling-2-Mini-Q2-warpgrid))** | 16.1 tok/s (`IQ2_XXS`) | — | — | **21.69** raw / **26.70** DFlash 2 | **+35% raw / +66% DFlash 2** vs `llama.cpp`, 16/16 tests PASS |
+| **Apple M4 Mac mini (16 GB, [`Q3`](https://huggingface.co/cglab-org/Inkling-2-Mini-Q3-warpgrid))** | 16.1 tok/s (`IQ2_XXS`) | — | — | **20.64** raw / **25.45** DFlash 2 code | **+58% vs `llama.cpp`**, **90.0% HumanEval** (93.8% retention), 17/17 tests |
 
 ---
 
@@ -87,7 +87,7 @@ Measured end-to-end over the live OpenAI-compatible HTTP/SSE server (`./warpgrid
 - **WMMA BF16 Tensor Core FlashAttention:** Custom GQA=3 `BK=64` Tensor Core prefill with exact relative-position logits, attention sinks, and sigmoid output gating.
 - **Native DFlash 2 Block-Diffusion Drafter (CUDA & Metal):** Full 5-layer `incoai/Inkling-2-Mini-DFlash2` drafter (`--dflash2`) with 2-tap `GroupedDynamicCausalConv`, bidirectional block + SWA=2048 attention, W8A16 FP8 projections, top-16 candidate path selector, and 100% CUDA-graph capture on Blackwell (**+36% to +79%** vs DSpark; **116.5 tok/s CLI / 58.2 tok/s prose SSE** on M5 Max).
 - **2-Row/SIMDgroup W8A16 FP8 & Deduplicated Small-Batch MoE (Apple Metal):** Hits **94%** of M5 Max's `465.69 GB/s` DRAM bandwidth on the 200K LM head (`1.05 ms`), with grouped `simdgroup_matrix` MoE prefill, FlashAttention-2 FP8 prefill, Split-K FP8 decode, and runtime MSL fallback for Macs without Xcode.
-- **Compact `Q2_G64` (2.5 bpw) Native MoE Quantizer (`scripts/quantize_q2.py`):** MSE-optimal asymmetric group-64 2-bit MoE weights (`L0–L1` NVFP4 + `L2–L23` `Q2_G64`) enabling native `Inkling-2-Mini` + DFlash 2 inference on **16 GB Apple M4 Mac mini** at **21.69 raw / 26.70 DFlash 2 tok/s** (**+35% / +66%** vs `llama.cpp` `IQ2_XXS`).
+- **Compact `Q3_G64` / `Q2_G64` Native MoE Quantizer (`scripts/quantize_q2.py`):** Activation-`imatrix` Lloyd-Max bit-split 3-bit (`Q3_G64`, 3.5 bpw) and 2-bit (`Q2_G64`, 2.5 bpw) MoE weights (`18×Q3_G64 + 6×Q2_G64`) + automatic `low_mem` BF16-dense release (−1.2 GiB), delivering **90.0% HumanEval Pass@1 (93.8% retention vs 18 GiB NVFP4)** and **25.45 tok/s** coding with DFlash 2 on a **16 GB Apple M4 Mac mini** (**+58%** vs `llama.cpp` `IQ2_XXS`).
 - **Full-Step CUDA Graphs:** Captured per-`T` (`1..8`) single-slot verify, per-`B` (`1..8`) parallel decode, batched `B=2` speculative verify, and graphed DSpark / DFlash 2 drafting.
 - **Exact Prefix Caching:** Per-slot end-of-prefill snapshots (local SWA ring + conv states) delivering **9.4×–656.9×** warm TTFT speedups and reporting `usage.prompt_tokens_details.cached_tokens`.
 
@@ -119,21 +119,24 @@ This builds a single standalone binary: `./warpgrid` (and runs the portable C++2
   --max-seq-len 139264 \
   --max-chunk 4096
 
-# 16 GB Apple Silicon Macs (e.g., M4 Mac mini): pull the pre-quantized Q2_G64 checkpoint
-hf download cglab-org/Inkling-2-Mini-Q2-warpgrid --local-dir ./Inkling-2-Mini-Q2
+# 16 GB Apple Silicon Macs (e.g., M4 Mac mini): pull the pre-quantized Q3 hybrid checkpoint (90% HumanEval)
+hf download cglab-org/Inkling-2-Mini-Q3-warpgrid --local-dir ./Inkling-2-Mini-Q3
 ./warpgrid \
-  --model ./Inkling-2-Mini-Q2 \
+  --model ./Inkling-2-Mini-Q3 \
   --dflash2 /path/to/incoai/Inkling-2-Mini-DFlash2 \
   --draft-k 6 \
   --max-slots 1 \
   --max-seq-len 2048 \
   --port 8888
 
-# Or quantize your own Q2_G64 checkpoint from official weights:
+# Or quantize your own Q3/Q2 checkpoint from official weights:
 uv run --with numpy python3 scripts/quantize_q2.py \
   --src /path/to/thinkingmachines/Inkling-2-Mini \
-  --dst /path/to/Inkling-2-Mini-Q2 \
-  --keep-nvfp4-layers 0,1
+  --dst /path/to/Inkling-2-Mini-Q3 \
+  --keep-nvfp4-layers "" \
+  --q3-layers 0,1,2,3,4,5,6,11,12,15,16,17,18,19,20,21,22,23 \
+  --imatrix /path/to/imatrix.bin \
+  --drop-vision
 ```
 
 Endpoints:
