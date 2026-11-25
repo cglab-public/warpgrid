@@ -2394,7 +2394,7 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
             double draft_gib = !dflash2_dir.empty() ? 0.85 : (draft_k > 0 ? 0.60 : 0.0);
             double weight_gib = file_gib * weight_mult + draft_gib;
             double mem_budget_gib = impl_->gpu_low_mem
-                ? std::max(impl_->gpu_ws_gib * 0.90, phys_ram_gib - 1.5)
+                ? std::max(impl_->gpu_ws_gib * 0.90, phys_ram_gib - 1.9)
                 : (impl_->gpu_ws_gib * 0.90);
             double avail_kv_gib = std::max(0.5, mem_budget_gib - weight_gib);
             auto est_kv_gib = [&](int slots, int seq) -> double {

@@ -143,7 +143,7 @@ hf download incoai/Inkling-2-Mini-DFlash2 --local-dir ./Inkling-2-Mini-DFlash2
   --dflash2 ./Inkling-2-Mini-DFlash2 \
   --draft-k 6 \
   --max-slots 1 \
-  --max-seq-len 32768 \
+  --max-seq-len 8192 \
   --port 8888
 
 # Or quantize your own Q3/Q2 checkpoint from official weights:
