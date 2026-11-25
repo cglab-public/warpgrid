@@ -1,6 +1,8 @@
 #include "../src/auth.hpp"
 #include "../src/cli.hpp"
 #include "../src/config.hpp"
+#include "../src/engram.hpp"
+#include "../src/gguf.hpp"
 #include "../src/json.hpp"
 #include "../src/model_backend.hpp"
 #include "../src/prefix_cache.hpp"
@@ -667,6 +669,197 @@ static void test_tokenizer_gguf_vectors_and_deepseek_chat_template() {
     EXPECT_TRUE(rendered.find("<｜User｜>Hello<｜Assistant｜>") != std::string::npos);
 }
 
+static void write_u32_le(std::ostream& os, uint32_t v) { os.write(reinterpret_cast<const char*>(&v), 4); }
+static void write_i32_le(std::ostream& os, int32_t v) { os.write(reinterpret_cast<const char*>(&v), 4); }
+static void write_u64_le(std::ostream& os, uint64_t v) { os.write(reinterpret_cast<const char*>(&v), 8); }
+static void write_gguf_str(std::ostream& os, const std::string& s) {
+    write_u64_le(os, (uint64_t)s.size());
+    os.write(s.data(), (std::streamsize)s.size());
+}
+
+static void write_synthetic_gguf(
+    const std::string& path,
+    bool include_meta,
+    const std::string& tensor_name,
+    uint32_t ggml_type,
+    const std::vector<uint64_t>& dims,
+    const std::vector<uint8_t>& payload) {
+    std::ofstream f(path, std::ios::binary);
+    f.write("GGUF", 4);
+    write_u32_le(f, 3);
+    write_u64_le(f, 1);
+    write_u64_le(f, include_meta ? 7 : 0);
+
+    if (include_meta) {
+        write_gguf_str(f, "general.architecture");
+        write_u32_le(f, 8);
+        write_gguf_str(f, "deepseek41");
+
+        write_gguf_str(f, "deepseek41.block_count");
+        write_u32_le(f, 4);
+        write_u32_le(f, 40);
+
+        write_gguf_str(f, "tokenizer.ggml.bos_token_id");
+        write_u32_le(f, 4);
+        write_u32_le(f, 0);
+
+        write_gguf_str(f, "tokenizer.ggml.eos_token_id");
+        write_u32_le(f, 4);
+        write_u32_le(f, 1);
+
+        write_gguf_str(f, "tokenizer.ggml.tokens");
+        write_u32_le(f, 9);
+        write_u32_le(f, 8);
+        write_u64_le(f, 4);
+        write_gguf_str(f, "<｜begin▁of▁sentence｜>");
+        write_gguf_str(f, "<｜end▁of▁sentence｜>");
+        write_gguf_str(f, "h");
+        write_gguf_str(f, "i");
+
+        write_gguf_str(f, "tokenizer.ggml.token_type");
+        write_u32_le(f, 9);
+        write_u32_le(f, 5);
+        write_u64_le(f, 4);
+        write_i32_le(f, 3);
+        write_i32_le(f, 3);
+        write_i32_le(f, 1);
+        write_i32_le(f, 1);
+
+        write_gguf_str(f, "tokenizer.ggml.merges");
+        write_u32_le(f, 9);
+        write_u32_le(f, 8);
+        write_u64_le(f, 1);
+        write_gguf_str(f, "h i");
+    }
+
+    write_gguf_str(f, tensor_name);
+    write_u32_le(f, (uint32_t)dims.size());
+    for (uint64_t d : dims) write_u64_le(f, d);
+    write_u32_le(f, ggml_type);
+    write_u64_le(f, 0);
+
+    size_t pos = (size_t)f.tellp();
+    size_t aligned = (pos + 31) & ~(size_t)31;
+    std::vector<char> pad(aligned - pos, 0);
+    if (!pad.empty()) f.write(pad.data(), (std::streamsize)pad.size());
+    f.write(reinterpret_cast<const char*>(payload.data()), (std::streamsize)payload.size());
+}
+
+static void test_gguf_v3_single_and_multishard_reader() {
+    EXPECT_EQ(ink::ggml_block_size(ink::GgmlType::Q8_0), (size_t)32);
+    EXPECT_EQ(ink::ggml_type_size(ink::GgmlType::Q8_0), (size_t)34);
+    EXPECT_EQ(ink::ggml_block_size(ink::GgmlType::IQ4_NL), (size_t)32);
+    EXPECT_EQ(ink::ggml_type_size(ink::GgmlType::IQ4_NL), (size_t)18);
+    EXPECT_EQ(ink::ggml_block_size(ink::GgmlType::IQ1_S), (size_t)256);
+    EXPECT_EQ(ink::ggml_type_size(ink::GgmlType::IQ1_S), (size_t)50);
+    EXPECT_EQ(ink::ggml_block_size(ink::GgmlType::Q2_K), (size_t)256);
+    EXPECT_EQ(ink::ggml_type_size(ink::GgmlType::Q2_K), (size_t)84);
+    EXPECT_EQ(ink::ggml_block_size(ink::GgmlType::Q6_K), (size_t)256);
+    EXPECT_EQ(ink::ggml_type_size(ink::GgmlType::Q6_K), (size_t)210);
+    EXPECT_EQ(ink::ggml_block_size(ink::GgmlType::MXFP4), (size_t)32);
+    EXPECT_EQ(ink::ggml_type_size(ink::GgmlType::MXFP4), (size_t)17);
+
+    std::string pid_str = std::to_string((int)getpid());
+    std::string p1 = "/tmp/warpgrid_ds_" + pid_str + "-00001-of-00002.gguf";
+    std::string p2 = "/tmp/warpgrid_ds_" + pid_str + "-00002-of-00002.gguf";
+
+    std::vector<float> w0 = {1.5f, -2.0f, 3.25f, 4.0f};
+    std::vector<float> w1 = {5.0f, 6.5f, -7.25f, 8.0f};
+    std::vector<uint8_t> b0(16), b1(16);
+    std::memcpy(b0.data(), w0.data(), 16);
+    std::memcpy(b1.data(), w1.data(), 16);
+
+    write_synthetic_gguf(p1, true, "blk.0.attn_norm.weight", (uint32_t)ink::GgmlType::F32, {4}, b0);
+    write_synthetic_gguf(p2, false, "blk.20.attn_norm.weight", (uint32_t)ink::GgmlType::F32, {4}, b1);
+
+    ink::GgufFile gf;
+    gf.open(p1);
+    EXPECT_EQ(gf.num_shards(), (size_t)2);
+    EXPECT_EQ(gf.get_str("general.architecture", ""), std::string("deepseek41"));
+    EXPECT_EQ(gf.get_i64("deepseek41.block_count", 0), (int64_t)40);
+    EXPECT_TRUE(gf.has_tensor("blk.0.attn_norm.weight"));
+    EXPECT_TRUE(gf.has_tensor("blk.20.attn_norm.weight"));
+
+    std::vector<float> out0(4, 0.0f), out1(4, 0.0f);
+    gf.read_tensor_into("blk.0.attn_norm.weight", out0.data(), 16);
+    gf.read_tensor_into("blk.20.attn_norm.weight", out1.data(), 16);
+    for (int i = 0; i < 4; ++i) {
+        EXPECT_TRUE(std::abs(out0[i] - w0[i]) < 1e-6f);
+        EXPECT_TRUE(std::abs(out1[i] - w1[i]) < 1e-6f);
+    }
+
+    ink::Tokenizer tok;
+    gf.load_tokenizer(tok);
+    EXPECT_EQ(tok.bos_id, 0);
+    EXPECT_EQ(tok.eos_id, 1);
+    EXPECT_EQ(tok.chat_format, ink::ChatFormat::DeepSeek);
+
+    ::unlink(p1.c_str());
+    ::unlink(p2.c_str());
+}
+
+static uint16_t f32_to_f16_bits(float v) {
+    uint32_t u = 0;
+    std::memcpy(&u, &v, 4);
+    uint32_t sign = (u >> 16) & 0x8000u;
+    int32_t exp = (int32_t)((u >> 23) & 0xFFu) - 127 + 15;
+    uint32_t mant = (u >> 13) & 0x3FFu;
+    if (exp <= 0) return (uint16_t)sign;
+    if (exp >= 31) return (uint16_t)(sign | 0x7C00u);
+    return (uint16_t)(sign | ((uint32_t)exp << 10) | mant);
+}
+
+static void test_engram_nvme_mmap_dequant_and_cache() {
+    std::string pid_str = std::to_string((int)getpid());
+    std::string p_q8 = "/tmp/warpgrid_engram_q8_" + pid_str + ".gguf";
+    std::string p_iq4 = "/tmp/warpgrid_engram_iq4_" + pid_str + ".gguf";
+
+    std::vector<uint8_t> q8_bytes(2 * 34, 0);
+    uint16_t d0 = f32_to_f16_bits(0.5f);
+    std::memcpy(q8_bytes.data(), &d0, 2);
+    for (int i = 0; i < 32; ++i) q8_bytes[2 + i] = (uint8_t)(int8_t)(i - 16);
+    uint16_t d1 = f32_to_f16_bits(0.25f);
+    std::memcpy(q8_bytes.data() + 34, &d1, 2);
+    for (int i = 0; i < 32; ++i) q8_bytes[34 + 2 + i] = (uint8_t)(int8_t)(2);
+    write_synthetic_gguf(p_q8, false, "engram.0.weight", (uint32_t)ink::GgmlType::Q8_0, {32, 2}, q8_bytes);
+
+    ink::EngramTable et_q8;
+    et_q8.open(p_q8, 64);
+    std::vector<float> row(32, 0.0f);
+    et_q8.lookup_row("engram.0.weight", 0, row.data(), 32);
+    EXPECT_TRUE(std::abs(row[0] - (-8.0f)) < 1e-3f);
+    EXPECT_TRUE(std::abs(row[16] - 0.0f) < 1e-3f);
+    EXPECT_TRUE(std::abs(row[31] - 7.5f) < 1e-3f);
+    EXPECT_EQ(et_q8.cache_hits(), (uint64_t)0);
+
+    et_q8.lookup_row("engram.0.weight", 0, row.data(), 32);
+    EXPECT_EQ(et_q8.cache_hits(), (uint64_t)1);
+
+    et_q8.lookup_row("engram.0.weight", 1, row.data(), 32);
+    EXPECT_TRUE(std::abs(row[5] - 0.5f) < 1e-3f);
+
+    std::vector<uint8_t> iq4_bytes(18, 0);
+    uint16_t diq = f32_to_f16_bits(1.0f);
+    std::memcpy(iq4_bytes.data(), &diq, 2);
+    for (int i = 0; i < 16; ++i) iq4_bytes[2 + i] = (uint8_t)((8u << 4) | 0u);
+    write_synthetic_gguf(p_iq4, false, "engram.1.weight", (uint32_t)ink::GgmlType::IQ4_NL, {32, 1}, iq4_bytes);
+
+    ink::EngramTable et_iq4;
+    et_iq4.open(p_iq4, 16);
+    et_iq4.lookup_row("engram.1.weight", 0, row.data(), 32);
+    EXPECT_TRUE(std::abs(row[0] - (-127.0f)) < 1e-2f);
+    EXPECT_TRUE(std::abs(row[16] - 1.0f) < 1e-2f);
+
+    int32_t ng[3] = {101, 202, 303};
+    uint64_t h1 = ink::engram_hash_row(ng, 3, 1337ULL, 1000003ULL);
+    uint64_t h2 = ink::engram_hash_row(ng, 3, 1337ULL, 1000003ULL);
+    EXPECT_EQ(h1, h2);
+    EXPECT_TRUE(h1 < 1000003ULL);
+
+    ::unlink(p_q8.c_str());
+    ::unlink(p_iq4.c_str());
+}
+
 int main() {
     run_test("test_json_roundtrip_and_escaping", test_json_roundtrip_and_escaping);
     run_test("test_config_inkling2_parse", test_config_inkling2_parse);
@@ -680,6 +873,8 @@ int main() {
     run_test("test_cli_parse_engram_and_format_detection", test_cli_parse_engram_and_format_detection);
     run_test("test_model_backend_polymorphic_interface", test_model_backend_polymorphic_interface);
     run_test("test_tokenizer_gguf_vectors_and_deepseek_chat_template", test_tokenizer_gguf_vectors_and_deepseek_chat_template);
+    run_test("test_gguf_v3_single_and_multishard_reader", test_gguf_v3_single_and_multishard_reader);
+    run_test("test_engram_nvme_mmap_dequant_and_cache", test_engram_nvme_mmap_dequant_and_cache);
     printf("Host tests: %d passed, %d failed\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;
 }
