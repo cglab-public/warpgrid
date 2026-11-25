@@ -568,6 +568,22 @@ static void test_sse_keepalive_and_disconnect() {
     ::close(lfd);
 }
 
+static void test_inplace_slot_prefix_match() {
+    std::vector<int32_t> empty;
+    std::vector<int32_t> slot = {10, 20, 30, 40, 50};
+    std::vector<int32_t> cont = {10, 20, 30, 40, 50, 60, 70};
+    std::vector<int32_t> same = {10, 20, 30, 40, 50};
+    std::vector<int32_t> shorter = {10, 20, 30};
+    std::vector<int32_t> mismatch = {10, 20, 99, 40, 50, 60};
+
+    EXPECT_EQ(ink::match_inplace_slot_prefix(empty, cont), 0);
+    EXPECT_EQ(ink::match_inplace_slot_prefix(slot, cont), 5);
+    EXPECT_EQ(ink::match_inplace_slot_prefix(slot, same), 0);
+    EXPECT_EQ(ink::match_inplace_slot_prefix(slot, shorter), 0);
+    EXPECT_EQ(ink::match_inplace_slot_prefix(slot, mismatch), 0);
+    EXPECT_EQ(ink::match_inplace_slot_prefix(slot, empty), 0);
+}
+
 int main() {
     run_test("test_json_roundtrip_and_escaping", test_json_roundtrip_and_escaping);
     run_test("test_config_inkling2_parse", test_config_inkling2_parse);
@@ -580,6 +596,7 @@ int main() {
     run_test("test_radix_prefix_cache_cross_slot_and_eviction", test_radix_prefix_cache_cross_slot_and_eviction);
     run_test("test_clamp_max_tokens", test_clamp_max_tokens);
     run_test("test_sse_keepalive_and_disconnect", test_sse_keepalive_and_disconnect);
+    run_test("test_inplace_slot_prefix_match", test_inplace_slot_prefix_match);
     printf("Host tests: %d passed, %d failed\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;
 }

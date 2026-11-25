@@ -48,6 +48,7 @@ class OpenAIServer {
         int pos = 0;
         int cached_tokens = 0;
         int32_t hit_snap_id = -1;
+        bool in_place_hit = false;
         int shared_checkpoint_pos = 0;
         bool prefill_initialized = false;
         bool prefill_done = false;
@@ -179,10 +180,12 @@ class OpenAIServer {
 
     void worker_loop() {
         int max_slots = model_.max_slots;
+        const bool use_inplace_cache = (model_.num_snapshots == 0 && max_slots == 1);
         std::vector<bool> slot_used(max_slots, false);
         std::vector<bool> slot_dspark_valid(max_slots, false);
         std::vector<int> slot_dspark_written(max_slots, 0);
         std::vector<std::vector<int32_t>> slot_blocks(max_slots);
+        std::vector<std::vector<int32_t>> slot_inplace_toks(max_slots);
         RadixPrefixCache prefix_cache;
         prefix_cache.init(model_.num_kv_blocks, model_.num_snapshots);
         std::vector<std::shared_ptr<RequestState>> active;
@@ -210,8 +213,13 @@ class OpenAIServer {
             st.dflash2_active = r->dspark_ready && !model_.dflash2_dir.empty();
             metrics_.update_slot(st);
         };
-        auto release_slot = [&](int sid) {
-            prefix_cache.release_slot_blocks(slot_blocks[sid]);
+        auto release_slot = [&](int sid, bool keep_inplace = true) {
+            if (!(use_inplace_cache && keep_inplace && !slot_inplace_toks[sid].empty())) {
+                prefix_cache.release_slot_blocks(slot_blocks[sid]);
+                slot_inplace_toks[sid].clear();
+                slot_dspark_valid[sid] = false;
+                slot_dspark_written[sid] = 0;
+            }
             slot_used[sid] = false;
             metrics_.clear_slot(sid);
         };
@@ -255,7 +263,9 @@ class OpenAIServer {
                     int best_rem = std::numeric_limits<int>::max();
                     int best_peek_hit = 0;
                     for (size_t i = 0; i < pending_.size(); ++i) {
-                        int hit = prefix_cache.peek_prefix_hit(pending_[i]->prompt_ids);
+                        int hit = use_inplace_cache
+                            ? match_inplace_slot_prefix(slot_inplace_toks[first_free], pending_[i]->prompt_ids)
+                            : prefix_cache.peek_prefix_hit(pending_[i]->prompt_ids);
                         int rem = (int)pending_[i]->prompt_ids.size() - hit;
                         if (rem < best_rem) {
                             best_rem = rem;
@@ -266,24 +276,43 @@ class OpenAIServer {
 
                     auto req = pending_[best_idx];
                     int peek_hit = best_peek_hit;
-                    // Leader/follower detection: if another queued request shares a longer uncached
-                    // prefix with `req`, admit `req` alone first so it prefills and publishes that
-                    // shared prefix before followers are admitted!
                     int shared_lcp = 0;
-                    for (size_t j = 0; j < pending_.size(); ++j) {
-                        if (j == best_idx) continue;
-                        int lcp = compute_lcp_aligned(req->prompt_ids, pending_[j]->prompt_ids);
-                        if (lcp > peek_hit && lcp > shared_lcp) shared_lcp = lcp;
+                    if (!use_inplace_cache) {
+                        for (size_t j = 0; j < pending_.size(); ++j) {
+                            if (j == best_idx) continue;
+                            int lcp = compute_lcp_aligned(req->prompt_ids, pending_[j]->prompt_ids);
+                            if (lcp > peek_hit && lcp > shared_lcp) shared_lcp = lcp;
+                        }
                     }
 
                     pending_.erase(pending_.begin() + (ptrdiff_t)best_idx);
-                    PrefixMatch match = prefix_cache.acquire_prefix(req->prompt_ids);
-                    slot_used[first_free] = true;
-                    slot_blocks[first_free] = std::move(match.phys_blocks);
-                    req->slot_id = first_free;
-                    req->cached_tokens = match.hit_tokens;
-                    req->hit_snap_id = match.snap_id;
-                    req->shared_checkpoint_pos = shared_lcp;
+                    if (use_inplace_cache) {
+                        int inplace_hit = match_inplace_slot_prefix(slot_inplace_toks[first_free], req->prompt_ids);
+                        slot_used[first_free] = true;
+                        req->slot_id = first_free;
+                        req->hit_snap_id = -1;
+                        req->shared_checkpoint_pos = 0;
+                        if (inplace_hit > 0) {
+                            req->cached_tokens = inplace_hit;
+                            req->in_place_hit = true;
+                        } else {
+                            prefix_cache.release_slot_blocks(slot_blocks[first_free]);
+                            slot_inplace_toks[first_free].clear();
+                            slot_dspark_valid[first_free] = false;
+                            slot_dspark_written[first_free] = 0;
+                            req->cached_tokens = 0;
+                            req->in_place_hit = false;
+                        }
+                    } else {
+                        PrefixMatch match = prefix_cache.acquire_prefix(req->prompt_ids);
+                        slot_used[first_free] = true;
+                        slot_blocks[first_free] = std::move(match.phys_blocks);
+                        req->slot_id = first_free;
+                        req->cached_tokens = match.hit_tokens;
+                        req->hit_snap_id = match.snap_id;
+                        req->in_place_hit = false;
+                        req->shared_checkpoint_pos = shared_lcp;
+                    }
                     if (!slot_blocks[first_free].empty()) {
                         model_.set_slot_block_table(first_free, slot_blocks[first_free].data(),
                                                     (int)slot_blocks[first_free].size());
@@ -345,11 +374,13 @@ class OpenAIServer {
                             r->hit_snap_id = -1;
                         }
                         r->mark_done("KV cache block pool exhausted");
-                        release_slot(r->slot_id);
+                        release_slot(r->slot_id, false);
                         active.erase(active.begin() + (ptrdiff_t)idx);
                         continue;
                     }
-                    if (r->cached_tokens > 0) {
+                    if (r->in_place_hit) {
+                        r->pos = r->cached_tokens;
+                    } else if (r->cached_tokens > 0) {
                         model_.restore_boundary_snapshot(r->slot_id, r->hit_snap_id);
                         prefix_cache.release_snapshot_pin(r->hit_snap_id);
                         r->hit_snap_id = -1;
@@ -360,14 +391,19 @@ class OpenAIServer {
                         r->pos = 0;
                     }
                     r->can_commit_ds = false;
-                    if (r->slot_id < model_.max_dspark_slots() && model_.draft_k > 0 && r->cached_tokens == 0) {
-                        slot_dspark_valid[r->slot_id] = true;
-                        slot_dspark_written[r->slot_id] = 0;
-                        r->can_commit_ds = true;
+                    if (r->slot_id < model_.max_dspark_slots() && model_.draft_k > 0) {
+                        if (r->cached_tokens == 0) {
+                            slot_dspark_valid[r->slot_id] = true;
+                            slot_dspark_written[r->slot_id] = 0;
+                            r->can_commit_ds = true;
+                        } else if (r->in_place_hit && slot_dspark_valid[r->slot_id] &&
+                                   slot_dspark_written[r->slot_id] == r->cached_tokens) {
+                            r->can_commit_ds = true;
+                        }
                     }
-                    r->cp_shared = (r->shared_checkpoint_pos > r->pos && r->shared_checkpoint_pos < plen)
+                    r->cp_shared = (!use_inplace_cache && r->shared_checkpoint_pos > r->pos && r->shared_checkpoint_pos < plen)
                         ? r->shared_checkpoint_pos : 0;
-                    r->cp_end = (plen > kKvBlockSize)
+                    r->cp_end = (!use_inplace_cache && plen > kKvBlockSize)
                         ? (((plen - 1) / kKvBlockSize) * kKvBlockSize) : 0;
                     if (r->cp_end <= r->pos) r->cp_end = 0;
                     r->prefill_initialized = true;
@@ -396,6 +432,12 @@ class OpenAIServer {
                     first_tok = sample_token(logits, r->temperature, r->top_p, rng);
                 } else {
                     first_tok = model_.forward_and_greedy(r->prompt_ids.data() + p, n, p, r->slot_id);
+                }
+                if (use_inplace_cache) {
+                    slot_inplace_toks[r->slot_id].insert(
+                        slot_inplace_toks[r->slot_id].end(),
+                        r->prompt_ids.begin() + p,
+                        r->prompt_ids.begin() + p + n);
                 }
                 if (r->can_commit_ds) {
                     model_.commit_dspark_context(n, p, r->slot_id);
@@ -477,7 +519,7 @@ class OpenAIServer {
                 int32_t drafts[8], verify_in[8], verify_out[8];
                 if (!ensure_blocks(r->slot_id, r->pos + cur_k + 1)) {
                     r->mark_done("KV cache block pool exhausted");
-                    release_slot(r->slot_id);
+                    release_slot(r->slot_id, false);
                     active.clear();
                     continue;
                 }
@@ -501,6 +543,12 @@ class OpenAIServer {
                 }
                 int emitted = acc + 1;
                 if (emitted < cur_k + 1) model_.rollback_conv_states(emitted);
+                if (use_inplace_cache) {
+                    slot_inplace_toks[r->slot_id].insert(
+                        slot_inplace_toks[r->slot_id].end(),
+                        verify_in,
+                        verify_in + emitted);
+                }
                 model_.commit_dspark_context(emitted, r->pos);
                 slot_dspark_written[r->slot_id] = r->pos + emitted;
 
@@ -574,6 +622,12 @@ class OpenAIServer {
                         r->spec_accepted.fetch_add(acc, std::memory_order_relaxed);
                         if (!model_.dflash2_dir.empty()) r->used_dflash2.store(true, std::memory_order_relaxed);
                         if (emitted < L) model_.rollback_conv_states(emitted, r->slot_id);
+                        if (use_inplace_cache) {
+                            slot_inplace_toks[r->slot_id].insert(
+                                slot_inplace_toks[r->slot_id].end(),
+                                verify_in + b * L,
+                                verify_in + b * L + emitted);
+                        }
                         model_.commit_dspark_context(emitted, r->pos, r->slot_id, b * L);
                         slot_dspark_written[r->slot_id] = r->pos + emitted;
                         bool done = false;
@@ -615,7 +669,7 @@ class OpenAIServer {
                     auto& r = active[batch_idx[k]];
                     if (!ensure_blocks(r->slot_id, r->pos + 1)) {
                         r->mark_done("KV cache block pool exhausted");
-                        release_slot(r->slot_id);
+                        release_slot(r->slot_id, false);
                         active.erase(active.begin() + (ptrdiff_t)batch_idx[k]);
                         batch_idx.erase(batch_idx.begin() + k);
                         for (size_t m = (size_t)k; m < batch_idx.size(); ++m) batch_idx[m]--;
@@ -637,6 +691,9 @@ class OpenAIServer {
                 for (int b = B - 1; b >= 0; --b) {
                     size_t ai = batch_idx[b];
                     auto& r = active[ai];
+                    if (use_inplace_cache) {
+                        slot_inplace_toks[r->slot_id].push_back(h_toks[b]);
+                    }
                     if (r->cancelled) {
                         r->mark_done();
                         release_slot(r->slot_id);

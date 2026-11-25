@@ -369,4 +369,13 @@ public:
     }
 };
 
+inline int match_inplace_slot_prefix(const std::vector<int32_t>& slot_toks,
+                                     const std::vector<int32_t>& prompt_ids) {
+    int slen = static_cast<int>(slot_toks.size());
+    int plen = static_cast<int>(prompt_ids.size());
+    if (slen <= 0 || plen <= slen) return 0;
+    if (!std::equal(slot_toks.begin(), slot_toks.end(), prompt_ids.begin())) return 0;
+    return slen;
+}
+
 } // namespace ink
