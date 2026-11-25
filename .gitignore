@@ -4,8 +4,11 @@ warpgrid
 *.metallib
 src/metal/kernels_metallib_embed.hpp
 src/metal/kernels_source_embed.hpp
+src/metal/kernels_gguf_metallib_embed.hpp
+src/metal/kernels_gguf_source_embed.hpp
 bench_hw/hw_probe_metal
 tests/test_host
 tests/test_metal_kernels
+tests/test_metal_gguf_kernels
 .agenfk/
 .DS_Store
