@@ -53,6 +53,7 @@ struct DsEngramApplyParams {
 struct DsPartialRopeParams {
     uint32_t T;
     uint32_t start_pos;
+    uint32_t pos_stride;
     uint32_t n_heads;
     uint32_t head_dim;
     uint32_t n_nope;
@@ -82,6 +83,7 @@ struct DsIndexerParams {
     uint32_t T;
     uint32_t start_pos;
     uint32_t n_comp;
+    uint32_t max_comp;
     uint32_t n_idx_head;
     uint32_t idx_dim;
     uint32_t ratio;
@@ -204,6 +206,7 @@ struct DeepSeekV41Model::Impl {
     id<MTLBuffer> b_idx_k_tmp = nil;
     id<MTLBuffer> b_idx_q = nil;
     id<MTLBuffer> b_idx_w = nil;
+    id<MTLBuffer> b_idx_scores = nil;
 
     id<MTLBuffer> b_engram_rows = nil;
     id<MTLBuffer> b_engram_kv = nil;
@@ -338,12 +341,12 @@ struct DeepSeekV41Model::Impl {
     }
 
     void encode_rmsnorm(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> x, id<MTLBuffer> w, id<MTLBuffer> y,
-                        uint32_t T, uint32_t D, float eps) {
+                        uint32_t T, uint32_t D, float eps, size_t x_offset = 0, size_t y_offset = 0) {
         DsRmsParams p{T, D, eps};
         [enc setComputePipelineState:pso("ds_rmsnorm_f32")];
-        [enc setBuffer:x offset:0 atIndex:0];
+        [enc setBuffer:x offset:x_offset atIndex:0];
         [enc setBuffer:w offset:0 atIndex:1];
-        [enc setBuffer:y offset:0 atIndex:2];
+        [enc setBuffer:y offset:y_offset atIndex:2];
         [enc setBytes:&p length:sizeof(p) atIndex:3];
         [enc dispatchThreadgroups:MTLSizeMake(T, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
     }
@@ -467,7 +470,7 @@ void DeepSeekV41Model::load(const std::string& model_path, int max_seq, int max_
     impl_->slot_tok_history.assign((size_t)max_slots, {});
 
     size_t kv_layer_bytes = (size_t)max_slots * (size_t)max_seq_len * (size_t)cfg.head_dim * sizeof(float);
-    uint32_t topk_cap = (uint32_t)std::min(cfg.index_topk, 256);
+    uint32_t topk_cap = (uint32_t)std::max(1, cfg.index_topk);
 
     for (int l = 0; l < cfg.num_hidden_layers; ++l) {
         std::string p = "blk." + std::to_string(l) + ".";
@@ -568,6 +571,7 @@ void DeepSeekV41Model::load(const std::string& model_path, int max_seq, int max_
     impl_->b_idx_k_tmp = impl_->alloc_buf(Tmax * (size_t)std::max(1, cfg.index_head_dim) * sizeof(float));
     impl_->b_idx_q = impl_->alloc_buf(Tmax * (size_t)std::max(1, cfg.index_head_count * cfg.index_head_dim) * sizeof(float));
     impl_->b_idx_w = impl_->alloc_buf(Tmax * (size_t)std::max(1, cfg.index_head_count) * sizeof(float));
+    impl_->b_idx_scores = impl_->alloc_buf(Tmax * (size_t)(max_seq_len + 1) * sizeof(float));
 
     size_t ple_dim = (size_t)std::max(1, cfg.ple_n_heads * cfg.ple_head_dim);
     impl_->b_engram_rows = impl_->alloc_buf(Tmax * ple_dim * sizeof(float));
@@ -641,15 +645,14 @@ void DeepSeekV41Model::forward_logits(const int32_t* h_tokens, int T, int start_
         [cb0 waitUntilCompleted];
     }
 
-    id<MTLBuffer> pre_prev = nil;
-    id<MTLBuffer> pre_cur = impl_->b_hc_pre_a;
-    id<MTLBuffer> pre_next = impl_->b_hc_pre_b;
+    id<MTLBuffer> pre_attn = impl_->b_hc_pre_a;
+    id<MTLBuffer> pre_ffn = impl_->b_hc_pre_b;
 
     size_t slot_kv_bytes = (size_t)max_seq_len * (size_t)cfg.head_dim * sizeof(float);
     size_t slot_kv_off = (size_t)slot_id * slot_kv_bytes;
     uint32_t n_nope = (uint32_t)std::max(0, cfg.head_dim - cfg.n_rot);
     uint32_t n_rot = (uint32_t)std::max(0, cfg.n_rot);
-    uint32_t topk_cap = (uint32_t)std::min(cfg.index_topk, 256);
+    uint32_t topk_cap = (uint32_t)std::max(1, cfg.index_topk);
 
     for (int l = 0; l < cfg.num_hidden_layers; ++l) {
         const auto& lw = impl_->layers[(size_t)l];
@@ -692,11 +695,11 @@ void DeepSeekV41Model::forward_logits(const int32_t* h_tokens, int T, int start_
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
 
         impl_->encode_hc_mixes(enc, impl_->b_streams_a, lw.hc_attn_fn, lw.hc_attn_scale, lw.hc_attn_base,
-                               pre_cur, impl_->b_hc_post, impl_->b_hc_comb,
+                               pre_attn, impl_->b_hc_post, impl_->b_hc_comb,
                                (uint32_t)T, (uint32_t)D, hc, (uint32_t)cfg.hc_sinkhorn_iters, cfg.rms_norm_eps, cfg.hc_eps);
 
-        if (pre_prev != nil) {
-            impl_->encode_hc_pre(enc, impl_->b_streams_a, pre_prev, impl_->b_hidden, (uint32_t)T, (uint32_t)D, hc);
+        if (l > 0) {
+            impl_->encode_hc_pre(enc, impl_->b_streams_a, pre_ffn, impl_->b_hidden, (uint32_t)T, (uint32_t)D, hc);
         } else {
             [enc endEncoding];
             id<MTLBlitCommandEncoder> bl0 = [cb blitCommandEncoder];
@@ -722,14 +725,14 @@ void DeepSeekV41Model::forward_logits(const int32_t* h_tokens, int T, int start_
         float freq_base_l = (ratio != 0) ? cfg.compress_rope_freq_base : cfg.rope_freq_base;
 
         if (n_rot >= 2) {
-            DsPartialRopeParams rq{(uint32_t)T, (uint32_t)start_pos, (uint32_t)cfg.num_attention_heads, (uint32_t)cfg.head_dim, n_nope, n_rot, 0u, freq_base_l};
+            DsPartialRopeParams rq{(uint32_t)T, (uint32_t)start_pos, 1u, (uint32_t)cfg.num_attention_heads, (uint32_t)cfg.head_dim, n_nope, n_rot, 0u, freq_base_l};
             [enc setComputePipelineState:impl_->pso("ds_rope_partial_f32")];
             [enc setBuffer:impl_->b_q offset:0 atIndex:0];
             [enc setBytes:&rq length:sizeof(rq) atIndex:1];
             [enc dispatchThreads:MTLSizeMake(n_rot / 2u, (uint32_t)cfg.num_attention_heads, (uint32_t)T)
                 threadsPerThreadgroup:MTLSizeMake(std::min<uint32_t>(32u, n_rot / 2u), 1, 1)];
 
-            DsPartialRopeParams rk{(uint32_t)T, (uint32_t)start_pos, 1u, (uint32_t)cfg.head_dim, n_nope, n_rot, 0u, freq_base_l};
+            DsPartialRopeParams rk{(uint32_t)T, (uint32_t)start_pos, 1u, 1u, (uint32_t)cfg.head_dim, n_nope, n_rot, 0u, freq_base_l};
             [enc setBuffer:impl_->b_kv_norm offset:0 atIndex:0];
             [enc setBytes:&rk length:sizeof(rk) atIndex:1];
             [enc dispatchThreads:MTLSizeMake(n_rot / 2u, 1u, (uint32_t)T)
@@ -785,18 +788,18 @@ void DeepSeekV41Model::forward_logits(const int32_t* h_tokens, int T, int start_
                 [enc dispatchThreadgroups:MTLSizeMake(n_new, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 
                 impl_->encode_gemv(enc, kv.comp_kv, lw.idx_k, impl_->b_idx_k_tmp, n_new, comp_off, 0, 0);
-                impl_->encode_rmsnorm(enc, impl_->b_idx_k_tmp, lw.idx_k_norm, kv.comp_ik, n_new, (uint32_t)cfg.index_head_dim, cfg.rms_norm_eps);
+                impl_->encode_rmsnorm(enc, impl_->b_idx_k_tmp, lw.idx_k_norm, kv.comp_ik, n_new, (uint32_t)cfg.index_head_dim, cfg.rms_norm_eps, 0, ik_off);
 
                 if (n_rot >= 2) {
                     uint32_t ik_nope = (uint32_t)std::max(0, cfg.index_head_dim - cfg.n_rot);
-                    DsPartialRopeParams rik{n_new, first_blk * (uint32_t)ratio, 1u, (uint32_t)cfg.index_head_dim, ik_nope, n_rot, 0u, freq_base_l};
+                    DsPartialRopeParams rik{n_new, first_blk * (uint32_t)ratio, (uint32_t)ratio, 1u, (uint32_t)cfg.index_head_dim, ik_nope, n_rot, 0u, freq_base_l};
                     [enc setComputePipelineState:impl_->pso("ds_rope_partial_f32")];
                     [enc setBuffer:kv.comp_ik offset:ik_off atIndex:0];
                     [enc setBytes:&rik length:sizeof(rik) atIndex:1];
                     [enc dispatchThreads:MTLSizeMake(n_rot / 2u, 1u, n_new)
                         threadsPerThreadgroup:MTLSizeMake(std::min<uint32_t>(32u, n_rot / 2u), 1, 1)];
 
-                    DsPartialRopeParams rc{n_new, first_blk * (uint32_t)ratio, 1u, (uint32_t)cfg.head_dim, n_nope, n_rot, 0u, freq_base_l};
+                    DsPartialRopeParams rc{n_new, first_blk * (uint32_t)ratio, (uint32_t)ratio, 1u, (uint32_t)cfg.head_dim, n_nope, n_rot, 0u, freq_base_l};
                     [enc setBuffer:kv.comp_kv offset:comp_off atIndex:0];
                     [enc setBytes:&rc length:sizeof(rc) atIndex:1];
                     [enc dispatchThreads:MTLSizeMake(n_rot / 2u, 1u, n_new)
@@ -813,7 +816,7 @@ void DeepSeekV41Model::forward_logits(const int32_t* h_tokens, int T, int start_
             impl_->encode_gemv(enc, impl_->b_qr_norm, lw.idx_q_b, impl_->b_idx_q, (uint32_t)T);
             if (n_rot >= 2) {
                 uint32_t iq_nope = (uint32_t)std::max(0, cfg.index_head_dim - cfg.n_rot);
-                DsPartialRopeParams riq{(uint32_t)T, (uint32_t)start_pos, (uint32_t)cfg.index_head_count, (uint32_t)cfg.index_head_dim, iq_nope, n_rot, 0u, freq_base_l};
+                DsPartialRopeParams riq{(uint32_t)T, (uint32_t)start_pos, 1u, (uint32_t)cfg.index_head_count, (uint32_t)cfg.index_head_dim, iq_nope, n_rot, 0u, freq_base_l};
                 [enc setComputePipelineState:impl_->pso("ds_rope_partial_f32")];
                 [enc setBuffer:impl_->b_idx_q offset:0 atIndex:0];
                 [enc setBytes:&riq length:sizeof(riq) atIndex:1];
@@ -823,7 +826,7 @@ void DeepSeekV41Model::forward_logits(const int32_t* h_tokens, int T, int start_
             impl_->encode_gemv(enc, impl_->b_norm, lw.idx_proj, impl_->b_idx_w, (uint32_t)T);
 
             DsIndexerParams ip{
-                (uint32_t)T, (uint32_t)start_pos, total_comp_blocks,
+                (uint32_t)T, (uint32_t)start_pos, total_comp_blocks, (uint32_t)(max_seq_len + 1),
                 (uint32_t)cfg.index_head_count, (uint32_t)cfg.index_head_dim,
                 (uint32_t)ratio, (uint32_t)cfg.sliding_window, topk_cap,
                 1.0f / std::sqrt((float)(cfg.index_head_dim * cfg.index_head_count))
@@ -832,8 +835,9 @@ void DeepSeekV41Model::forward_logits(const int32_t* h_tokens, int T, int start_
             [enc setBuffer:impl_->b_idx_q offset:0 atIndex:0];
             [enc setBuffer:impl_->kv_caches[(size_t)src_kv_l].comp_ik offset:slot_ik_off atIndex:1];
             [enc setBuffer:impl_->b_idx_w offset:0 atIndex:2];
-            [enc setBuffer:kv.topk_sel offset:0 atIndex:3];
-            [enc setBytes:&ip length:sizeof(ip) atIndex:4];
+            [enc setBuffer:impl_->b_idx_scores offset:0 atIndex:3];
+            [enc setBuffer:kv.topk_sel offset:0 atIndex:4];
+            [enc setBytes:&ip length:sizeof(ip) atIndex:5];
             [enc dispatchThreadgroups:MTLSizeMake((uint32_t)T, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         }
 
@@ -870,7 +874,7 @@ void DeepSeekV41Model::forward_logits(const int32_t* h_tokens, int T, int start_
         }
 
         if (n_rot >= 2) {
-            DsPartialRopeParams rinv{(uint32_t)T, (uint32_t)start_pos, (uint32_t)cfg.num_attention_heads, (uint32_t)cfg.head_dim, n_nope, n_rot, 1u, freq_base_l};
+            DsPartialRopeParams rinv{(uint32_t)T, (uint32_t)start_pos, 1u, (uint32_t)cfg.num_attention_heads, (uint32_t)cfg.head_dim, n_nope, n_rot, 1u, freq_base_l};
             [enc setComputePipelineState:impl_->pso("ds_rope_partial_f32")];
             [enc setBuffer:impl_->b_attn_out offset:0 atIndex:0];
             [enc setBytes:&rinv length:sizeof(rinv) atIndex:1];
@@ -894,11 +898,9 @@ void DeepSeekV41Model::forward_logits(const int32_t* h_tokens, int T, int start_
         std::swap(impl_->b_streams_a, impl_->b_streams_b);
 
         impl_->encode_hc_mixes(enc, impl_->b_streams_a, lw.hc_ffn_fn, lw.hc_ffn_scale, lw.hc_ffn_base,
-                               pre_next, impl_->b_hc_post, impl_->b_hc_comb,
+                               pre_ffn, impl_->b_hc_post, impl_->b_hc_comb,
                                (uint32_t)T, (uint32_t)D, hc, (uint32_t)cfg.hc_sinkhorn_iters, cfg.rms_norm_eps, cfg.hc_eps);
-        impl_->encode_hc_pre(enc, impl_->b_streams_a, pre_cur, impl_->b_hidden, (uint32_t)T, (uint32_t)D, hc);
-        pre_prev = pre_next;
-        std::swap(pre_cur, pre_next);
+        impl_->encode_hc_pre(enc, impl_->b_streams_a, pre_attn, impl_->b_hidden, (uint32_t)T, (uint32_t)D, hc);
 
         impl_->encode_rmsnorm(enc, impl_->b_hidden, lw.ffn_norm, impl_->b_norm, (uint32_t)T, (uint32_t)D, cfg.rms_norm_eps);
 
@@ -963,8 +965,8 @@ void DeepSeekV41Model::forward_logits(const int32_t* h_tokens, int T, int start_
 
     id<MTLCommandBuffer> cb = [impl_->queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-    if (pre_prev != nil) {
-        impl_->encode_hc_pre(enc, impl_->b_streams_a, pre_prev, impl_->b_hidden, (uint32_t)T, (uint32_t)D, hc);
+    if (cfg.num_hidden_layers > 0) {
+        impl_->encode_hc_pre(enc, impl_->b_streams_a, pre_ffn, impl_->b_hidden, (uint32_t)T, (uint32_t)D, hc);
     }
     impl_->encode_rmsnorm(enc, impl_->b_hidden, impl_->output_norm, impl_->b_norm, (uint32_t)T, (uint32_t)D, cfg.rms_norm_eps);
     size_t last_off = (size_t)(T - 1) * D * sizeof(float);

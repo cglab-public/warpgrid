@@ -626,6 +626,7 @@ kernel void ds_engram_apply_f32(
 struct DsPartialRopeParams {
     uint T;
     uint start_pos;
+    uint pos_stride;
     uint n_heads;
     uint head_dim;
     uint n_nope;
@@ -643,7 +644,7 @@ kernel void ds_rope_partial_f32(
     uint t = gid.z;
     uint half_rot = p.n_rot >> 1;
     if (pair >= half_rot || h >= p.n_heads || t >= p.T) return;
-    float pos = float(p.start_pos + t);
+    float pos = float(p.start_pos + t * max(1u, p.pos_stride));
     float freq = pow(p.freq_base, -float(2u * pair) / float(p.n_rot));
     float angle = pos * freq;
     if (p.inverse != 0u) angle = -angle;
@@ -970,6 +971,7 @@ struct DsIndexerParams {
     uint T;
     uint start_pos;
     uint n_comp;
+    uint max_comp;
     uint n_idx_head;
     uint idx_dim;
     uint ratio;
@@ -982,8 +984,9 @@ kernel void ds_indexer_score_topk_f32(
     device const float* iq [[buffer(0)]],
     device const float* ik_cache [[buffer(1)]],
     device const float* iw [[buffer(2)]],
-    device int* out_topk [[buffer(3)]],
-    constant DsIndexerParams& p [[buffer(4)]],
+    device float* scores_buf [[buffer(3)]],
+    device int* out_topk [[buffer(4)]],
+    constant DsIndexerParams& p [[buffer(5)]],
     uint tgid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]]) {
     if (tgid >= p.T || tid != 0u) return;
@@ -991,16 +994,12 @@ kernel void ds_indexer_score_topk_f32(
     uint pos = p.start_pos + t;
     uint win_start = (p.sliding_window > 0u && pos + 1u > p.sliding_window) ? (pos + 1u - p.sliding_window) : 0u;
     uint max_vis = min(p.n_comp, win_start / max(1u, p.ratio));
-    uint K = min(p.top_k, 256u);
+    uint K = p.top_k;
 
-    int best_id[256];
-    float best_sc[256];
-    for (uint k = 0; k < K; ++k) {
-        best_id[k] = -1;
-        best_sc[k] = -1e30f;
-    }
     device const float* iqt = iq + ulong(t) * p.n_idx_head * p.idx_dim;
     device const float* iwt = iw + ulong(t) * p.n_idx_head;
+    device float* sc = scores_buf + ulong(t) * p.max_comp;
+    device int* dst = out_topk + ulong(t) * K;
 
     for (uint c = 0; c < max_vis; ++c) {
         device const float* ikc = ik_cache + ulong(c) * p.idx_dim;
@@ -1011,19 +1010,24 @@ kernel void ds_indexer_score_topk_f32(
             for (uint d = 0; d < p.idx_dim; ++d) dot += iqh[d] * ikc[d];
             if (dot > 0.0f) total += dot * (iwt[h] * p.iw_scale);
         }
-        if (total > best_sc[K - 1u]) {
-            uint ins = K - 1u;
-            while (ins > 0u && total > best_sc[ins - 1u]) {
-                best_sc[ins] = best_sc[ins - 1u];
-                best_id[ins] = best_id[ins - 1u];
-                --ins;
-            }
-            best_sc[ins] = total;
-            best_id[ins] = int(c);
-        }
+        sc[c] = total;
     }
+
     for (uint k = 0; k < K; ++k) {
-        out_topk[ulong(t) * K + k] = best_id[k];
+        if (k >= max_vis) {
+            dst[k] = -1;
+            continue;
+        }
+        int best_c = -1;
+        float best_v = -1e30f;
+        for (uint c = 0; c < max_vis; ++c) {
+            if (sc[c] > best_v) {
+                best_v = sc[c];
+                best_c = int(c);
+            }
+        }
+        dst[k] = best_c;
+        if (best_c >= 0) sc[uint(best_c)] = -1e30f;
     }
 }
 
