@@ -35,7 +35,7 @@ void ensure_iq_tables_uploaded() {
 
 __device__ __forceinline__ float warp_sum(float v) {
     for (int off = 16; off > 0; off >>= 1) {
-        v += __shfl_down_sync(0xFFFFFFFFu, v, off);
+        v += __shfl_xor_sync(0xFFFFFFFFu, v, off);
     }
     return v;
 }
@@ -576,25 +576,30 @@ __global__ void k_ds_engram_apply(float* streams, const float* ekv, const float*
     uint32_t t = blockIdx.y;
     uint32_t lane = threadIdx.x;
     if (s >= hc || t >= T) return;
-    float* st = streams + ((size_t)t * hc + s) * D;
-    const float* key = ekv + ((size_t)t * (hc + 1u) + s) * D;
-    const float* val = ekv + ((size_t)t * (hc + 1u) + hc) * D;
+    float* xp = streams + ((size_t)t * hc + s) * D;
+    const float* kv_base = ekv + (size_t)t * (hc + 1u) * D;
+    const float* kp = kv_base + (size_t)s * D;
+    const float* vp = kv_base + (size_t)hc * D;
+    const float* gp = gate + (size_t)s * D;
 
-    float ss_s = 0.0f, ss_k = 0.0f, dot_sk = 0.0f;
+    float x_ss = 0.0f, k_ss = 0.0f;
     for (uint32_t d = lane; d < D; d += 32u) {
-        float sv = st[d];
-        float kv = key[d];
-        ss_s = fmaf(sv, sv, ss_s);
-        ss_k = fmaf(kv, kv, ss_k);
-        dot_sk = fmaf(sv, kv, dot_sk);
+        x_ss = fmaf(xp[d], xp[d], x_ss);
+        k_ss = fmaf(kp[d], kp[d], k_ss);
     }
-    float inv_s = rsqrtf(warp_sum(ss_s) / (float)D + eps);
-    float inv_k = rsqrtf(warp_sum(ss_k) / (float)D + eps);
-    float cos_sim = warp_sum(dot_sk) * inv_s * inv_k / sqrtf((float)D);
-    float alpha = 1.0f / (1.0f + expf(-cos_sim));
-    float g = gate[s];
+    float inv_x = rsqrtf(warp_sum(x_ss) / (float)D + eps);
+    float inv_k = rsqrtf(warp_sum(k_ss) / (float)D + eps);
+
+    float dot = 0.0f;
     for (uint32_t d = lane; d < D; d += 32u) {
-        st[d] += alpha * g * val[d];
+        dot = fmaf((xp[d] * inv_x) * (kp[d] * inv_k), gp[d], dot);
+    }
+    float dval = warp_sum(dot) * rsqrtf((float)D);
+    float mag = sqrtf(fmaxf(fabsf(dval), 1e-6f));
+    float signed_mag = (dval < 0.0f) ? -mag : mag;
+    float g = 1.0f / (1.0f + expf(-signed_mag));
+    for (uint32_t d = lane; d < D; d += 32u) {
+        xp[d] += vp[d] * g;
     }
 }
 
@@ -846,10 +851,30 @@ __global__ void k_ds_argmax(const float* logits, int32_t* out_tok, uint32_t voca
     if (threadIdx.x == 0u) out_tok[0] = s_idx[0];
 }
 
+void validate_quant_type(GgmlType type) {
+    switch (type) {
+        case GgmlType::F32:
+        case GgmlType::BF16:
+        case GgmlType::Q8_0:
+        case GgmlType::IQ4_NL:
+        case GgmlType::MXFP4:
+        case GgmlType::Q4_K:
+        case GgmlType::Q5_K:
+        case GgmlType::Q6_K:
+        case GgmlType::Q2_K:
+        case GgmlType::IQ2_XXS:
+        case GgmlType::IQ1_S:
+            return;
+        default:
+            throw std::runtime_error("Unsupported CUDA GGUF quant type: " + std::to_string((uint32_t)type));
+    }
+}
+
 }
 
 void launch_gemv(GgmlType type, const float* x, const uint8_t* w, float* y,
                  uint32_t M, uint32_t N, uint32_t K, cudaStream_t stream) {
+    validate_quant_type(type);
     ensure_iq_tables_uploaded();
     if (type == GgmlType::F32 && N <= 64u && (K & 3u) == 0u &&
         ((reinterpret_cast<uintptr_t>(x) & 15u) == 0u) && ((reinterpret_cast<uintptr_t>(w) & 15u) == 0u)) {
@@ -862,6 +887,7 @@ void launch_gemv(GgmlType type, const float* x, const uint8_t* w, float* y,
 void launch_grouped_gemv(GgmlType type, const float* x, const uint8_t* w, float* y,
                          uint32_t T, uint32_t G, uint32_t N, uint32_t K,
                          uint32_t group_stride_bytes, cudaStream_t stream) {
+    validate_quant_type(type);
     ensure_iq_tables_uploaded();
     k_gguf_grouped_gemv<<<dim3((N + 3u) / 4u, T * G, 1), 128, 0, stream>>>(type, x, w, y, T, G, N, K, group_stride_bytes);
 }
@@ -870,6 +896,7 @@ void launch_moe_indexed(GgmlType type, const float* x, const uint8_t* w,
                         const int32_t* topk_ids, float* y,
                         uint32_t T, uint32_t N, uint32_t K, uint32_t top_k,
                         uint32_t expert_stride_bytes, cudaStream_t stream) {
+    validate_quant_type(type);
     ensure_iq_tables_uploaded();
     k_gguf_moe_indexed<<<dim3((N + 3u) / 4u, T * top_k, 1), 128, 0, stream>>>(type, x, w, topk_ids, y, T, N, K, top_k, expert_stride_bytes);
 }
@@ -878,6 +905,7 @@ void launch_moe_down_accum(GgmlType type, const float* x, const uint8_t* w,
                            const int32_t* topk_ids, const float* topk_w, float* y,
                            uint32_t T, uint32_t N, uint32_t K, uint32_t top_k,
                            uint32_t expert_stride_bytes, cudaStream_t stream) {
+    validate_quant_type(type);
     ensure_iq_tables_uploaded();
     k_gguf_moe_down_accum<<<dim3((N + 3u) / 4u, T, 1), 128, 0, stream>>>(type, x, w, topk_ids, topk_w, y, T, N, K, top_k, expert_stride_bytes);
 }
@@ -886,6 +914,7 @@ void launch_moe_gate_up_swiglu(GgmlType type, const float* x, const uint8_t* wg,
                                const uint8_t* wu, const int32_t* topk_ids, float* y,
                                uint32_t T, uint32_t N, uint32_t K, uint32_t top_k,
                                uint32_t expert_stride_bytes, float clamp_val, cudaStream_t stream) {
+    validate_quant_type(type);
     ensure_iq_tables_uploaded();
     k_gguf_moe_gate_up_swiglu<<<dim3((N + 3u) / 4u, T * top_k, 1), 128, 0, stream>>>(
         type, x, wg, wu, topk_ids, y, T, N, K, top_k, expert_stride_bytes, clamp_val);

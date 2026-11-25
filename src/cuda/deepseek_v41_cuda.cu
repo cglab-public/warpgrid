@@ -208,14 +208,23 @@ struct DeepSeekV41Model::Impl {
             wb.owned = true;
             wb.type = GgmlType::F32;
             if (wb.groups > 1) wb.group_stride_bytes = wb.cols * wb.rows * (uint32_t)sizeof(float);
-        } else if (ti.shard_index < shard_dev_ptrs.size() && shard_dev_ptrs[ti.shard_index] != nullptr) {
-            wb.ptr = shard_dev_ptrs[ti.shard_index] + gf.shard_data_offset(ti.shard_index) + (size_t)ti.offset;
-            wb.owned = false;
         } else {
-            uint8_t* d = alloc_dev<uint8_t>(ti.nbytes);
-            cuda_check(cudaMemcpy(d, gf.tensor_data(name), ti.nbytes, cudaMemcpyHostToDevice), "load_weight_copy");
-            wb.ptr = d;
-            wb.owned = true;
+            bool supported = (ti.type == GgmlType::F32 || ti.type == GgmlType::BF16 || ti.type == GgmlType::Q8_0 ||
+                              ti.type == GgmlType::IQ4_NL || ti.type == GgmlType::MXFP4 || ti.type == GgmlType::Q4_K ||
+                              ti.type == GgmlType::Q5_K || ti.type == GgmlType::Q6_K || ti.type == GgmlType::Q2_K ||
+                              ti.type == GgmlType::IQ2_XXS || ti.type == GgmlType::IQ1_S);
+            if (!supported) {
+                throw std::runtime_error("Unsupported CUDA GGUF weight quant type for " + name + ": " + std::to_string((uint32_t)ti.type));
+            }
+            if (ti.shard_index < shard_dev_ptrs.size() && shard_dev_ptrs[ti.shard_index] != nullptr) {
+                wb.ptr = shard_dev_ptrs[ti.shard_index] + gf.shard_data_offset(ti.shard_index) + (size_t)ti.offset;
+                wb.owned = false;
+            } else {
+                uint8_t* d = alloc_dev<uint8_t>(ti.nbytes);
+                cuda_check(cudaMemcpy(d, gf.tensor_data(name), ti.nbytes, cudaMemcpyHostToDevice), "load_weight_copy");
+                wb.ptr = d;
+                wb.owned = true;
+            }
         }
         return wb;
     }
