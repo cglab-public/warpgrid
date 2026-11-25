@@ -684,7 +684,7 @@ __global__ void k_ds_indexer_score_topk(const float* idx_q, const float* comp_ik
     uint32_t lane = threadIdx.x;
     if (t >= T) return;
     uint32_t q_pos = start_pos + t;
-    uint32_t cutoff = (q_pos + 1u > sliding_window) ? (q_pos + 1u - sliding_window) : 0u;
+    uint32_t cutoff = (sliding_window > 0u && q_pos + 1u > sliding_window) ? (q_pos + 1u - sliding_window) : 0u;
     uint32_t n_elig = cutoff / ratio;
     if (n_elig > n_comp) n_elig = n_comp;
 
@@ -738,7 +738,7 @@ __global__ void k_ds_mqa_sink_attn(const float* Q, const float* kv_cache, const 
     const float* qp = Q + ((size_t)t * n_heads + h) * head_dim;
     float* op = out + ((size_t)t * n_heads + h) * head_dim;
     uint32_t q_pos = start_pos + t;
-    uint32_t win_start = (q_pos + 1u > sliding_window) ? (q_pos + 1u - sliding_window) : 0u;
+    uint32_t win_start = (sliding_window > 0u && q_pos + 1u > sliding_window) ? (q_pos + 1u - sliding_window) : 0u;
 
     float m = sinks[h];
     float l = 1.0f;
