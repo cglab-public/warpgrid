@@ -2383,12 +2383,30 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
             for (int i = cfg.loop_core_end; i < cfg.num_hidden_layers; ++i) (cfg.is_local(i) ? n_local_visits : n_global_visits)++;
 
             int kv_dim_est = cfg.num_key_value_heads * cfg.head_dim;
-            double weight_gib = 21.2 + (draft_k > 0 ? 0.8 : 0.0);
-            double avail_kv_gib = std::max(0.5, impl_->gpu_ws_gib * 0.90 - weight_gib);
+            double phys_ram_gib = (double)[[NSProcessInfo processInfo] physicalMemory] / (1024.0 * 1024.0 * 1024.0);
+            struct stat st_buf{};
+            double file_gib = 18.0;
+            if (::stat((model_dir + "/model-00001-of-00001.safetensors").c_str(), &st_buf) == 0 && st_buf.st_size > 0) {
+                file_gib = (double)st_buf.st_size / (1024.0 * 1024.0 * 1024.0);
+            }
+            // On low_mem (< 24 GiB ws) GPUs, BF16 dense copies and unembed_w are released after FP8 quantization.
+            double weight_mult = impl_->gpu_low_mem ? 0.98 : 1.15;
+            double draft_gib = !dflash2_dir.empty() ? 0.85 : (draft_k > 0 ? 0.60 : 0.0);
+            double weight_gib = file_gib * weight_mult + draft_gib;
+            double mem_budget_gib = impl_->gpu_low_mem
+                ? std::max(impl_->gpu_ws_gib * 0.90, phys_ram_gib - 1.5)
+                : (impl_->gpu_ws_gib * 0.90);
+            double avail_kv_gib = std::max(0.5, mem_budget_gib - weight_gib);
             auto est_kv_gib = [&](int slots, int seq) -> double {
                 double g_bytes = (double)n_global_visits * slots * seq * (2.0 * kv_dim_est + 2.0 * cfg.num_key_value_heads * 4.0);
                 double l_bytes = (double)n_local_visits * slots * (cfg.sliding_window_size + max_batch_tokens) * 4.0 * kv_dim_est * 2.0;
-                double d_bytes = (draft_k > 0) ? ((double)std::min(2, slots) * (seq + 24) * 2.0 * kv_dim_est * 2.0) : 0.0;
+                double d_bytes = 0.0;
+                if (!dflash2_dir.empty()) {
+                    // DFlash 2 allocates 5 layers with fixed SWA=2048 (+ block + 16 = 2072) regardless of max_seq_len
+                    d_bytes = 5.0 * (double)std::min(2, slots) * 2072.0 * 2.0 * kv_dim_est * 2.0;
+                } else if (draft_k > 0) {
+                    d_bytes = (double)std::min(2, slots) * (seq + 24) * 2.0 * kv_dim_est * 2.0;
+                }
                 return (g_bytes + l_bytes + d_bytes) / (1024.0 * 1024.0 * 1024.0);
             };
             int orig_slots = max_slots;
