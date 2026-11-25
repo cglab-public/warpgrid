@@ -516,6 +516,17 @@ static void test_radix_prefix_cache_cross_slot_and_eviction() {
     EXPECT_EQ(cache.free_block_count(), 8);
 }
 
+static void test_clamp_max_tokens() {
+    EXPECT_EQ(ink::clamp_max_tokens(16, 32768, 32768), 32752);
+    EXPECT_EQ(ink::clamp_max_tokens(13600, 32768, 32768), 19168);
+    EXPECT_EQ(ink::clamp_max_tokens(32768, 16, 32768), 0);
+    EXPECT_EQ(ink::clamp_max_tokens(100, 512, 32768), 512);
+    EXPECT_EQ(ink::clamp_max_tokens(100, 0, 32768), 1);
+    EXPECT_EQ(ink::clamp_max_tokens(100, -10, 32768), 1);
+    EXPECT_EQ(ink::clamp_max_tokens(32767, 16, 32768), 1);
+    EXPECT_EQ(ink::clamp_max_tokens(32769, 16, 32768), 0);
+}
+
 int main() {
     run_test("test_json_roundtrip_and_escaping", test_json_roundtrip_and_escaping);
     run_test("test_config_inkling2_parse", test_config_inkling2_parse);
@@ -526,6 +537,7 @@ int main() {
     run_test("test_telemetry_otlp_payload_and_loopback", test_telemetry_otlp_payload_and_loopback);
     run_test("test_auth_request_line_and_api_key", test_auth_request_line_and_api_key);
     run_test("test_radix_prefix_cache_cross_slot_and_eviction", test_radix_prefix_cache_cross_slot_and_eviction);
+    run_test("test_clamp_max_tokens", test_clamp_max_tokens);
     printf("Host tests: %d passed, %d failed\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;
 }

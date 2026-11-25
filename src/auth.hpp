@@ -139,4 +139,12 @@ inline bool is_request_authorized(std::string_view header_block, std::string_vie
     return false;
 }
 
+inline int clamp_max_tokens(int prompt_len, int requested_max_tokens, int max_seq_len) {
+    if (prompt_len < 0 || max_seq_len <= 0 || prompt_len >= max_seq_len) {
+        return 0;
+    }
+    int avail = max_seq_len - prompt_len;
+    return std::clamp(requested_max_tokens, 1, avail);
+}
+
 } // namespace ink

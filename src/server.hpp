@@ -308,16 +308,18 @@ class OpenAIServer {
                 int plen = (int)r->prompt_ids.size();
 
                 if (!r->prefill_initialized) {
-                    if (plen + r->max_tokens > model_.max_seq_len) {
+                    int clamped_max_tokens = clamp_max_tokens(plen, r->max_tokens, model_.max_seq_len);
+                    if (clamped_max_tokens <= 0) {
                         if (r->hit_snap_id >= 0) {
                             prefix_cache.release_snapshot_pin(r->hit_snap_id);
                             r->hit_snap_id = -1;
                         }
-                        r->mark_done("prompt + max_tokens exceeds max_seq_len");
+                        r->mark_done("prompt exceeds max_seq_len");
                         release_slot(r->slot_id);
                         active.erase(active.begin() + (ptrdiff_t)idx);
                         continue;
                     }
+                    r->max_tokens = clamped_max_tokens;
                     if (!ensure_blocks(r->slot_id, plen)) {
                         if (r->hit_snap_id >= 0) {
                             prefix_cache.release_snapshot_pin(r->hit_snap_id);
@@ -654,13 +656,15 @@ class OpenAIServer {
         st->prompt_ids = tok_.encode(prompt);
         int prompt_len = (int)st->prompt_ids.size();
 
-        if (prompt_len + st->max_tokens > model_.max_seq_len) {
+        int clamped_max_tokens = clamp_max_tokens(prompt_len, st->max_tokens, model_.max_seq_len);
+        if (clamped_max_tokens <= 0) {
             metrics_.on_request_error();
-            fprintf(stderr, "[warpgrid] req_error 400 prompt=%d max_tokens=%d exceeds max_seq_len=%d\n",
-                    prompt_len, st->max_tokens, model_.max_seq_len);
-            send_json(fd, 400, "{\"error\":\"prompt + max_tokens exceeds max_seq_len\"}");
+            fprintf(stderr, "[warpgrid] req_error 400 prompt=%d exceeds max_seq_len=%d\n",
+                    prompt_len, model_.max_seq_len);
+            send_json(fd, 400, "{\"error\":\"prompt exceeds max_seq_len\"}");
             return;
         }
+        st->max_tokens = clamped_max_tokens;
 
         if (stream) {
             std::string hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
