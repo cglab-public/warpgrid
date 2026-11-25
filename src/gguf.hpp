@@ -509,16 +509,20 @@ class GgufFile {
             throw std::runtime_error("GGUF data offset out of bounds in: " + path);
         }
         size_t data_avail = sh.file_size - sh.data_offset;
-        for (auto& ti : shard_tensors) {
+        for (const auto& ti : shard_tensors) {
             if (ti.offset > data_avail || ti.nbytes > data_avail - (size_t)ti.offset) {
                 throw std::runtime_error("Tensor data out of bounds in GGUF: " + ti.name);
             }
             if (tensors_.count(ti.name) > 0) {
                 throw std::runtime_error("Duplicate tensor name in GGUF shard set: " + ti.name);
             }
-            tensors_[ti.name] = std::move(ti);
         }
         shards_.push_back(std::move(sh));
+        for (auto& ti : shard_tensors) {
+            if (!tensors_.emplace(ti.name, std::move(ti)).second) {
+                throw std::runtime_error("Duplicate tensor name in GGUF shard: " + ti.name);
+            }
+        }
     }
 
 public:
@@ -535,9 +539,14 @@ public:
 
     void open(const std::string& path, bool random_access = false) {
         close();
-        auto files = discover_shards(path);
-        for (size_t i = 0; i < files.size(); ++i) {
-            parse_shard(i, files[i], random_access);
+        try {
+            auto files = discover_shards(path);
+            for (size_t i = 0; i < files.size(); ++i) {
+                parse_shard(i, files[i], random_access);
+            }
+        } catch (...) {
+            close();
+            throw;
         }
     }
 
