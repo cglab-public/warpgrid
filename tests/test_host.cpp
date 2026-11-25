@@ -540,6 +540,32 @@ static void test_sse_keepalive_and_disconnect() {
     ::close(fds[1]);
     EXPECT_TRUE(ink::is_socket_disconnected(fds[0]));
     ::close(fds[0]);
+
+    int lfd = ::socket(AF_INET, SOCK_STREAM, 0);
+    EXPECT_TRUE(lfd >= 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    EXPECT_EQ(::bind(lfd, (sockaddr*)&addr, sizeof(addr)), 0);
+    EXPECT_EQ(::listen(lfd, 1), 0);
+    socklen_t alen = sizeof(addr);
+    EXPECT_EQ(::getsockname(lfd, (sockaddr*)&addr, &alen), 0);
+
+    int cfd = ::socket(AF_INET, SOCK_STREAM, 0);
+    EXPECT_TRUE(cfd >= 0);
+    EXPECT_EQ(::connect(cfd, (sockaddr*)&addr, sizeof(addr)), 0);
+    int sfd = ::accept(lfd, nullptr, nullptr);
+    EXPECT_TRUE(sfd >= 0);
+    EXPECT_TRUE(!ink::is_socket_disconnected(sfd));
+    ::close(cfd);
+    struct pollfd wait_pfd{};
+    wait_pfd.fd = sfd;
+    wait_pfd.events = POLLIN;
+    ::poll(&wait_pfd, 1, 200);
+    EXPECT_TRUE(ink::is_socket_disconnected(sfd));
+    ::close(sfd);
+    ::close(lfd);
 }
 
 int main() {

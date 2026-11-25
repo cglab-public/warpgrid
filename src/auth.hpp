@@ -1,7 +1,9 @@
 #pragma once
 #include <poll.h>
+#include <sys/socket.h>
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -157,8 +159,15 @@ inline bool is_socket_disconnected(int fd) {
     pfd.fd = fd;
     pfd.events = POLLIN;
     int rc = ::poll(&pfd, 1, 0);
-    if (rc < 0) return false;
-    return (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0;
+    if (rc <= 0) return false;
+    if ((pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) return true;
+    if ((pfd.revents & POLLIN) != 0) {
+        char b = 0;
+        ssize_t n = ::recv(fd, &b, 1, MSG_PEEK | MSG_DONTWAIT);
+        if (n == 0) return true;
+        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) return true;
+    }
+    return false;
 }
 
 } // namespace ink

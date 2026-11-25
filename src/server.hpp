@@ -704,11 +704,14 @@ class OpenAIServer {
         int completion_tokens = 0;
         std::string finish_reason = "length";
 
+        auto last_write = std::chrono::steady_clock::now();
+
         auto emit_sse_delta = [&](const std::string& field, const std::string& text) -> bool {
             if (!stream || text.empty()) return true;
             std::string chunk_json = "{\"id\":\"chatcmpl-warpgrid\",\"object\":\"chat.completion.chunk\",\"model\":"
                 + json::escape_str(served_name_) + ",\"choices\":[{\"index\":0,\"delta\":{"
                 + json::escape_str(field) + ":" + json::escape_str(text) + "},\"finish_reason\":null}]}";
+            last_write = std::chrono::steady_clock::now();
             return send_all(fd, "data: " + chunk_json + "\n\n");
         };
 
@@ -729,11 +732,22 @@ class OpenAIServer {
                     std::string chunk_json = "{\"id\":\"chatcmpl-warpgrid\",\"object\":\"chat.completion.chunk\",\"model\":"
                         + json::escape_str(served_name_) + ",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":["
                         + json::dump(delta_tc) + "]},\"finish_reason\":null}]}";
+                    last_write = std::chrono::steady_clock::now();
                     send_all(fd, "data: " + chunk_json + "\n\n");
                 }
                 tool_calls.push_back(std::move(tc));
             } catch (...) {}
             tool_buf.clear();
+        };
+
+        auto maybe_keepalive = [&]() -> bool {
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_write).count();
+            if (elapsed_ms < kSseKeepaliveIntervalMs) return true;
+            if (is_socket_disconnected(fd)) return false;
+            last_write = now;
+            if (stream && !send_all(fd, kSseKeepaliveFrame)) return false;
+            return true;
         };
 
         bool client_ok = true;
@@ -753,14 +767,7 @@ class OpenAIServer {
                 }
             }
             if (!woke) {
-                if (is_socket_disconnected(fd)) {
-                    client_ok = false;
-                    break;
-                }
-                if (stream && !send_all(fd, kSseKeepaliveFrame)) {
-                    client_ok = false;
-                    break;
-                }
+                client_ok = maybe_keepalive();
                 continue;
             }
             if (!got_first) {
@@ -797,6 +804,9 @@ class OpenAIServer {
                 } else if (mode == ParseMode::ToolJson) {
                     tool_buf += piece;
                 }
+            }
+            if (client_ok) {
+                client_ok = maybe_keepalive();
             }
         }
         auto record_telemetry = [&](bool cancelled, const std::string& fin_reason) {
