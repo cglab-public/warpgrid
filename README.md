@@ -95,7 +95,21 @@ Measured end-to-end over the live OpenAI-compatible HTTP/SSE server (`./warpgrid
 
 ## Quick Start
 
-### 1. Build (Auto-Detects macOS/Metal or Linux/CUDA)
+### 1. Install (Prebuilt Binary or Build from Source)
+
+**Option A — Download a prebuilt binary** from [GitHub Releases (`v0.1.0`)](https://github.com/cglab-public/warpgrid/releases/tag/v0.1.0):
+
+```bash
+# macOS Apple Silicon (arm64, macOS 15+, Metal)
+curl -fL https://github.com/cglab-public/warpgrid/releases/download/v0.1.0/warpgrid-v0.1.0-macos-arm64.tar.gz | tar -xz
+
+# NVIDIA DGX Spark (Linux aarch64, GB10 sm_121a, CUDA 13.0)
+curl -fL https://github.com/cglab-public/warpgrid/releases/download/v0.1.0/warpgrid-v0.1.0-linux-aarch64-dgx-spark-cuda13.tar.gz | tar -xz
+```
+
+*(Checksums are included in `SHA256SUMS.txt` on the [release page](https://github.com/cglab-public/warpgrid/releases/tag/v0.1.0).)*
+
+**Option B — Build from source** (auto-detects macOS/Metal or Linux/CUDA):
 - **macOS (Apple Silicon M3/M4/M5):** Requires Xcode Command Line Tools (`clang++`, Metal framework; optional `xcrun metal` toolchain for precompiled `.metallib` embedding).
 - **Linux (NVIDIA Blackwell):** Requires CUDA Toolkit (12.8+ for `sm_121a`) and `g++` (C++20).
 
