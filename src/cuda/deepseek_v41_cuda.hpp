@@ -18,6 +18,10 @@ struct DeepSeekV41Model : public ModelBackend {
 
     DeepSeekV41Model();
     ~DeepSeekV41Model() override;
+    DeepSeekV41Model(const DeepSeekV41Model&) = delete;
+    DeepSeekV41Model& operator=(const DeepSeekV41Model&) = delete;
+
+    std::string arch_name() const override { return cfg.arch; }
 
     void load(const std::string& model_path, int max_seq = 32768, int max_chunk = 512, int n_slots = 1) override;
     void load_tokenizer(Tokenizer& tok) const;
