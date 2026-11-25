@@ -1269,7 +1269,7 @@ void DSparkDrafter::draft_tokens(
 }
 
 void DSparkDrafter::alloc_df2_snapshots(int num_snaps) {
-    if (!is_dflash2 || num_snaps <= 0 || df2_kv_cap <= 0) return;
+    if (!df2_mode || num_snaps <= 0 || df2_kv_cap <= 0) return;
     df2_num_snapshots = num_snaps;
     int kv_dim = df2_kv_heads * df2_head_dim;
     for (int i = 0; i < df2_num_layers; ++i) {
@@ -1280,7 +1280,7 @@ void DSparkDrafter::alloc_df2_snapshots(int num_snaps) {
 }
 
 void DSparkDrafter::save_df2_snapshot(int slot_id, int snap_id, cudaStream_t s) {
-    if (!is_dflash2 || df2_num_snapshots <= 0) return;
+    if (!df2_mode || df2_num_snapshots <= 0) return;
     if (slot_id < 0 || slot_id >= max_dspark_slots || snap_id < 0 || snap_id >= df2_num_snapshots) return;
     int kv_dim = df2_kv_heads * df2_head_dim;
     size_t one_df2 = (size_t)df2_kv_cap * kv_dim * sizeof(__nv_bfloat16);
@@ -1294,7 +1294,7 @@ void DSparkDrafter::save_df2_snapshot(int slot_id, int snap_id, cudaStream_t s) 
 }
 
 void DSparkDrafter::restore_df2_snapshot(int slot_id, int snap_id, cudaStream_t s) {
-    if (!is_dflash2 || df2_num_snapshots <= 0) return;
+    if (!df2_mode || df2_num_snapshots <= 0) return;
     if (slot_id < 0 || slot_id >= max_dspark_slots || snap_id < 0 || snap_id >= df2_num_snapshots) return;
     int kv_dim = df2_kv_heads * df2_head_dim;
     size_t one_df2 = (size_t)df2_kv_cap * kv_dim * sizeof(__nv_bfloat16);
