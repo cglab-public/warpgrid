@@ -252,6 +252,7 @@ struct Inkling2Model::Impl {
     id<MTLComputePipelineState> pso_quant_fp8 = nil;
     id<MTLComputePipelineState> pso_fp8_gemv = nil;
     id<MTLComputePipelineState> pso_fp8_small_gemm = nil;
+    id<MTLComputePipelineState> pso_fp8_gemm_tiled = nil;
     id<MTLComputePipelineState> pso_bf16_gemm_tiled = nil;
     id<MTLComputePipelineState> pso_softcap_argmax = nil;
     id<MTLComputePipelineState> pso_batched_argmax = nil;
@@ -541,6 +542,18 @@ struct Inkling2Model::Impl {
                            uint32_t M, uint32_t N, uint32_t K, bool out_fp32)
     {
         GemvParams gp{M, N, K, out_fp32 ? 1u : 0u};
+        if (M >= 9u && (K & 31u) == 0u) {
+            [enc setComputePipelineState:pso_fp8_gemm_tiled];
+            [enc setBuffer:X offset:x_off atIndex:0];
+            [enc setBuffer:W8 offset:w8_off atIndex:1];
+            [enc setBuffer:Wsc offset:wsc_off atIndex:2];
+            [enc setBuffer:(Y_bf ? Y_bf : b_dummy) offset:y_bf_off atIndex:3];
+            [enc setBuffer:(Y_f32 ? Y_f32 : b_dummy) offset:y_f32_off atIndex:4];
+            [enc setBytes:&gp length:sizeof(gp) atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake((N + 31u) / 32u, (M + 31u) / 32u, 1)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            return;
+        }
         if (M >= 2u && M <= 8u) {
             [enc setComputePipelineState:pso_fp8_small_gemm];
             [enc setBuffer:X offset:x_off atIndex:0];
@@ -2500,6 +2513,7 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
         impl_->pso_quant_fp8 = impl_->make_pso("quantize_bf16_to_fp8_rowwise_kernel");
         impl_->pso_fp8_gemv = impl_->make_pso("fp8_gemv_kernel");
         impl_->pso_fp8_small_gemm = impl_->make_pso("fp8_small_gemm_kernel");
+        impl_->pso_fp8_gemm_tiled = impl_->make_pso("fp8_gemm_tiled_kernel");
         impl_->pso_bf16_gemm_tiled = impl_->make_pso("bf16_gemm_tiled_kernel");
         impl_->pso_softcap_argmax = impl_->make_pso("softcap_argmax_kernel");
         impl_->pso_batched_argmax = impl_->make_pso("batched_argmax_kernel");

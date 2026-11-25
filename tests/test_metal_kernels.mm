@@ -1385,6 +1385,96 @@ static void test_moe_q3_parity() {
     EXPECT_TRUE(max_e2 < 2e-2f);
 }
 
+static void test_fp8_gemm_tiled() {
+    auto p_quant = g_ctx.pso("quantize_bf16_to_fp8_rowwise_kernel");
+    auto p_gemv = g_ctx.pso("fp8_gemv_kernel");
+    auto p_tiled = g_ctx.pso("fp8_gemm_tiled_kernel");
+    EXPECT_TRUE(p_quant != nil && p_gemv != nil && p_tiled != nil);
+
+    const uint32_t M = 45, N = 50, K = 128;
+    std::vector<uint16_t> X(M * K), W(N * K);
+    for (uint32_t i = 0; i < M * K; ++i) X[i] = f32_to_bf16(0.3f * std::sin((float)i * 0.13f));
+    for (uint32_t i = 0; i < N * K; ++i) W[i] = f32_to_bf16(0.4f * std::cos((float)i * 0.11f));
+
+    auto bX = g_ctx.buf(X.size() * 2, X.data());
+    auto bW = g_ctx.buf(W.size() * 2, W.data());
+    auto bW8 = g_ctx.buf(N * K);
+    auto bSc = g_ctx.buf(N * 4);
+    auto bRefBf = g_ctx.buf(M * N * 2);
+    auto bRefF32 = g_ctx.buf(M * N * 4);
+    auto bOutBf = g_ctx.buf(M * N * 2);
+    auto bOutF32 = g_ctx.buf(M * N * 4);
+
+    struct QuantParams { uint32_t N; uint32_t K; } qp{N, K};
+    struct GemvParams { uint32_t M; uint32_t N; uint32_t K; uint32_t out_fp32; };
+    GemvParams gp_bf{M, N, K, 0u};
+    GemvParams gp_f32{M, N, K, 1u};
+
+    id<MTLCommandBuffer> cb = [g_ctx.q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+
+    [enc setComputePipelineState:p_quant];
+    [enc setBuffer:bW offset:0 atIndex:0];
+    [enc setBuffer:bW8 offset:0 atIndex:1];
+    [enc setBuffer:bSc offset:0 atIndex:2];
+    [enc setBytes:&qp length:sizeof(qp) atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+    [enc setComputePipelineState:p_gemv];
+    [enc setBuffer:bX offset:0 atIndex:0];
+    [enc setBuffer:bW8 offset:0 atIndex:1];
+    [enc setBuffer:bSc offset:0 atIndex:2];
+    [enc setBuffer:bRefBf offset:0 atIndex:3];
+    [enc setBuffer:bRefF32 offset:0 atIndex:4];
+    [enc setBytes:&gp_bf length:sizeof(gp_bf) atIndex:5];
+    [enc dispatchThreadgroups:MTLSizeMake((N + 3) / 4, M, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+    [enc setComputePipelineState:p_tiled];
+    [enc setBuffer:bX offset:0 atIndex:0];
+    [enc setBuffer:bW8 offset:0 atIndex:1];
+    [enc setBuffer:bSc offset:0 atIndex:2];
+    [enc setBuffer:bOutBf offset:0 atIndex:3];
+    [enc setBuffer:bOutF32 offset:0 atIndex:4];
+    [enc setBytes:&gp_bf length:sizeof(gp_bf) atIndex:5];
+    [enc dispatchThreadgroups:MTLSizeMake((N + 31) / 32, (M + 31) / 32, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+    [enc setComputePipelineState:p_gemv];
+    [enc setBuffer:bX offset:0 atIndex:0];
+    [enc setBuffer:bW8 offset:0 atIndex:1];
+    [enc setBuffer:bSc offset:0 atIndex:2];
+    [enc setBuffer:bRefBf offset:0 atIndex:3];
+    [enc setBuffer:bRefF32 offset:0 atIndex:4];
+    [enc setBytes:&gp_f32 length:sizeof(gp_f32) atIndex:5];
+    [enc dispatchThreadgroups:MTLSizeMake((N + 3) / 4, M, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+    [enc setComputePipelineState:p_tiled];
+    [enc setBuffer:bX offset:0 atIndex:0];
+    [enc setBuffer:bW8 offset:0 atIndex:1];
+    [enc setBuffer:bSc offset:0 atIndex:2];
+    [enc setBuffer:bOutBf offset:0 atIndex:3];
+    [enc setBuffer:bOutF32 offset:0 atIndex:4];
+    [enc setBytes:&gp_f32 length:sizeof(gp_f32) atIndex:5];
+    [enc dispatchThreadgroups:MTLSizeMake((N + 31) / 32, (M + 31) / 32, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+    [enc endEncoding];
+    EXPECT_TRUE(g_ctx.run_cb(cb));
+
+    const uint16_t* r_bf = (const uint16_t*)bRefBf.contents;
+    const uint16_t* o_bf = (const uint16_t*)bOutBf.contents;
+    const float* r_f32 = (const float*)bRefF32.contents;
+    const float* o_f32 = (const float*)bOutF32.contents;
+    float max_bf = 0.0f, max_f32 = 0.0f;
+    for (uint32_t i = 0; i < M * N; ++i) {
+        float vb = bf16_to_f32(o_bf[i]);
+        float vr = bf16_to_f32(r_bf[i]);
+        EXPECT_TRUE(std::isfinite(vb) && std::isfinite(o_f32[i]));
+        max_bf = std::max(max_bf, std::fabs(vb - vr));
+        max_f32 = std::max(max_f32, std::fabs(o_f32[i] - r_f32[i]));
+    }
+    EXPECT_TRUE(max_bf < 2e-2f);
+    EXPECT_TRUE(max_f32 < 1e-4f);
+}
+
 int main() {
     @autoreleasepool {
         if (!g_ctx.init()) {
@@ -1404,6 +1494,7 @@ int main() {
         run_test("test_dflash2_kernels", test_dflash2_kernels);
         run_test("test_moe_q2_parity", test_moe_q2_parity);
         run_test("test_moe_q3_parity", test_moe_q3_parity);
+        run_test("test_fp8_gemm_tiled", test_fp8_gemm_tiled);
         printf("Metal kernel tests: %d passed, %d failed\n", g_passed, g_failed);
         return g_failed == 0 ? 0 : 1;
     }

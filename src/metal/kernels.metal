@@ -2296,6 +2296,88 @@ kernel void bf16_gemm_tiled_kernel(
     }
 }
 
+kernel void fp8_gemm_tiled_kernel(
+    device const bfloat* X   [[buffer(0)]],
+    device const uchar* W8   [[buffer(1)]],
+    device const float* Wsc  [[buffer(2)]],
+    device bfloat* Y_bf16    [[buffer(3)]],
+    device float* Y_fp32     [[buffer(4)]],
+    constant GemvParams& p   [[buffer(5)]],
+    uint2 tgid               [[threadgroup_position_in_grid]],
+    uint sg_id               [[simdgroup_index_in_threadgroup]],
+    uint tid                 [[thread_index_in_threadgroup]])
+{
+    uint m0 = tgid.y * 32u;
+    uint n0 = tgid.x * 32u;
+    if (m0 >= p.M || n0 >= p.N) return;
+
+    threadgroup bfloat smX[32 * 32];
+    threadgroup bfloat smW[32 * 32];
+    threadgroup float smOut[32 * 32];
+    threadgroup float smSc[32];
+
+    if (tid < 32u) {
+        uint gn = n0 + tid;
+        smSc[tid] = (gn < p.N) ? Wsc[gn] : 0.0f;
+    }
+
+    uint sg_r = (sg_id >> 1) * 16u;
+    uint sg_c = (sg_id & 1u) * 16u;
+
+    simdgroup_matrix<float, 8, 8> acc[2][2];
+    for (uint i = 0; i < 2u; ++i)
+        for (uint j = 0; j < 2u; ++j)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (uint k0 = 0; k0 < p.K; k0 += 32u) {
+        for (uint idx = tid; idx < 1024u; idx += 128u) {
+            uint r = idx >> 5;
+            uint c = idx & 31u;
+            uint gm = m0 + r;
+            uint gn = n0 + r;
+            uint gk = k0 + c;
+            smX[idx] = (gm < p.M && gk < p.K) ? X[long(gm) * long(p.K) + long(gk)] : bfloat(0.0f);
+            smW[c * 32u + r] = (gn < p.N && gk < p.K)
+                ? bfloat(e4m3_to_f32(W8[long(gn) * long(p.K) + long(gk)]))
+                : bfloat(0.0f);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint kk = 0; kk < 32u; kk += 8u) {
+            simdgroup_matrix<bfloat, 8, 8> ma0, ma1, mb0, mb1;
+            simdgroup_load(ma0, smX + (sg_r + 0u) * 32u + kk, 32u);
+            simdgroup_load(ma1, smX + (sg_r + 8u) * 32u + kk, 32u);
+            simdgroup_load(mb0, smW + kk * 32u + (sg_c + 0u), 32u);
+            simdgroup_load(mb1, smW + kk * 32u + (sg_c + 8u), 32u);
+            simdgroup_multiply_accumulate(acc[0][0], ma0, mb0, acc[0][0]);
+            simdgroup_multiply_accumulate(acc[0][1], ma0, mb1, acc[0][1]);
+            simdgroup_multiply_accumulate(acc[1][0], ma1, mb0, acc[1][0]);
+            simdgroup_multiply_accumulate(acc[1][1], ma1, mb1, acc[1][1]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint i = 0; i < 2u; ++i) {
+        for (uint j = 0; j < 2u; ++j) {
+            simdgroup_store(acc[i][j], smOut + (sg_r + i * 8u) * 32u + (sg_c + j * 8u), 32u);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint idx = tid; idx < 1024u; idx += 128u) {
+        uint r = idx >> 5;
+        uint c = idx & 31u;
+        uint gm = m0 + r;
+        uint gn = n0 + c;
+        if (gm < p.M && gn < p.N) {
+            float val = smOut[idx] * smSc[c];
+            long out_idx = long(gm) * long(p.N) + long(gn);
+            if (p.out_fp32 != 0u) Y_fp32[out_idx] = val;
+            else Y_bf16[out_idx] = bfloat(val);
+        }
+    }
+}
+
 struct ArgmaxParams {
     uint vocab_size;
     float softcap;
