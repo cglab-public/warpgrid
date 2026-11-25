@@ -502,9 +502,10 @@ __global__ void k_ds_rmsnorm(const float* X, const float* W, float* Y, uint32_t 
 
 __global__ void k_ds_hc_mixes(const float* raw, const float* scale, const float* base,
                               float* out_pre, float* out_post, float* out_comb,
-                              uint32_t T, uint32_t hc, uint32_t sinkhorn_iters, float eps) {
+                              uint32_t T, uint32_t hc_mult, uint32_t sinkhorn_iters, float eps) {
     uint32_t t = blockIdx.x;
     if (t >= T || threadIdx.x != 0u) return;
+    uint32_t hc = hc_mult < 8u ? hc_mult : 8u;
     uint32_t total = (2u + hc) * hc;
     const float* rp = raw + (size_t)t * total;
     float s_pre = scale[0], s_post = scale[1], s_comb = scale[2];
@@ -514,28 +515,45 @@ __global__ void k_ds_hc_mixes(const float* raw, const float* scale, const float*
 
     for (uint32_t i = 0; i < hc; ++i) {
         float vp = rp[i] * s_pre + base[i];
-        pre[i] = 1.0f / (1.0f + expf(-vp));
+        pre[i] = (1.0f / (1.0f + expf(-vp))) + eps;
         float vo = rp[hc + i] * s_post + base[hc + i];
         post[i] = 2.0f / (1.0f + expf(-vo));
     }
 
-    float M[16];
-    for (uint32_t i = 0; i < hc * hc; ++i) {
-        float vc = rp[2u * hc + i] * s_comb + base[2u * hc + i];
-        M[i] = expf(fminf(fmaxf(vc, -40.0f), 40.0f));
+    float M[64];
+    for (uint32_t src = 0; src < hc; ++src) {
+        float mx = -1e30f;
+        for (uint32_t dst = 0; dst < hc; ++dst) {
+            uint32_t idx = src * hc + dst;
+            float v = rp[2u * hc + idx] * s_comb + base[2u * hc + idx];
+            M[idx] = v;
+            mx = fmaxf(mx, v);
+        }
+        float sm = 0.0f;
+        for (uint32_t dst = 0; dst < hc; ++dst) {
+            float e = expf(M[src * hc + dst] - mx);
+            M[src * hc + dst] = e;
+            sm += e;
+        }
+        float inv = 1.0f / fmaxf(sm, 1e-20f);
+        for (uint32_t dst = 0; dst < hc; ++dst) {
+            M[src * hc + dst] = M[src * hc + dst] * inv + eps;
+        }
     }
     for (uint32_t it = 0; it < sinkhorn_iters; ++it) {
-        for (uint32_t r = 0; r < hc; ++r) {
-            float rs = eps;
-            for (uint32_t c = 0; c < hc; ++c) rs += M[r * hc + c];
-            float inv = 1.0f / rs;
-            for (uint32_t c = 0; c < hc; ++c) M[r * hc + c] *= inv;
+        if (it > 0u) {
+            for (uint32_t src = 0; src < hc; ++src) {
+                float rs = eps;
+                for (uint32_t dst = 0; dst < hc; ++dst) rs += M[src * hc + dst];
+                float inv = 1.0f / rs;
+                for (uint32_t dst = 0; dst < hc; ++dst) M[src * hc + dst] *= inv;
+            }
         }
-        for (uint32_t c = 0; c < hc; ++c) {
+        for (uint32_t dst = 0; dst < hc; ++dst) {
             float cs = eps;
-            for (uint32_t r = 0; r < hc; ++r) cs += M[r * hc + c];
+            for (uint32_t src = 0; src < hc; ++src) cs += M[src * hc + dst];
             float inv = 1.0f / cs;
-            for (uint32_t r = 0; r < hc; ++r) M[r * hc + c] *= inv;
+            for (uint32_t src = 0; src < hc; ++src) M[src * hc + dst] *= inv;
         }
     }
     for (uint32_t i = 0; i < hc * hc; ++i) comb[i] = M[i];
@@ -564,7 +582,7 @@ __global__ void k_ds_hc_post(const float* sub, const float* residual, const floa
     for (uint32_t s = 0; s < hc; ++s) {
         float acc = pw[s] * sv;
         for (uint32_t r = 0; r < hc; ++r) {
-            acc = fmaf(cw[s * hc + r], residual[((size_t)t * hc + r) * D + d], acc);
+            acc = fmaf(cw[r * hc + s], residual[((size_t)t * hc + r) * D + d], acc);
         }
         out_streams[((size_t)t * hc + s) * D + d] = acc;
     }
