@@ -2389,17 +2389,20 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
             if (::stat((model_dir + "/model-00001-of-00001.safetensors").c_str(), &st_buf) == 0 && st_buf.st_size > 0) {
                 file_gib = (double)st_buf.st_size / (1024.0 * 1024.0 * 1024.0);
             }
-            // On low_mem (< 24 GiB ws) GPUs, BF16 dense copies and unembed_w are released after FP8 quantization.
+            // On low_mem (< 24 GiB ws) GPUs, BF16 dense copies and unembed_w are released after FP8 quantization,
+            // and for single-slot 16 GB setups we skip the duplicate local-SWA prefix snapshot pool (~240 MiB saved).
             double weight_mult = impl_->gpu_low_mem ? 0.98 : 1.15;
             double draft_gib = !dflash2_dir.empty() ? 0.85 : (draft_k > 0 ? 0.60 : 0.0);
             double weight_gib = file_gib * weight_mult + draft_gib;
             double mem_budget_gib = impl_->gpu_low_mem
-                ? std::max(impl_->gpu_ws_gib * 0.90, phys_ram_gib - 1.9)
+                ? std::min(phys_ram_gib - 1.2, std::max(impl_->gpu_ws_gib * 1.04, phys_ram_gib - 1.9))
                 : (impl_->gpu_ws_gib * 0.90);
             double avail_kv_gib = std::max(0.5, mem_budget_gib - weight_gib);
             auto est_kv_gib = [&](int slots, int seq) -> double {
+                int snaps = (impl_->gpu_low_mem && slots == 1) ? 0
+                    : ((slots >= 4 && impl_->gpu_ws_gib >= 48.0) ? std::max(slots, 12) : slots);
                 double g_bytes = (double)n_global_visits * slots * seq * (2.0 * kv_dim_est + 2.0 * cfg.num_key_value_heads * 4.0);
-                double l_bytes = (double)n_local_visits * slots * (cfg.sliding_window_size + max_batch_tokens) * 4.0 * kv_dim_est * 2.0;
+                double l_bytes = (double)n_local_visits * (slots + snaps) * (cfg.sliding_window_size + max_batch_tokens) * 2.0 * kv_dim_est * 2.0;
                 double d_bytes = 0.0;
                 if (!dflash2_dir.empty()) {
                     // DFlash 2 allocates 5 layers with fixed SWA=2048 (+ block + 16 = 2072) regardless of max_seq_len
@@ -2694,8 +2697,9 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
 
         max_blocks_per_seq = (max_seq_len + 63) / 64;
         num_kv_blocks = max_slots * max_blocks_per_seq;
-        num_snapshots = (max_slots >= 4 && impl_->device.recommendedMaxWorkingSetSize >= (48ULL << 30))
-            ? std::max(max_slots, 12) : max_slots;
+        num_snapshots = (impl_->gpu_low_mem && max_slots == 1) ? 0
+            : ((max_slots >= 4 && impl_->device.recommendedMaxWorkingSetSize >= (48ULL << 30))
+                ? std::max(max_slots, 12) : max_slots);
         impl_->max_blocks_per_seq = max_blocks_per_seq;
         impl_->num_kv_blocks = num_kv_blocks;
         impl_->num_snapshots = num_snapshots;
@@ -2743,16 +2747,18 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
             vc.attn_conv_snap = impl_->alloc_shared((size_t)n_ds * 8 * 3 * D * 2);
             vc.mlp_conv_snap = impl_->alloc_shared((size_t)n_ds * 8 * 3 * D * 2);
 
-            if (vc.is_local) {
-                size_t kv_sz = (size_t)num_snapshots * (size_t)vc.cap * kv_dim * 2;
-                vc.local_k_prefill_snap = impl_->alloc_shared(kv_sz);
-                vc.local_v_prefill_snap = impl_->alloc_shared(kv_sz);
-                kv_bytes_total += 2 * kv_sz;
+            if (num_snapshots > 0) {
+                if (vc.is_local) {
+                    size_t kv_sz = (size_t)num_snapshots * (size_t)vc.cap * kv_dim * 2;
+                    vc.local_k_prefill_snap = impl_->alloc_shared(kv_sz);
+                    vc.local_v_prefill_snap = impl_->alloc_shared(kv_sz);
+                    kv_bytes_total += 2 * kv_sz;
+                }
+                vc.k_conv_prefill_snap = impl_->alloc_shared((size_t)num_snapshots * 3 * kv_dim * 2);
+                vc.v_conv_prefill_snap = impl_->alloc_shared((size_t)num_snapshots * 3 * kv_dim * 2);
+                vc.attn_conv_prefill_snap = impl_->alloc_shared((size_t)num_snapshots * 3 * D * 2);
+                vc.mlp_conv_prefill_snap = impl_->alloc_shared((size_t)num_snapshots * 3 * D * 2);
             }
-            vc.k_conv_prefill_snap = impl_->alloc_shared((size_t)num_snapshots * 3 * kv_dim * 2);
-            vc.v_conv_prefill_snap = impl_->alloc_shared((size_t)num_snapshots * 3 * kv_dim * 2);
-            vc.attn_conv_prefill_snap = impl_->alloc_shared((size_t)num_snapshots * 3 * D * 2);
-            vc.mlp_conv_prefill_snap = impl_->alloc_shared((size_t)num_snapshots * 3 * D * 2);
         }
 
         int T = max_batch_tokens;

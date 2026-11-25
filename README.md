@@ -143,8 +143,10 @@ hf download incoai/Inkling-2-Mini-DFlash2 --local-dir ./Inkling-2-Mini-DFlash2
   --dflash2 ./Inkling-2-Mini-DFlash2 \
   --draft-k 6 \
   --max-slots 1 \
-  --max-seq-len 8192 \
+  --max-chunk 256 \
+  --max-seq-len 16384 \
   --port 8888
+# (Tip: on 16 GB Macs, `sudo sysctl -w iogpu.wired_limit_mb=14336` unlocks `--max-seq-len 32768` at 0.71 GiB KV / 23.1 tok/s!)
 
 # Or quantize your own Q3/Q2 checkpoint from official weights:
 uv run --with numpy python3 scripts/quantize_q2.py \
