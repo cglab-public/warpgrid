@@ -1268,4 +1268,43 @@ void DSparkDrafter::draft_tokens(
     CHECK_CUDA(cudaStreamSynchronize(stream));
 }
 
+void DSparkDrafter::alloc_df2_snapshots(int num_snaps) {
+    if (!is_dflash2 || num_snaps <= 0 || df2_kv_cap <= 0) return;
+    df2_num_snapshots = num_snaps;
+    int kv_dim = df2_kv_heads * df2_head_dim;
+    for (int i = 0; i < df2_num_layers; ++i) {
+        size_t sz = (size_t)num_snaps * df2_kv_cap * kv_dim * sizeof(__nv_bfloat16);
+        df2_k_snap[i] = (__nv_bfloat16*)alloc_gpu(sz);
+        df2_v_snap[i] = (__nv_bfloat16*)alloc_gpu(sz);
+    }
+}
+
+void DSparkDrafter::save_df2_snapshot(int slot_id, int snap_id, cudaStream_t s) {
+    if (!is_dflash2 || df2_num_snapshots <= 0) return;
+    if (slot_id < 0 || slot_id >= max_dspark_slots || snap_id < 0 || snap_id >= df2_num_snapshots) return;
+    int kv_dim = df2_kv_heads * df2_head_dim;
+    size_t one_df2 = (size_t)df2_kv_cap * kv_dim * sizeof(__nv_bfloat16);
+    int64_t src_off = (int64_t)slot_id * df2_kv_cap * kv_dim;
+    int64_t dst_off = (int64_t)snap_id * df2_kv_cap * kv_dim;
+    for (int i = 0; i < df2_num_layers; ++i) {
+        if (!df2_k_snap[i] || !df2_v_snap[i]) continue;
+        CHECK_CUDA(cudaMemcpyAsync(df2_k_snap[i] + dst_off, df2_k_cache[i] + src_off, one_df2, cudaMemcpyDeviceToDevice, s));
+        CHECK_CUDA(cudaMemcpyAsync(df2_v_snap[i] + dst_off, df2_v_cache[i] + src_off, one_df2, cudaMemcpyDeviceToDevice, s));
+    }
+}
+
+void DSparkDrafter::restore_df2_snapshot(int slot_id, int snap_id, cudaStream_t s) {
+    if (!is_dflash2 || df2_num_snapshots <= 0) return;
+    if (slot_id < 0 || slot_id >= max_dspark_slots || snap_id < 0 || snap_id >= df2_num_snapshots) return;
+    int kv_dim = df2_kv_heads * df2_head_dim;
+    size_t one_df2 = (size_t)df2_kv_cap * kv_dim * sizeof(__nv_bfloat16);
+    int64_t src_off = (int64_t)snap_id * df2_kv_cap * kv_dim;
+    int64_t dst_off = (int64_t)slot_id * df2_kv_cap * kv_dim;
+    for (int i = 0; i < df2_num_layers; ++i) {
+        if (!df2_k_snap[i] || !df2_v_snap[i]) continue;
+        CHECK_CUDA(cudaMemcpyAsync(df2_k_cache[i] + dst_off, df2_k_snap[i] + src_off, one_df2, cudaMemcpyDeviceToDevice, s));
+        CHECK_CUDA(cudaMemcpyAsync(df2_v_cache[i] + dst_off, df2_v_snap[i] + src_off, one_df2, cudaMemcpyDeviceToDevice, s));
+    }
+}
+
 } // namespace ink

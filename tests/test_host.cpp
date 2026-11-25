@@ -584,6 +584,20 @@ static void test_inplace_slot_prefix_match() {
     EXPECT_EQ(ink::match_inplace_slot_prefix(slot, empty), 0);
 }
 
+static void test_dflash2_snapshot_resume_gate() {
+    std::vector<bool> valid = {true, false};
+    std::vector<int> pos = {2176, 0};
+
+    EXPECT_TRUE(ink::can_resume_dflash2_from_snapshot(true, 0, 1, 6, 0, 2176, valid, pos));
+    EXPECT_TRUE(!ink::can_resume_dflash2_from_snapshot(false, 0, 1, 6, 0, 2176, valid, pos));
+    EXPECT_TRUE(!ink::can_resume_dflash2_from_snapshot(true, 1, 1, 6, 0, 2176, valid, pos));
+    EXPECT_TRUE(!ink::can_resume_dflash2_from_snapshot(true, 0, 1, 0, 0, 2176, valid, pos));
+    EXPECT_TRUE(!ink::can_resume_dflash2_from_snapshot(true, 0, 1, 6, 1, 2176, valid, pos));
+    EXPECT_TRUE(!ink::can_resume_dflash2_from_snapshot(true, 0, 1, 6, 0, 2048, valid, pos));
+    EXPECT_TRUE(!ink::can_resume_dflash2_from_snapshot(true, 0, 1, 6, -1, 2176, valid, pos));
+    EXPECT_TRUE(!ink::can_resume_dflash2_from_snapshot(true, 0, 1, 6, 2, 2176, valid, pos));
+}
+
 int main() {
     run_test("test_json_roundtrip_and_escaping", test_json_roundtrip_and_escaping);
     run_test("test_config_inkling2_parse", test_config_inkling2_parse);
@@ -597,6 +611,7 @@ int main() {
     run_test("test_clamp_max_tokens", test_clamp_max_tokens);
     run_test("test_sse_keepalive_and_disconnect", test_sse_keepalive_and_disconnect);
     run_test("test_inplace_slot_prefix_match", test_inplace_slot_prefix_match);
+    run_test("test_dflash2_snapshot_resume_gate", test_dflash2_snapshot_resume_gate);
     printf("Host tests: %d passed, %d failed\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;
 }

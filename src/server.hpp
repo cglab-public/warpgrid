@@ -184,6 +184,8 @@ class OpenAIServer {
         std::vector<bool> slot_used(max_slots, false);
         std::vector<bool> slot_dspark_valid(max_slots, false);
         std::vector<int> slot_dspark_written(max_slots, 0);
+        std::vector<bool> snap_dspark_valid(std::max(0, model_.num_snapshots), false);
+        std::vector<int> snap_dspark_pos(std::max(0, model_.num_snapshots), 0);
         std::vector<std::vector<int32_t>> slot_blocks(max_slots);
         std::vector<std::vector<int32_t>> slot_inplace_toks(max_slots);
         RadixPrefixCache prefix_cache;
@@ -378,13 +380,25 @@ class OpenAIServer {
                         active.erase(active.begin() + (ptrdiff_t)idx);
                         continue;
                     }
+                    bool restored_df2 = false;
                     if (r->in_place_hit) {
                         r->pos = r->cached_tokens;
                     } else if (r->cached_tokens > 0) {
-                        model_.restore_boundary_snapshot(r->slot_id, r->hit_snap_id);
-                        prefix_cache.release_snapshot_pin(r->hit_snap_id);
+                        int32_t hsid = r->hit_snap_id;
+                        model_.restore_boundary_snapshot(r->slot_id, hsid);
+                        restored_df2 = can_resume_dflash2_from_snapshot(
+                            !model_.dflash2_dir.empty(),
+                            r->slot_id,
+                            model_.max_dspark_slots(),
+                            model_.draft_k,
+                            hsid,
+                            r->cached_tokens,
+                            snap_dspark_valid,
+                            snap_dspark_pos);
+                        prefix_cache.release_snapshot_pin(hsid);
                         r->hit_snap_id = -1;
-                        slot_dspark_valid[r->slot_id] = false;
+                        slot_dspark_valid[r->slot_id] = restored_df2;
+                        slot_dspark_written[r->slot_id] = restored_df2 ? r->cached_tokens : 0;
                         r->pos = r->cached_tokens;
                     } else {
                         model_.reset_cache(r->slot_id);
@@ -396,7 +410,7 @@ class OpenAIServer {
                             slot_dspark_valid[r->slot_id] = true;
                             slot_dspark_written[r->slot_id] = 0;
                             r->can_commit_ds = true;
-                        } else if (r->in_place_hit && slot_dspark_valid[r->slot_id] &&
+                        } else if ((r->in_place_hit || restored_df2) && slot_dspark_valid[r->slot_id] &&
                                    slot_dspark_written[r->slot_id] == r->cached_tokens) {
                             r->can_commit_ds = true;
                         }
@@ -450,9 +464,21 @@ class OpenAIServer {
 
                 if ((r->cp_shared > 0 && p == r->cp_shared) || (r->cp_end > 0 && p == r->cp_end)) {
                     int32_t sid = prefix_cache.alloc_snapshot();
-                    if (sid >= 0) model_.save_boundary_snapshot(r->slot_id, sid);
-                    prefix_cache.publish_prefix(r->prompt_ids, p / kKvBlockSize,
-                                                slot_blocks[r->slot_id], sid);
+                    if (sid >= 0) {
+                        model_.save_boundary_snapshot(r->slot_id, sid);
+                        bool df2_ok = !model_.dflash2_dir.empty() && r->can_commit_ds &&
+                                      slot_dspark_valid[r->slot_id] && slot_dspark_written[r->slot_id] == p;
+                        if (sid < (int)snap_dspark_valid.size()) {
+                            snap_dspark_valid[sid] = df2_ok;
+                            snap_dspark_pos[sid] = df2_ok ? p : 0;
+                        }
+                    }
+                    int32_t attached_sid = prefix_cache.publish_prefix(r->prompt_ids, p / kKvBlockSize,
+                                                                       slot_blocks[r->slot_id], sid);
+                    if (sid >= 0 && attached_sid != sid && sid < (int)snap_dspark_valid.size()) {
+                        snap_dspark_valid[sid] = false;
+                        snap_dspark_pos[sid] = 0;
+                    }
                     model_.set_slot_block_table(r->slot_id, slot_blocks[r->slot_id].data(),
                                                 (int)slot_blocks[r->slot_id].size());
                 }

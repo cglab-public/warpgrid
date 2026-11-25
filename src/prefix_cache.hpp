@@ -378,4 +378,19 @@ inline int match_inplace_slot_prefix(const std::vector<int32_t>& slot_toks,
     return slen;
 }
 
+inline bool can_resume_dflash2_from_snapshot(bool dflash2_enabled,
+                                             int slot_id,
+                                             int max_dspark_slots,
+                                             int draft_k,
+                                             int32_t snap_id,
+                                             int cached_tokens,
+                                             const std::vector<bool>& snap_valid,
+                                             const std::vector<int>& snap_pos) {
+    if (!dflash2_enabled || draft_k <= 0 || cached_tokens <= 0) return false;
+    if (slot_id < 0 || slot_id >= max_dspark_slots) return false;
+    if (snap_id < 0 || snap_id >= static_cast<int>(snap_valid.size())) return false;
+    if (snap_id >= static_cast<int>(snap_pos.size())) return false;
+    return snap_valid[snap_id] && snap_pos[snap_id] == cached_tokens;
+}
+
 } // namespace ink

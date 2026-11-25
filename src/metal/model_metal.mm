@@ -417,6 +417,8 @@ struct Inkling2Model::Impl {
     std::vector<MetalDFlash2LayerWeights> df2_layers;
     std::vector<id<MTLBuffer>> df2_k_cache;
     std::vector<id<MTLBuffer>> df2_v_cache;
+    std::vector<id<MTLBuffer>> df2_k_snap;
+    std::vector<id<MTLBuffer>> df2_v_snap;
     id<MTLBuffer> df2_ctx_cat = nil;
     id<MTLBuffer> df2_ctx_fc = nil;
     id<MTLBuffer> df2_ctx_norm = nil;
@@ -2079,10 +2081,19 @@ struct Inkling2Model::Impl {
         df2_kv_cap = df2_window + df2_block + 16;
         df2_k_cache.resize(df2_num_layers);
         df2_v_cache.resize(df2_num_layers);
+        if (num_snapshots > 0) {
+            df2_k_snap.resize(df2_num_layers);
+            df2_v_snap.resize(df2_num_layers);
+        }
         for (int i = 0; i < df2_num_layers; ++i) {
             size_t sz = (size_t)dspark_slots * (size_t)df2_kv_cap * kv_dim * 2;
             df2_k_cache[i] = alloc_shared(sz);
             df2_v_cache[i] = alloc_shared(sz);
+            if (num_snapshots > 0) {
+                size_t snap_sz = (size_t)num_snapshots * (size_t)df2_kv_cap * kv_dim * 2;
+                df2_k_snap[i] = alloc_shared(snap_sz);
+                df2_v_snap[i] = alloc_shared(snap_sz);
+            }
         }
 
         df2_ctx_cat = alloc_shared((size_t)max_ctx_chunk * 4 * df2_hidden * 2);
@@ -2417,7 +2428,7 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
                 double l_bytes = (double)n_local_visits * (slots + snaps) * (cfg.sliding_window_size + max_batch_tokens) * 2.0 * kv_dim_est * 2.0;
                 double d_bytes = 0.0;
                 if (!dflash2_dir.empty()) {
-                    d_bytes = 5.0 * (double)std::min(2, slots) * 2072.0 * 2.0 * kv_dim_est * 2.0;
+                    d_bytes = 5.0 * (double)(std::min(2, slots) + snaps) * 2072.0 * 2.0 * kv_dim_est * 2.0;
                 } else if (draft_k > 0) {
                     d_bytes = (double)std::min(2, slots) * (seq + 24) * 2.0 * kv_dim_est * 2.0;
                 }
@@ -2906,6 +2917,18 @@ void Inkling2Model::save_boundary_snapshot(int slot_id, int snap_id) {
         memcpy(static_cast<uint8_t*>(vc.mlp_conv_prefill_snap.contents) + (size_t)snap_id * d_sz,
                static_cast<uint8_t*>(vc.mlp_conv_state.contents) + (size_t)slot_id * d_sz, d_sz);
     }
+    if (impl_->df2_loaded && !impl_->df2_k_snap.empty() && slot_id >= 0 && slot_id < impl_->dspark_slots) {
+        size_t df2_kv_dim = (size_t)impl_->df2_kv_heads * (size_t)impl_->df2_head_dim;
+        size_t one_df2 = (size_t)impl_->df2_kv_cap * df2_kv_dim * 2;
+        size_t src_off = (size_t)slot_id * one_df2;
+        size_t dst_off = (size_t)snap_id * one_df2;
+        for (int i = 0; i < impl_->df2_num_layers; ++i) {
+            memcpy(static_cast<uint8_t*>(impl_->df2_k_snap[i].contents) + dst_off,
+                   static_cast<uint8_t*>(impl_->df2_k_cache[i].contents) + src_off, one_df2);
+            memcpy(static_cast<uint8_t*>(impl_->df2_v_snap[i].contents) + dst_off,
+                   static_cast<uint8_t*>(impl_->df2_v_cache[i].contents) + src_off, one_df2);
+        }
+    }
 }
 
 void Inkling2Model::restore_boundary_snapshot(int slot_id, int snap_id) {
@@ -2932,6 +2955,18 @@ void Inkling2Model::restore_boundary_snapshot(int slot_id, int snap_id) {
                static_cast<uint8_t*>(vc.attn_conv_prefill_snap.contents) + (size_t)snap_id * d_sz, d_sz);
         memcpy(static_cast<uint8_t*>(vc.mlp_conv_state.contents) + (size_t)slot_id * d_sz,
                static_cast<uint8_t*>(vc.mlp_conv_prefill_snap.contents) + (size_t)snap_id * d_sz, d_sz);
+    }
+    if (impl_->df2_loaded && !impl_->df2_k_snap.empty() && slot_id >= 0 && slot_id < impl_->dspark_slots) {
+        size_t df2_kv_dim = (size_t)impl_->df2_kv_heads * (size_t)impl_->df2_head_dim;
+        size_t one_df2 = (size_t)impl_->df2_kv_cap * df2_kv_dim * 2;
+        size_t src_off = (size_t)snap_id * one_df2;
+        size_t dst_off = (size_t)slot_id * one_df2;
+        for (int i = 0; i < impl_->df2_num_layers; ++i) {
+            memcpy(static_cast<uint8_t*>(impl_->df2_k_cache[i].contents) + dst_off,
+                   static_cast<uint8_t*>(impl_->df2_k_snap[i].contents) + src_off, one_df2);
+            memcpy(static_cast<uint8_t*>(impl_->df2_v_cache[i].contents) + dst_off,
+                   static_cast<uint8_t*>(impl_->df2_v_snap[i].contents) + src_off, one_df2);
+        }
     }
 }
 

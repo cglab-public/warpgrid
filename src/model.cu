@@ -425,6 +425,7 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
         if (draft_k <= 0) draft_k = 6;
         dspark.load_dflash2(dflash2_dir, embed_w, embed_norm_w, unembed_w, cublas, stream,
                             max_batch_tokens, draft_vocab_file, n_ds_slots);
+        dspark.alloc_df2_snapshots(num_snapshots);
     } else if (draft_k > 0) {
         dspark.load(model_dir, embed_w, embed_norm_w, unembed_w, cublas, stream,
                     max_seq_len, max_batch_tokens, draft_vocab_file, n_ds_slots);
@@ -462,6 +463,7 @@ void Inkling2Model::save_boundary_snapshot(int slot_id, int snap_id) {
         CHECK_CUDA(cudaMemcpyAsync(vc.attn_conv_prefill_snap + d_dst, vc.attn_conv_state + d_src, 3 * D * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream));
         CHECK_CUDA(cudaMemcpyAsync(vc.mlp_conv_prefill_snap + d_dst, vc.mlp_conv_state + d_src, 3 * D * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream));
     }
+    dspark.save_df2_snapshot(slot_id, snap_id, stream);
 }
 
 void Inkling2Model::restore_boundary_snapshot(int slot_id, int snap_id) {
@@ -485,6 +487,7 @@ void Inkling2Model::restore_boundary_snapshot(int slot_id, int snap_id) {
         CHECK_CUDA(cudaMemcpyAsync(vc.attn_conv_state + d_dst, vc.attn_conv_prefill_snap + d_src, 3 * D * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream));
         CHECK_CUDA(cudaMemcpyAsync(vc.mlp_conv_state + d_dst, vc.mlp_conv_prefill_snap + d_src, 3 * D * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream));
     }
+    dspark.restore_df2_snapshot(slot_id, snap_id, stream);
 }
 
 void Inkling2Model::save_prefill_snapshot(int slot_id) {

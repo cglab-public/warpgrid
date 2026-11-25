@@ -188,6 +188,9 @@ public:
     std::vector<DFlash2LayerWeights> df2_layers;
     __nv_bfloat16* df2_k_cache[5] = {};
     __nv_bfloat16* df2_v_cache[5] = {};
+    __nv_bfloat16* df2_k_snap[5] = {};
+    __nv_bfloat16* df2_v_snap[5] = {};
+    int df2_num_snapshots = 0;
 
     __nv_bfloat16* df2_ctx_cat = nullptr;
     __nv_bfloat16* df2_ctx_fc = nullptr;
@@ -230,6 +233,10 @@ public:
                       cudaStream_t shared_stream,
                       int max_ctx_chunk, const std::string& draft_vocab_file = "",
                       int n_dspark_slots = 4);
+
+    void alloc_df2_snapshots(int num_snaps);
+    void save_df2_snapshot(int slot_id, int snap_id, cudaStream_t s);
+    void restore_df2_snapshot(int slot_id, int snap_id, cudaStream_t s);
 
     // Store context K/V from target's 4 aux hidden states [4, T, 2304] at [start_pos .. start_pos+T-1]
     void store_context_kv(const __nv_bfloat16* aux_states, int aux_stride, int T, int start_pos, int slot_id = 0);
