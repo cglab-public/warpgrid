@@ -438,6 +438,274 @@ kernel void ds_rmsnorm_f32(
     }
 }
 
+kernel void ds_rmsnorm_unweighted_f32(
+    device const float* X [[buffer(0)]],
+    device float* Y [[buffer(1)]],
+    constant DsRmsParams& p [[buffer(2)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    if (tgid >= p.T) return;
+    device const float* xp = X + ulong(tgid) * p.D;
+    device float* yp = Y + ulong(tgid) * p.D;
+    float ss = 0.0f;
+    for (uint d = tid; d < p.D; d += 32u) {
+        float v = xp[d];
+        ss += v * v;
+    }
+    float mean_ss = simd_sum(ss) / float(p.D);
+    float inv_rms = rsqrt(mean_ss + p.eps);
+    for (uint d = tid; d < p.D; d += 32u) {
+        yp[d] = xp[d] * inv_rms;
+    }
+}
+
+struct DsHcMixParams {
+    uint T;
+    uint hc_mult;
+    uint sinkhorn_iters;
+    float eps;
+};
+
+kernel void ds_hc_mixes_f32(
+    device const float* raw_mixes [[buffer(0)]],
+    device const float* hc_scale [[buffer(1)]],
+    device const float* hc_base [[buffer(2)]],
+    device float* out_pre [[buffer(3)]],
+    device float* out_post [[buffer(4)]],
+    device float* out_comb [[buffer(5)]],
+    constant DsHcMixParams& p [[buffer(6)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    if (tgid >= p.T || tid != 0u) return;
+    uint hc = min(p.hc_mult, 8u);
+    uint mix_dim = (2u + hc) * hc;
+    device const float* m = raw_mixes + ulong(tgid) * mix_dim;
+    float s_pre = hc_scale[0];
+    float s_post = hc_scale[1];
+    float s_comb = hc_scale[2];
+
+    for (uint i = 0; i < hc; ++i) {
+        float v = m[i] * s_pre + hc_base[i];
+        out_pre[ulong(tgid) * hc + i] = (1.0f / (1.0f + exp(-v))) + p.eps;
+    }
+    for (uint i = 0; i < hc; ++i) {
+        float v = m[hc + i] * s_post + hc_base[hc + i];
+        out_post[ulong(tgid) * hc + i] = 2.0f / (1.0f + exp(-v));
+    }
+
+    float mat[64];
+    for (uint src = 0; src < hc; ++src) {
+        float mx = -1e30f;
+        for (uint dst = 0; dst < hc; ++dst) {
+            uint idx = src * hc + dst;
+            float v = m[2u * hc + idx] * s_comb + hc_base[2u * hc + idx];
+            mat[idx] = v;
+            mx = max(mx, v);
+        }
+        float sm = 0.0f;
+        for (uint dst = 0; dst < hc; ++dst) {
+            float e = exp(mat[src * hc + dst] - mx);
+            mat[src * hc + dst] = e;
+            sm += e;
+        }
+        float inv = 1.0f / max(sm, 1e-20f);
+        for (uint dst = 0; dst < hc; ++dst) {
+            mat[src * hc + dst] = mat[src * hc + dst] * inv + p.eps;
+        }
+    }
+
+    for (uint it = 0; it < p.sinkhorn_iters; ++it) {
+        if (it > 0u) {
+            for (uint src = 0; src < hc; ++src) {
+                float rs = p.eps;
+                for (uint dst = 0; dst < hc; ++dst) rs += mat[src * hc + dst];
+                float inv = 1.0f / rs;
+                for (uint dst = 0; dst < hc; ++dst) mat[src * hc + dst] *= inv;
+            }
+        }
+        for (uint dst = 0; dst < hc; ++dst) {
+            float cs = p.eps;
+            for (uint src = 0; src < hc; ++src) cs += mat[src * hc + dst];
+            float inv = 1.0f / cs;
+            for (uint src = 0; src < hc; ++src) mat[src * hc + dst] *= inv;
+        }
+    }
+    for (uint i = 0; i < hc * hc; ++i) {
+        out_comb[ulong(tgid) * (hc * hc) + i] = mat[i];
+    }
+}
+
+struct DsHcApplyParams {
+    uint T;
+    uint D;
+    uint hc_mult;
+};
+
+kernel void ds_hc_pre_f32(
+    device const float* streams [[buffer(0)]],
+    device const float* pre_w [[buffer(1)]],
+    device float* out_hidden [[buffer(2)]],
+    constant DsHcApplyParams& p [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    uint d = gid.x;
+    uint t = gid.y;
+    if (d >= p.D || t >= p.T) return;
+    float acc = 0.0f;
+    for (uint s = 0; s < p.hc_mult; ++s) {
+        acc += streams[(ulong(t) * p.hc_mult + s) * p.D + d] * pre_w[ulong(t) * p.hc_mult + s];
+    }
+    out_hidden[ulong(t) * p.D + d] = acc;
+}
+
+kernel void ds_hc_post_f32(
+    device const float* sublayer [[buffer(0)]],
+    device const float* residual [[buffer(1)]],
+    device const float* post_w [[buffer(2)]],
+    device const float* comb_w [[buffer(3)]],
+    device float* out_streams [[buffer(4)]],
+    constant DsHcApplyParams& p [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    uint d = gid.x;
+    uint t = gid.y;
+    if (d >= p.D || t >= p.T) return;
+    float sv = sublayer[ulong(t) * p.D + d];
+    for (uint dst = 0; dst < p.hc_mult; ++dst) {
+        float acc = sv * post_w[ulong(t) * p.hc_mult + dst];
+        for (uint src = 0; src < p.hc_mult; ++src) {
+            float c = comb_w[ulong(t) * (p.hc_mult * p.hc_mult) + src * p.hc_mult + dst];
+            acc += residual[(ulong(t) * p.hc_mult + src) * p.D + d] * c;
+        }
+        out_streams[(ulong(t) * p.hc_mult + dst) * p.D + d] = acc;
+    }
+}
+
+struct DsEngramApplyParams {
+    uint T;
+    uint D;
+    uint hc_mult;
+    float eps;
+};
+
+kernel void ds_engram_apply_f32(
+    device float* streams [[buffer(0)]],
+    device const float* engram_kv [[buffer(1)]],
+    device const float* engram_gate [[buffer(2)]],
+    constant DsEngramApplyParams& p [[buffer(3)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    uint s = tgid.x;
+    uint t = tgid.y;
+    if (s >= p.hc_mult || t >= p.T) return;
+    device float* xp = streams + (ulong(t) * p.hc_mult + s) * p.D;
+    device const float* kv_base = engram_kv + ulong(t) * (p.hc_mult + 1u) * p.D;
+    device const float* kp = kv_base + ulong(s) * p.D;
+    device const float* vp = kv_base + ulong(p.hc_mult) * p.D;
+    device const float* gp = engram_gate + ulong(s) * p.D;
+
+    float x_ss = 0.0f, k_ss = 0.0f;
+    for (uint d = tid; d < p.D; d += 32u) {
+        x_ss += xp[d] * xp[d];
+        k_ss += kp[d] * kp[d];
+    }
+    float inv_x = rsqrt(simd_sum(x_ss) / float(p.D) + p.eps);
+    float inv_k = rsqrt(simd_sum(k_ss) / float(p.D) + p.eps);
+
+    float dot = 0.0f;
+    for (uint d = tid; d < p.D; d += 32u) {
+        dot += (xp[d] * inv_x) * (kp[d] * inv_k) * gp[d];
+    }
+    float dval = simd_sum(dot) * rsqrt(float(p.D));
+    float mag = sqrt(max(fabs(dval), 1e-6f));
+    float signed_mag = (dval < 0.0f) ? -mag : mag;
+    float gate = 1.0f / (1.0f + exp(-signed_mag));
+    for (uint d = tid; d < p.D; d += 32u) {
+        xp[d] += vp[d] * gate;
+    }
+}
+
+struct DsPartialRopeParams {
+    uint T;
+    uint start_pos;
+    uint n_heads;
+    uint head_dim;
+    uint n_nope;
+    uint n_rot;
+    uint inverse;
+    float freq_base;
+};
+
+kernel void ds_rope_partial_f32(
+    device float* X [[buffer(0)]],
+    constant DsPartialRopeParams& p [[buffer(1)]],
+    uint3 gid [[thread_position_in_grid]]) {
+    uint pair = gid.x;
+    uint h = gid.y;
+    uint t = gid.z;
+    uint half_rot = p.n_rot >> 1;
+    if (pair >= half_rot || h >= p.n_heads || t >= p.T) return;
+    float pos = float(p.start_pos + t);
+    float freq = pow(p.freq_base, -float(2u * pair) / float(p.n_rot));
+    float angle = pos * freq;
+    if (p.inverse != 0u) angle = -angle;
+    float cs = cos(angle);
+    float sn = sin(angle);
+    ulong base = (ulong(t) * p.n_heads + h) * p.head_dim + p.n_nope;
+    float x0 = X[base + 2u * pair];
+    float x1 = X[base + 2u * pair + 1u];
+    X[base + 2u * pair] = x0 * cs - x1 * sn;
+    X[base + 2u * pair + 1u] = x0 * sn + x1 * cs;
+}
+
+struct DsMqaSinkAttnParams {
+    uint T;
+    uint start_pos;
+    uint n_heads;
+    uint head_dim;
+    uint sliding_window;
+    uint n_comp_sel;
+    float scale;
+};
+
+kernel void ds_mqa_sink_attn_f32(
+    device const float* Q [[buffer(0)]],
+    device const float* KV_cache [[buffer(1)]],
+    device const float* sinks [[buffer(2)]],
+    device float* O [[buffer(3)]],
+    constant DsMqaSinkAttnParams& p [[buffer(4)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    uint h = tgid.x;
+    uint t = tgid.y;
+    if (h >= p.n_heads || t >= p.T) return;
+    uint seq_end = p.start_pos + t + 1u;
+    uint win_start = (p.sliding_window > 0u && seq_end > p.sliding_window) ? (seq_end - p.sliding_window) : 0u;
+    device const float* qp = Q + (ulong(t) * p.n_heads + h) * p.head_dim;
+    device float* op = O + (ulong(t) * p.n_heads + h) * p.head_dim;
+
+    float sink_val = sinks[h];
+    float m_max = sink_val;
+    for (uint s = win_start; s < seq_end; ++s) {
+        device const float* kvp = KV_cache + ulong(s) * p.head_dim;
+        float dot = 0.0f;
+        for (uint d = tid; d < p.head_dim; d += 32u) dot += qp[d] * kvp[d];
+        float sc = simd_sum(dot) * p.scale;
+        m_max = max(m_max, sc);
+    }
+
+    float l_sum = exp(sink_val - m_max);
+    for (uint d = tid; d < p.head_dim; d += 32u) op[d] = 0.0f;
+    for (uint s = win_start; s < seq_end; ++s) {
+        device const float* kvp = KV_cache + ulong(s) * p.head_dim;
+        float dot = 0.0f;
+        for (uint d = tid; d < p.head_dim; d += 32u) dot += qp[d] * kvp[d];
+        float w = exp(simd_sum(dot) * p.scale - m_max);
+        l_sum += w;
+        for (uint d = tid; d < p.head_dim; d += 32u) op[d] += w * kvp[d];
+    }
+    float inv_l = 1.0f / max(l_sum, 1e-20f);
+    for (uint d = tid; d < p.head_dim; d += 32u) op[d] *= inv_l;
+}
+
 struct DsMhcParams {
     uint T;
     uint D;
@@ -655,6 +923,214 @@ kernel void ds_csa_hca_attn_f32(
     }
     float inv_l = 1.0f / max(l_sum, 1e-20f);
     for (uint d = tid; d < p.head_dim; d += 32u) op[d] *= inv_l;
+}
+
+struct DsCompGroupParams {
+    uint n_blocks;
+    uint ratio;
+    uint head_dim;
+    float eps;
+};
+
+kernel void ds_comp_group_reduce_f32(
+    device const float* state_kv [[buffer(0)]],
+    device const float* state_score [[buffer(1)]],
+    device const float* norm_w [[buffer(2)]],
+    device float* out_comp [[buffer(3)]],
+    constant DsCompGroupParams& p [[buffer(4)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    if (tgid >= p.n_blocks) return;
+    uint base_row = tgid * p.ratio;
+    device float* yp = out_comp + ulong(tgid) * p.head_dim;
+    float ss = 0.0f;
+    for (uint d = tid; d < p.head_dim; d += 32u) {
+        float mx = -1e30f;
+        for (uint r = 0; r < p.ratio; ++r) {
+            mx = max(mx, state_score[ulong(base_row + r) * p.head_dim + d]);
+        }
+        float sm = 0.0f;
+        float val = 0.0f;
+        for (uint r = 0; r < p.ratio; ++r) {
+            float w = exp(state_score[ulong(base_row + r) * p.head_dim + d] - mx);
+            sm += w;
+            val += w * state_kv[ulong(base_row + r) * p.head_dim + d];
+        }
+        float c = val / max(sm, 1e-20f);
+        yp[d] = c;
+        ss += c * c;
+    }
+    float inv_rms = rsqrt(simd_sum(ss) / float(p.head_dim) + p.eps);
+    for (uint d = tid; d < p.head_dim; d += 32u) {
+        yp[d] = yp[d] * inv_rms * norm_w[d];
+    }
+}
+
+struct DsIndexerParams {
+    uint T;
+    uint start_pos;
+    uint n_comp;
+    uint n_idx_head;
+    uint idx_dim;
+    uint ratio;
+    uint sliding_window;
+    uint top_k;
+    float iw_scale;
+};
+
+kernel void ds_indexer_score_topk_f32(
+    device const float* iq [[buffer(0)]],
+    device const float* ik_cache [[buffer(1)]],
+    device const float* iw [[buffer(2)]],
+    device int* out_topk [[buffer(3)]],
+    constant DsIndexerParams& p [[buffer(4)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    if (tgid >= p.T || tid != 0u) return;
+    uint t = tgid;
+    uint pos = p.start_pos + t;
+    uint win_start = (p.sliding_window > 0u && pos + 1u > p.sliding_window) ? (pos + 1u - p.sliding_window) : 0u;
+    uint max_vis = min(p.n_comp, win_start / max(1u, p.ratio));
+    uint K = min(p.top_k, 256u);
+
+    int best_id[256];
+    float best_sc[256];
+    for (uint k = 0; k < K; ++k) {
+        best_id[k] = -1;
+        best_sc[k] = -1e30f;
+    }
+    device const float* iqt = iq + ulong(t) * p.n_idx_head * p.idx_dim;
+    device const float* iwt = iw + ulong(t) * p.n_idx_head;
+
+    for (uint c = 0; c < max_vis; ++c) {
+        device const float* ikc = ik_cache + ulong(c) * p.idx_dim;
+        float total = 0.0f;
+        for (uint h = 0; h < p.n_idx_head; ++h) {
+            device const float* iqh = iqt + ulong(h) * p.idx_dim;
+            float dot = 0.0f;
+            for (uint d = 0; d < p.idx_dim; ++d) dot += iqh[d] * ikc[d];
+            if (dot > 0.0f) total += dot * (iwt[h] * p.iw_scale);
+        }
+        if (total > best_sc[K - 1u]) {
+            uint ins = K - 1u;
+            while (ins > 0u && total > best_sc[ins - 1u]) {
+                best_sc[ins] = best_sc[ins - 1u];
+                best_id[ins] = best_id[ins - 1u];
+                --ins;
+            }
+            best_sc[ins] = total;
+            best_id[ins] = int(c);
+        }
+    }
+    for (uint k = 0; k < K; ++k) {
+        out_topk[ulong(t) * K + k] = best_id[k];
+    }
+}
+
+kernel void ds_mqa_sink_comp_attn_f32(
+    device const float* Q [[buffer(0)]],
+    device const float* KV_cache [[buffer(1)]],
+    device const float* comp_kv_cache [[buffer(2)]],
+    device const int* comp_topk [[buffer(3)]],
+    device const float* sinks [[buffer(4)]],
+    device float* O [[buffer(5)]],
+    constant DsMqaSinkAttnParams& p [[buffer(6)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    uint h = tgid.x;
+    uint t = tgid.y;
+    if (h >= p.n_heads || t >= p.T) return;
+    uint seq_end = p.start_pos + t + 1u;
+    uint win_start = (p.sliding_window > 0u && seq_end > p.sliding_window) ? (seq_end - p.sliding_window) : 0u;
+    device const float* qp = Q + (ulong(t) * p.n_heads + h) * p.head_dim;
+    device float* op = O + (ulong(t) * p.n_heads + h) * p.head_dim;
+    device const int* sel = comp_topk + ulong(t) * p.n_comp_sel;
+
+    float sink_val = sinks[h];
+    float m_max = sink_val;
+    for (uint s = win_start; s < seq_end; ++s) {
+        device const float* kvp = KV_cache + ulong(s) * p.head_dim;
+        float dot = 0.0f;
+        for (uint d = tid; d < p.head_dim; d += 32u) dot += qp[d] * kvp[d];
+        m_max = max(m_max, simd_sum(dot) * p.scale);
+    }
+    for (uint k = 0; k < p.n_comp_sel; ++k) {
+        int c = sel[k];
+        if (c < 0) continue;
+        device const float* kvp = comp_kv_cache + ulong(uint(c)) * p.head_dim;
+        float dot = 0.0f;
+        for (uint d = tid; d < p.head_dim; d += 32u) dot += qp[d] * kvp[d];
+        m_max = max(m_max, simd_sum(dot) * p.scale);
+    }
+
+    float l_sum = exp(sink_val - m_max);
+    for (uint d = tid; d < p.head_dim; d += 32u) op[d] = 0.0f;
+    for (uint s = win_start; s < seq_end; ++s) {
+        device const float* kvp = KV_cache + ulong(s) * p.head_dim;
+        float dot = 0.0f;
+        for (uint d = tid; d < p.head_dim; d += 32u) dot += qp[d] * kvp[d];
+        float w = exp(simd_sum(dot) * p.scale - m_max);
+        l_sum += w;
+        for (uint d = tid; d < p.head_dim; d += 32u) op[d] += w * kvp[d];
+    }
+    for (uint k = 0; k < p.n_comp_sel; ++k) {
+        int c = sel[k];
+        if (c < 0) continue;
+        device const float* kvp = comp_kv_cache + ulong(uint(c)) * p.head_dim;
+        float dot = 0.0f;
+        for (uint d = tid; d < p.head_dim; d += 32u) dot += qp[d] * kvp[d];
+        float w = exp(simd_sum(dot) * p.scale - m_max);
+        l_sum += w;
+        for (uint d = tid; d < p.head_dim; d += 32u) op[d] += w * kvp[d];
+    }
+    float inv_l = 1.0f / max(l_sum, 1e-20f);
+    for (uint d = tid; d < p.head_dim; d += 32u) op[d] *= inv_l;
+}
+
+kernel void ds_router_sqrtsoftplus_topk_f32(
+    device const float* logits [[buffer(0)]],
+    device const float* bias [[buffer(1)]],
+    device int* out_ids [[buffer(2)]],
+    device float* out_w [[buffer(3)]],
+    constant DsRouterParams& p [[buffer(4)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    if (tgid >= p.T || tid != 0u || p.top_k == 0u || p.E == 0u) return;
+    device const float* row = logits + ulong(tgid) * p.E;
+    uint K = min(p.top_k, 16u);
+    int best_id[16];
+    float best_score[16];
+    float best_val[16];
+    for (uint k = 0; k < K; ++k) {
+        best_id[k] = -1;
+        best_score[k] = -1e30f;
+        best_val[k] = 0.0f;
+    }
+    for (uint e = 0; e < p.E; ++e) {
+        float x = row[e];
+        float sp = (x > 20.0f) ? x : log(1.0f + exp(x));
+        float val = sqrt(max(sp, 0.0f));
+        float sc = val + ((p.has_bias != 0u) ? bias[e] : 0.0f);
+        if (sc > best_score[K - 1u]) {
+            uint pos = K - 1u;
+            while (pos > 0u && sc > best_score[pos - 1u]) {
+                best_score[pos] = best_score[pos - 1u];
+                best_val[pos] = best_val[pos - 1u];
+                best_id[pos] = best_id[pos - 1u];
+                --pos;
+            }
+            best_score[pos] = sc;
+            best_val[pos] = val;
+            best_id[pos] = int(e);
+        }
+    }
+    float denom = 1e-20f;
+    for (uint k = 0; k < K; ++k) denom += best_val[k];
+    float inv = (K > 1u) ? (p.route_scale / denom) : p.route_scale;
+    for (uint k = 0; k < K; ++k) {
+        out_ids[ulong(tgid) * p.top_k + k] = best_id[k];
+        out_w[ulong(tgid) * p.top_k + k] = best_val[k] * inv;
+    }
 }
 
 struct DsStreamCollapseParams {
