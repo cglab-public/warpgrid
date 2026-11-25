@@ -744,7 +744,7 @@ class OpenAIServer {
             auto now = std::chrono::steady_clock::now();
             auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_write).count();
             if (elapsed_ms < kSseKeepaliveIntervalMs) return true;
-            if (is_socket_disconnected(fd)) return false;
+            if (is_socket_write_broken(fd)) return false;
             last_write = now;
             if (stream && !send_all(fd, kSseKeepaliveFrame)) return false;
             return true;

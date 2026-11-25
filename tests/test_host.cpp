@@ -532,14 +532,7 @@ static void test_sse_keepalive_and_disconnect() {
     EXPECT_TRUE(!frame.empty() && frame.front() == ':');
     EXPECT_TRUE(frame.size() >= 2 && frame.substr(frame.size() - 2) == "\n\n");
     EXPECT_TRUE(ink::kSseKeepaliveIntervalMs > 0 && ink::kSseKeepaliveIntervalMs <= 15000);
-    EXPECT_TRUE(ink::is_socket_disconnected(-1));
-
-    int fds[2] = {-1, -1};
-    EXPECT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
-    EXPECT_TRUE(!ink::is_socket_disconnected(fds[0]));
-    ::close(fds[1]);
-    EXPECT_TRUE(ink::is_socket_disconnected(fds[0]));
-    ::close(fds[0]);
+    EXPECT_TRUE(ink::is_socket_write_broken(-1));
 
     int lfd = ::socket(AF_INET, SOCK_STREAM, 0);
     EXPECT_TRUE(lfd >= 0);
@@ -557,13 +550,20 @@ static void test_sse_keepalive_and_disconnect() {
     EXPECT_EQ(::connect(cfd, (sockaddr*)&addr, sizeof(addr)), 0);
     int sfd = ::accept(lfd, nullptr, nullptr);
     EXPECT_TRUE(sfd >= 0);
-    EXPECT_TRUE(!ink::is_socket_disconnected(sfd));
-    ::close(cfd);
+    EXPECT_TRUE(!ink::is_socket_write_broken(sfd));
+
+    EXPECT_EQ(::shutdown(cfd, SHUT_WR), 0);
     struct pollfd wait_pfd{};
     wait_pfd.fd = sfd;
     wait_pfd.events = POLLIN;
     ::poll(&wait_pfd, 1, 200);
-    EXPECT_TRUE(ink::is_socket_disconnected(sfd));
+    EXPECT_TRUE(!ink::is_socket_write_broken(sfd));
+    EXPECT_EQ(::send(sfd, frame.data(), frame.size(), 0), (ssize_t)frame.size());
+    char rbuf[32] = {};
+    EXPECT_EQ(::recv(cfd, rbuf, frame.size(), 0), (ssize_t)frame.size());
+    EXPECT_EQ(std::string_view(rbuf, frame.size()), frame);
+
+    ::close(cfd);
     ::close(sfd);
     ::close(lfd);
 }

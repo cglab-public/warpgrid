@@ -1,9 +1,7 @@
 #pragma once
 #include <poll.h>
-#include <sys/socket.h>
 #include <algorithm>
 #include <cctype>
-#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -153,21 +151,14 @@ inline int clamp_max_tokens(int prompt_len, int requested_max_tokens, int max_se
 inline constexpr const char* kSseKeepaliveFrame = ": keepalive\n\n";
 inline constexpr int kSseKeepaliveIntervalMs = 5000;
 
-inline bool is_socket_disconnected(int fd) {
+inline bool is_socket_write_broken(int fd) {
     if (fd < 0) return true;
     struct pollfd pfd{};
     pfd.fd = fd;
-    pfd.events = POLLIN;
+    pfd.events = POLLOUT;
     int rc = ::poll(&pfd, 1, 0);
     if (rc <= 0) return false;
-    if ((pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) return true;
-    if ((pfd.revents & POLLIN) != 0) {
-        char b = 0;
-        ssize_t n = ::recv(fd, &b, 1, MSG_PEEK | MSG_DONTWAIT);
-        if (n == 0) return true;
-        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) return true;
-    }
-    return false;
+    return (pfd.revents & (POLLERR | POLLNVAL)) != 0;
 }
 
 } // namespace ink
