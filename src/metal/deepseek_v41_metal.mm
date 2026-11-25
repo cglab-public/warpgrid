@@ -69,7 +69,15 @@ struct DsAttnParams {
     uint32_t n_kv_heads;
     uint32_t head_dim;
     uint32_t max_seq;
+    uint32_t compress_ratio;
+    uint32_t local_window;
     float scale;
+};
+
+struct DsStreamCollapseParams {
+    uint32_t T;
+    uint32_t D;
+    uint32_t hc_mult;
 };
 
 struct WeightBuf {
@@ -123,7 +131,11 @@ struct DeepSeekV41Model::Impl {
     id<MTLBuffer> output_norm = nil;
     std::vector<DsLayerWeights> layers;
     std::vector<DsLayerKv> kv_caches;
+    std::vector<std::vector<int32_t>> slot_tok_history;
+    bool has_mhc = false;
 
+    id<MTLBuffer> b_streams_a = nil;
+    id<MTLBuffer> b_streams_b = nil;
     id<MTLBuffer> b_hidden = nil;
     id<MTLBuffer> b_norm = nil;
     id<MTLBuffer> b_q = nil;
@@ -248,7 +260,7 @@ struct DeepSeekV41Model::Impl {
     }
 
     void encode_gemv(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> x, const WeightBuf& w, id<MTLBuffer> y, uint32_t M, size_t w_offset = 0) {
-        if (!w.valid()) return;
+        if (!w.valid()) throw std::runtime_error("Attempted Metal GEMV on missing weight buffer");
         GgufGemvParams p{M, w.rows, w.cols};
         [enc setComputePipelineState:pso(gemv_kernel_for(w.type))];
         [enc setBuffer:x offset:0 atIndex:0];
@@ -318,15 +330,20 @@ void DeepSeekV41Model::load(const std::string& model_path, int max_seq, int max_
     num_kv_blocks = max_slots * max_blocks_per_seq;
     num_snapshots = 0;
 
+    if (!gguf.has_tensor("token_embd.weight")) {
+        throw std::runtime_error("Missing required GGUF tensor: token_embd.weight");
+    }
     impl_->output_norm = impl_->load_f32_1d(gguf, "output_norm.weight", (size_t)cfg.hidden_size, 1.0f);
     if (gguf.has_tensor("output.weight")) {
         impl_->lm_head = impl_->load_weight(gguf, "output.weight");
-    } else if (gguf.has_tensor("token_embd.weight")) {
+    } else {
         impl_->lm_head = impl_->load_weight(gguf, "token_embd.weight");
     }
 
     impl_->layers.resize((size_t)cfg.num_hidden_layers);
     impl_->kv_caches.resize((size_t)cfg.num_hidden_layers);
+    impl_->slot_tok_history.assign((size_t)max_slots, {});
+    impl_->has_mhc = false;
     size_t kv_layer_bytes = (size_t)max_slots * (size_t)max_seq_len * (size_t)cfg.num_key_value_heads * (size_t)cfg.head_dim * sizeof(float);
 
     for (int l = 0; l < cfg.num_hidden_layers; ++l) {
@@ -338,6 +355,9 @@ void DeepSeekV41Model::load(const std::string& model_path, int max_seq, int max_
         lw.wk = impl_->load_weight(gguf, p + "attn_k.weight");
         lw.wv = impl_->load_weight(gguf, p + "attn_v.weight");
         lw.wo = impl_->load_weight(gguf, p + "attn_output.weight");
+        if (!lw.wq.valid() || !lw.wk.valid() || !lw.wv.valid() || !lw.wo.valid()) {
+            throw std::runtime_error("Missing required attention projection weights in layer " + std::to_string(l));
+        }
         lw.router = impl_->load_weight(gguf, p + "ffn_gate_inp.weight");
         if (gguf.has_tensor(p + "exp_probs_b.bias")) {
             lw.router_bias = impl_->load_f32_1d(gguf, p + "exp_probs_b.bias", (size_t)cfg.n_routed_experts, 0.0f);
@@ -351,15 +371,23 @@ void DeepSeekV41Model::load(const std::string& model_path, int max_seq, int max_
         lw.ffn_gate_dense = impl_->load_weight(gguf, p + "ffn_gate.weight");
         lw.ffn_up_dense = impl_->load_weight(gguf, p + "ffn_up.weight");
         lw.ffn_down_dense = impl_->load_weight(gguf, p + "ffn_down.weight");
+        bool has_dense = lw.ffn_gate_dense.valid() && lw.ffn_up_dense.valid() && lw.ffn_down_dense.valid();
+        bool has_moe = lw.router.valid() && lw.ffn_gate_exps.valid() && lw.ffn_up_exps.valid() && lw.ffn_down_exps.valid();
+        bool has_shexp = lw.ffn_gate_shexp.valid() && lw.ffn_up_shexp.valid() && lw.ffn_down_shexp.valid();
+        if (!has_dense && !has_moe && !has_shexp) {
+            throw std::runtime_error("Missing required FFN weights in layer " + std::to_string(l));
+        }
 
         size_t hc_m = (size_t)std::max(1, cfg.hc_mult);
         if (gguf.has_tensor(p + "hc_attn_mat.weight")) {
             lw.hc_attn_mat = impl_->load_f32_1d(gguf, p + "hc_attn_mat.weight", hc_m * hc_m, 0.0f);
             lw.hc_attn_post = impl_->load_f32_1d(gguf, p + "hc_attn_post.weight", hc_m, 1.0f / (float)hc_m);
+            impl_->has_mhc = true;
         }
         if (gguf.has_tensor(p + "hc_ffn_mat.weight")) {
             lw.hc_ffn_mat = impl_->load_f32_1d(gguf, p + "hc_ffn_mat.weight", hc_m * hc_m, 0.0f);
             lw.hc_ffn_post = impl_->load_f32_1d(gguf, p + "hc_ffn_post.weight", hc_m, 1.0f / (float)hc_m);
+            impl_->has_mhc = true;
         }
 
         impl_->kv_caches[(size_t)l].k_cache = impl_->alloc_buf(kv_layer_bytes);
@@ -368,9 +396,15 @@ void DeepSeekV41Model::load(const std::string& model_path, int max_seq, int max_
 
     size_t Tmax = (size_t)max_batch_tokens;
     size_t D = (size_t)cfg.hidden_size;
+    size_t Mhc = (size_t)std::max(1, cfg.hc_mult);
     size_t Qdim = (size_t)cfg.num_attention_heads * (size_t)cfg.head_dim;
     size_t KVdim = (size_t)cfg.num_key_value_heads * (size_t)cfg.head_dim;
     size_t Inter = (size_t)std::max(cfg.ffn_intermediate_size, cfg.expert_intermediate_size);
+
+    if (impl_->has_mhc) {
+        impl_->b_streams_a = impl_->alloc_buf(Tmax * Mhc * D * sizeof(float));
+        impl_->b_streams_b = impl_->alloc_buf(Tmax * Mhc * D * sizeof(float));
+    }
 
     impl_->b_hidden = impl_->alloc_buf(Tmax * D * sizeof(float));
     impl_->b_norm = impl_->alloc_buf(Tmax * D * sizeof(float));
@@ -397,6 +431,9 @@ void DeepSeekV41Model::load(const std::string& model_path, int max_seq, int max_
 
 void DeepSeekV41Model::reset_cache(int slot_id) {
     if (slot_id < 0 || slot_id >= max_slots) return;
+    if ((size_t)slot_id < impl_->slot_tok_history.size()) {
+        impl_->slot_tok_history[(size_t)slot_id].clear();
+    }
     size_t slot_bytes = (size_t)max_seq_len * (size_t)cfg.num_key_value_heads * (size_t)cfg.head_dim * sizeof(float);
     for (auto& kv : impl_->kv_caches) {
         memset(static_cast<uint8_t*>(kv.k_cache.contents) + (size_t)slot_id * slot_bytes, 0, slot_bytes);
@@ -409,19 +446,34 @@ void DeepSeekV41Model::forward_logits(const int32_t* h_tokens, int T, int start_
     if (slot_id < 0 || slot_id >= max_slots) throw std::runtime_error("Invalid slot_id");
     if (start_pos < 0 || start_pos + T > max_seq_len) throw std::runtime_error("Sequence length exceeds max_seq_len");
 
+    auto& hist = impl_->slot_tok_history[(size_t)slot_id];
+    if ((int)hist.size() < start_pos + T) hist.resize((size_t)(start_pos + T), 0);
+    for (int t = 0; t < T; ++t) hist[(size_t)(start_pos + t)] = h_tokens[t];
+
     size_t D = (size_t)cfg.hidden_size;
     float* hidden_ptr = static_cast<float*>(impl_->b_hidden.contents);
-    if (gguf.has_tensor("token_embd.weight")) {
-        const auto& emb_ti = gguf.tensor("token_embd.weight");
-        size_t row_stride = ggml_row_nbytes(emb_ti.type, emb_ti.dims[0]);
-        const uint8_t* base = gguf.tensor_data("token_embd.weight");
-        uint64_t nrows = emb_ti.num_rows();
-        for (int t = 0; t < T; ++t) {
-            uint64_t tid = (uint64_t)std::clamp(h_tokens[t], 0, (int32_t)(nrows > 0 ? nrows - 1 : 0));
-            dequant_row_fp32(emb_ti.type, base + tid * row_stride, hidden_ptr + (size_t)t * D, D);
-        }
-    } else {
-        memset(hidden_ptr, 0, (size_t)T * D * sizeof(float));
+    const auto& emb_ti = gguf.tensor("token_embd.weight");
+    size_t row_stride = ggml_row_nbytes(emb_ti.type, emb_ti.dims[0]);
+    const uint8_t* base = gguf.tensor_data("token_embd.weight");
+    uint64_t nrows = emb_ti.num_rows();
+    for (int t = 0; t < T; ++t) {
+        uint64_t tid = (uint64_t)std::clamp(h_tokens[t], 0, (int32_t)(nrows > 0 ? nrows - 1 : 0));
+        dequant_row_fp32(emb_ti.type, base + tid * row_stride, hidden_ptr + (size_t)t * D, D);
+    }
+
+    if (impl_->has_mhc) {
+        id<MTLCommandBuffer> cb0 = [impl_->queue commandBuffer];
+        id<MTLComputeCommandEncoder> e0 = [cb0 computeCommandEncoder];
+        DsStreamCollapseParams scp{(uint32_t)T, (uint32_t)D, (uint32_t)std::max(1, cfg.hc_mult)};
+        [e0 setComputePipelineState:impl_->pso("ds_mhc_expand_f32")];
+        [e0 setBuffer:impl_->b_hidden offset:0 atIndex:0];
+        [e0 setBuffer:impl_->b_streams_a offset:0 atIndex:1];
+        [e0 setBytes:&scp length:sizeof(scp) atIndex:2];
+        [e0 dispatchThreads:MTLSizeMake((uint32_t)D, (uint32_t)T, 1)
+            threadsPerThreadgroup:MTLSizeMake(std::min<uint32_t>(64u, (uint32_t)D), 1, 1)];
+        [e0 endEncoding];
+        [cb0 commit];
+        [cb0 waitUntilCompleted];
     }
 
     size_t slot_kv_elems = (size_t)max_seq_len * (size_t)cfg.num_key_value_heads * (size_t)cfg.head_dim;
@@ -440,8 +492,9 @@ void DeepSeekV41Model::forward_logits(const int32_t* h_tokens, int T, int start_
                 uint64_t erows = eti.num_rows();
                 std::vector<float> erow(D, 0.0f);
                 for (int t = 0; t < T; ++t) {
-                    int ng_len = std::min(3, t + 1);
-                    uint64_t ridx = engram_hash_row(h_tokens + (t - ng_len + 1), ng_len, (uint64_t)(l + 1), erows);
+                    int abs_pos = start_pos + t;
+                    int ng_len = std::min(3, abs_pos + 1);
+                    uint64_t ridx = engram_hash_row(hist.data() + (abs_pos - ng_len + 1), ng_len, (uint64_t)(l + 1), erows);
                     engram.lookup_row(ename, ridx, erow.data(), D);
                     for (size_t d = 0; d < D; ++d) hidden_ptr[(size_t)t * D + d] += erow[d];
                 }
@@ -483,6 +536,8 @@ void DeepSeekV41Model::forward_logits(const int32_t* h_tokens, int T, int start_
             (uint32_t)T, (uint32_t)start_pos,
             (uint32_t)cfg.num_attention_heads, (uint32_t)cfg.num_key_value_heads,
             (uint32_t)cfg.head_dim, (uint32_t)max_seq_len,
+            (uint32_t)std::max(1, cfg.compress_ratio_for(l)),
+            (uint32_t)std::max(1, cfg.index_topk),
             1.0f / std::sqrt((float)cfg.head_dim)
         };
         [enc setComputePipelineState:impl_->pso("ds_csa_hca_attn_f32")];
@@ -495,7 +550,27 @@ void DeepSeekV41Model::forward_logits(const int32_t* h_tokens, int T, int start_
             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 
         impl_->encode_gemv(enc, impl_->b_attn_out, lw.wo, impl_->b_sub_out, (uint32_t)T);
-        impl_->encode_add(enc, impl_->b_hidden, impl_->b_sub_out, (uint32_t)((size_t)T * D));
+        if (lw.hc_attn_mat != nil && impl_->has_mhc) {
+            DsMhcParams mp{(uint32_t)T, (uint32_t)D, (uint32_t)std::max(1, cfg.hc_mult), (uint32_t)cfg.hc_sinkhorn_iters, cfg.hc_eps};
+            [enc setComputePipelineState:impl_->pso("ds_mhc_sinkhorn_mix")];
+            [enc setBuffer:impl_->b_streams_a offset:0 atIndex:0];
+            [enc setBuffer:impl_->b_sub_out offset:0 atIndex:1];
+            [enc setBuffer:lw.hc_attn_mat offset:0 atIndex:2];
+            [enc setBuffer:lw.hc_attn_post offset:0 atIndex:3];
+            [enc setBuffer:impl_->b_streams_b offset:0 atIndex:4];
+            [enc setBytes:&mp length:sizeof(mp) atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake(((uint32_t)D + 63u) / 64u, (uint32_t)T, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            std::swap(impl_->b_streams_a, impl_->b_streams_b);
+            DsStreamCollapseParams scp{(uint32_t)T, (uint32_t)D, (uint32_t)std::max(1, cfg.hc_mult)};
+            [enc setComputePipelineState:impl_->pso("ds_mhc_collapse_f32")];
+            [enc setBuffer:impl_->b_streams_a offset:0 atIndex:0];
+            [enc setBuffer:impl_->b_hidden offset:0 atIndex:1];
+            [enc setBytes:&scp length:sizeof(scp) atIndex:2];
+            [enc dispatchThreads:MTLSizeMake((uint32_t)D, (uint32_t)T, 1)
+                threadsPerThreadgroup:MTLSizeMake(std::min<uint32_t>(64u, (uint32_t)D), 1, 1)];
+        } else {
+            impl_->encode_add(enc, impl_->b_hidden, impl_->b_sub_out, (uint32_t)((size_t)T * D));
+        }
 
         impl_->encode_rmsnorm(enc, impl_->b_hidden, lw.ffn_norm, impl_->b_norm, (uint32_t)T, (uint32_t)D, cfg.rms_norm_eps);
 
@@ -504,14 +579,17 @@ void DeepSeekV41Model::forward_logits(const int32_t* h_tokens, int T, int start_
             impl_->encode_gemv(enc, impl_->b_norm, lw.ffn_up_dense, impl_->b_ffn_up, (uint32_t)T);
             impl_->encode_swiglu(enc, impl_->b_ffn_gate, impl_->b_ffn_up, impl_->b_ffn_act, (uint32_t)((size_t)T * lw.ffn_gate_dense.rows));
             impl_->encode_gemv(enc, impl_->b_ffn_act, lw.ffn_down_dense, impl_->b_sub_out, (uint32_t)T);
-            impl_->encode_add(enc, impl_->b_hidden, impl_->b_sub_out, (uint32_t)((size_t)T * D));
         } else {
+            uint32_t sub_n = (uint32_t)((size_t)T * D);
+            [enc setComputePipelineState:impl_->pso("ds_zero_f32")];
+            [enc setBuffer:impl_->b_sub_out offset:0 atIndex:0];
+            [enc setBytes:&sub_n length:sizeof(sub_n) atIndex:1];
+            [enc dispatchThreadgroups:MTLSizeMake((sub_n + 255u) / 256u, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             if (lw.ffn_gate_shexp.valid() && lw.ffn_up_shexp.valid() && lw.ffn_down_shexp.valid()) {
                 impl_->encode_gemv(enc, impl_->b_norm, lw.ffn_gate_shexp, impl_->b_ffn_gate, (uint32_t)T);
                 impl_->encode_gemv(enc, impl_->b_norm, lw.ffn_up_shexp, impl_->b_ffn_up, (uint32_t)T);
                 impl_->encode_swiglu(enc, impl_->b_ffn_gate, impl_->b_ffn_up, impl_->b_ffn_act, (uint32_t)((size_t)T * lw.ffn_gate_shexp.rows));
                 impl_->encode_gemv(enc, impl_->b_ffn_act, lw.ffn_down_shexp, impl_->b_sub_out, (uint32_t)T);
-                impl_->encode_add(enc, impl_->b_hidden, impl_->b_sub_out, (uint32_t)((size_t)T * D));
             }
             if (lw.router.valid() && lw.ffn_gate_exps.valid() && lw.ffn_up_exps.valid() && lw.ffn_down_exps.valid()) {
                 impl_->encode_gemv(enc, impl_->b_norm, lw.router, impl_->b_router_logits, (uint32_t)T);
@@ -572,7 +650,7 @@ void DeepSeekV41Model::forward_logits(const int32_t* h_tokens, int T, int start_
                             (uint32_t)D, (uint32_t)cfg.num_experts_per_tok, (uint32_t)r, (uint32_t)D
                         };
                         [enc setComputePipelineState:impl_->pso("ds_moe_scaled_add_f32")];
-                        [enc setBuffer:impl_->b_hidden offset:x_off atIndex:0];
+                        [enc setBuffer:impl_->b_sub_out offset:x_off atIndex:0];
                         [enc setBuffer:impl_->b_ffn_tmp offset:0 atIndex:1];
                         [enc setBuffer:impl_->b_topk_w offset:(size_t)t * (size_t)cfg.num_experts_per_tok * sizeof(float) atIndex:2];
                         [enc setBytes:&sap length:sizeof(sap) atIndex:3];
@@ -580,6 +658,28 @@ void DeepSeekV41Model::forward_logits(const int32_t* h_tokens, int T, int start_
                     }
                 }
             }
+        }
+
+        if (lw.hc_ffn_mat != nil && impl_->has_mhc) {
+            DsMhcParams mp{(uint32_t)T, (uint32_t)D, (uint32_t)std::max(1, cfg.hc_mult), (uint32_t)cfg.hc_sinkhorn_iters, cfg.hc_eps};
+            [enc setComputePipelineState:impl_->pso("ds_mhc_sinkhorn_mix")];
+            [enc setBuffer:impl_->b_streams_a offset:0 atIndex:0];
+            [enc setBuffer:impl_->b_sub_out offset:0 atIndex:1];
+            [enc setBuffer:lw.hc_ffn_mat offset:0 atIndex:2];
+            [enc setBuffer:lw.hc_ffn_post offset:0 atIndex:3];
+            [enc setBuffer:impl_->b_streams_b offset:0 atIndex:4];
+            [enc setBytes:&mp length:sizeof(mp) atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake(((uint32_t)D + 63u) / 64u, (uint32_t)T, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            std::swap(impl_->b_streams_a, impl_->b_streams_b);
+            DsStreamCollapseParams scp{(uint32_t)T, (uint32_t)D, (uint32_t)std::max(1, cfg.hc_mult)};
+            [enc setComputePipelineState:impl_->pso("ds_mhc_collapse_f32")];
+            [enc setBuffer:impl_->b_streams_a offset:0 atIndex:0];
+            [enc setBuffer:impl_->b_hidden offset:0 atIndex:1];
+            [enc setBytes:&scp length:sizeof(scp) atIndex:2];
+            [enc dispatchThreads:MTLSizeMake((uint32_t)D, (uint32_t)T, 1)
+                threadsPerThreadgroup:MTLSizeMake(std::min<uint32_t>(64u, (uint32_t)D), 1, 1)];
+        } else {
+            impl_->encode_add(enc, impl_->b_hidden, impl_->b_sub_out, (uint32_t)((size_t)T * D));
         }
 
         [enc endEncoding];

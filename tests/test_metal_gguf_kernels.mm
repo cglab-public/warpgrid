@@ -103,6 +103,8 @@ struct DsAttnParams {
     uint32_t n_kv_heads;
     uint32_t head_dim;
     uint32_t max_seq;
+    uint32_t compress_ratio;
+    uint32_t local_window;
     float scale;
 };
 
@@ -684,7 +686,7 @@ static void test_ds_csa_hca_causal_attention() {
     id<MTLBuffer> bv = [g_ctx.dev newBufferWithBytes:v_cache.data() length:v_cache.size() * sizeof(float) options:MTLResourceStorageModeShared];
     id<MTLBuffer> bo = [g_ctx.dev newBufferWithLength:q.size() * sizeof(float) options:MTLResourceStorageModeShared];
     float scale = 1.0f / std::sqrt((float)HD);
-    DsAttnParams params{T, 0, H, HKV, HD, MAX_SEQ, scale};
+    DsAttnParams params{T, 0, H, HKV, HD, MAX_SEQ, 1, 2048, scale};
 
     id<MTLCommandBuffer> cb = [g_ctx.q commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];

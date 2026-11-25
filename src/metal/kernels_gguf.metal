@@ -573,6 +573,8 @@ struct DsAttnParams {
     uint n_kv_heads;
     uint head_dim;
     uint max_seq;
+    uint compress_ratio;
+    uint local_window;
     float scale;
 };
 
@@ -589,11 +591,29 @@ kernel void ds_csa_hca_attn_f32(
     if (h >= p.n_heads || t >= p.T) return;
     uint kvh = h / max(1u, p.n_heads / p.n_kv_heads);
     uint seq_end = p.start_pos + t + 1u;
+    uint cr = max(1u, p.compress_ratio);
+    uint local_start = (cr > 1u && seq_end > p.local_window) ? (seq_end - p.local_window) : 0u;
+    uint comp_blocks = (cr > 1u) ? (local_start / cr) : 0u;
+    uint local_begin = (cr > 1u) ? (comp_blocks * cr) : 0u;
     device const float* qp = Q + (ulong(t) * p.n_heads + h) * p.head_dim;
     device float* op = O + (ulong(t) * p.n_heads + h) * p.head_dim;
 
     float m_max = -1e30f;
-    for (uint s = 0; s < seq_end; ++s) {
+    for (uint blk = 0; blk < comp_blocks; ++blk) {
+        uint s0 = blk * cr;
+        float dot = 0.0f;
+        float inv_cr = 1.0f / float(cr);
+        for (uint d = tid; d < p.head_dim; d += 32u) {
+            float k_avg = 0.0f;
+            for (uint j = 0; j < cr; ++j) {
+                k_avg += K_cache[(ulong(s0 + j) * p.n_kv_heads + kvh) * p.head_dim + d];
+            }
+            dot += qp[d] * (k_avg * inv_cr);
+        }
+        float sc = simd_sum(dot) * p.scale;
+        m_max = max(m_max, sc);
+    }
+    for (uint s = local_begin; s < seq_end; ++s) {
         device const float* kp = K_cache + (ulong(s) * p.n_kv_heads + kvh) * p.head_dim;
         float dot = 0.0f;
         for (uint d = tid; d < p.head_dim; d += 32u) dot += qp[d] * kp[d];
@@ -603,7 +623,28 @@ kernel void ds_csa_hca_attn_f32(
 
     float l_sum = 0.0f;
     for (uint d = tid; d < p.head_dim; d += 32u) op[d] = 0.0f;
-    for (uint s = 0; s < seq_end; ++s) {
+    for (uint blk = 0; blk < comp_blocks; ++blk) {
+        uint s0 = blk * cr;
+        float dot = 0.0f;
+        float inv_cr = 1.0f / float(cr);
+        for (uint d = tid; d < p.head_dim; d += 32u) {
+            float k_avg = 0.0f;
+            for (uint j = 0; j < cr; ++j) {
+                k_avg += K_cache[(ulong(s0 + j) * p.n_kv_heads + kvh) * p.head_dim + d];
+            }
+            dot += qp[d] * (k_avg * inv_cr);
+        }
+        float w = exp(simd_sum(dot) * p.scale - m_max);
+        l_sum += w;
+        for (uint d = tid; d < p.head_dim; d += 32u) {
+            float v_avg = 0.0f;
+            for (uint j = 0; j < cr; ++j) {
+                v_avg += V_cache[(ulong(s0 + j) * p.n_kv_heads + kvh) * p.head_dim + d];
+            }
+            op[d] += w * (v_avg * inv_cr);
+        }
+    }
+    for (uint s = local_begin; s < seq_end; ++s) {
         device const float* kp = K_cache + (ulong(s) * p.n_kv_heads + kvh) * p.head_dim;
         device const float* vp = V_cache + (ulong(s) * p.n_kv_heads + kvh) * p.head_dim;
         float dot = 0.0f;
@@ -614,6 +655,41 @@ kernel void ds_csa_hca_attn_f32(
     }
     float inv_l = 1.0f / max(l_sum, 1e-20f);
     for (uint d = tid; d < p.head_dim; d += 32u) op[d] *= inv_l;
+}
+
+struct DsStreamCollapseParams {
+    uint T;
+    uint D;
+    uint hc_mult;
+};
+
+kernel void ds_mhc_expand_f32(
+    device const float* hidden [[buffer(0)]],
+    device float* streams [[buffer(1)]],
+    constant DsStreamCollapseParams& p [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    uint d = gid.x;
+    uint t = gid.y;
+    if (d >= p.D || t >= p.T) return;
+    float v = hidden[ulong(t) * p.D + d];
+    for (uint r = 0; r < p.hc_mult; ++r) {
+        streams[(ulong(t) * p.hc_mult + r) * p.D + d] = v;
+    }
+}
+
+kernel void ds_mhc_collapse_f32(
+    device const float* streams [[buffer(0)]],
+    device float* hidden [[buffer(1)]],
+    constant DsStreamCollapseParams& p [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    uint d = gid.x;
+    uint t = gid.y;
+    if (d >= p.D || t >= p.T) return;
+    float acc = 0.0f;
+    for (uint r = 0; r < p.hc_mult; ++r) {
+        acc += streams[(ulong(t) * p.hc_mult + r) * p.D + d];
+    }
+    hidden[ulong(t) * p.D + d] = acc / float(max(1u, p.hc_mult));
 }
 
 kernel void ds_swiglu_f32(
@@ -635,6 +711,14 @@ kernel void ds_add_f32(
     uint gid [[thread_position_in_grid]]) {
     if (gid >= n) return;
     dst[gid] += src[gid];
+}
+
+kernel void ds_zero_f32(
+    device float* dst [[buffer(0)]],
+    constant uint& n [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= n) return;
+    dst[gid] = 0.0f;
 }
 
 struct DsScaledAddParams {
