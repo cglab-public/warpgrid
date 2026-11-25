@@ -81,11 +81,11 @@ ARCH ?= sm_121a
 CXXFLAGS := -O3 -std=c++20 -Xcompiler -pthread -Xcompiler -Wall -Xcompiler -Wno-unused-function -lineinfo
 LDFLAGS := -lcublas -lcublasLt -lpthread
 
-SRCS := src/main.cpp src/model.cu src/kernels.cu src/dspark.cu
+SRCS := src/main.cpp src/model.cu src/kernels.cu src/dspark.cu src/cuda/kernels_gguf.cu src/cuda/deepseek_v41_cuda.cu
 
 all: $(TARGET)
 
-$(TARGET): $(SRCS) $(COMMON_HDRS) src/kernels.cuh src/dspark.hpp
+$(TARGET): $(SRCS) $(COMMON_HDRS) src/kernels.cuh src/dspark.hpp src/cuda/kernels_gguf.cuh src/cuda/deepseek_v41_cuda.hpp src/gguf_iq_tables.hpp
 	$(NVCC) $(CXXFLAGS) -gencode arch=compute_121a,code=sm_121a $(SRCS) -o $(TARGET) $(LDFLAGS)
 
 tests/test_host: tests/test_host.cpp src/auth.hpp src/cli.hpp src/config.hpp src/deepseek_config.hpp src/engram.hpp src/gguf.hpp src/json.hpp src/model_backend.hpp src/prefix_cache.hpp src/safetensors.hpp src/telemetry.hpp src/tokenizer.hpp
@@ -94,12 +94,16 @@ tests/test_host: tests/test_host.cpp src/auth.hpp src/cli.hpp src/config.hpp src
 tests/test_dflash2_cuda: tests/test_dflash2_cuda.cu src/dspark.cu src/kernels.cu src/dspark.hpp src/kernels.cuh $(COMMON_HDRS)
 	$(NVCC) $(CXXFLAGS) -gencode arch=compute_121a,code=sm_121a tests/test_dflash2_cuda.cu src/dspark.cu src/kernels.cu -o tests/test_dflash2_cuda $(LDFLAGS)
 
-test: tests/test_host tests/test_dflash2_cuda
+tests/test_cuda_gguf_kernels: tests/test_cuda_gguf_kernels.cu src/cuda/kernels_gguf.cu src/cuda/kernels_gguf.cuh src/gguf.hpp src/gguf_iq_tables.hpp
+	$(NVCC) $(CXXFLAGS) -gencode arch=compute_121a,code=sm_121a tests/test_cuda_gguf_kernels.cu src/cuda/kernels_gguf.cu -o tests/test_cuda_gguf_kernels $(LDFLAGS)
+
+test: tests/test_host tests/test_dflash2_cuda tests/test_cuda_gguf_kernels
 	./tests/test_host
 	./tests/test_dflash2_cuda
+	./tests/test_cuda_gguf_kernels
 
 clean:
-	rm -f $(TARGET) tests/test_host tests/test_dflash2_cuda
+	rm -f $(TARGET) tests/test_host tests/test_dflash2_cuda tests/test_cuda_gguf_kernels
 endif
 
 .PHONY: all test clean

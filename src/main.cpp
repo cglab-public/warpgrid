@@ -3,6 +3,8 @@
 #include "model_backend.hpp"
 #ifdef WARPGRID_METAL
 #include "metal/deepseek_v41_metal.hpp"
+#else
+#include "cuda/deepseek_v41_cuda.hpp"
 #endif
 #include "server.hpp"
 #include "tokenizer.hpp"
@@ -39,15 +41,11 @@ int main(int argc, char** argv) {
 
         if (fmt == ink::ModelFormat::GgufDeepSeekV41) {
             if (!opts.served_name_explicit) opts.served_name = "DeepSeek-V4.1-Flash";
-#ifdef WARPGRID_METAL
             auto ds = std::make_unique<ink::DeepSeekV41Model>();
             ds->engram_path = opts.engram_path;
             ds->load(opts.model_dir, opts.max_seq, opts.max_chunk, opts.max_slots);
             ds->load_tokenizer(tok);
             model = std::move(ds);
-#else
-            throw std::runtime_error("GGUF DeepSeek-V4.1-Flash backend is currently enabled on Apple Metal only (CUDA port in Story 6)");
-#endif
         } else {
             tok.load(opts.model_dir + "/tokenizer.json");
             model = std::make_unique<ink::Inkling2Model>();
