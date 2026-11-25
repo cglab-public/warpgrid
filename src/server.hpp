@@ -1,7 +1,7 @@
 #pragma once
 #include "auth.hpp"
 #include "json.hpp"
-#include "model.hpp"
+#include "model_backend.hpp"
 #include "prefix_cache.hpp"
 #include "telemetry.hpp"
 #include "tokenizer.hpp"
@@ -26,7 +26,7 @@
 namespace ink {
 
 class OpenAIServer {
-    Inkling2Model& model_;
+    ModelBackend& model_;
     Tokenizer& tok_;
     std::string served_name_;
     int port_;
@@ -650,7 +650,7 @@ class OpenAIServer {
         st->t_start = std::chrono::steady_clock::now();
         st->start_unix_ns = now_unix_ns();
 
-        std::string prompt = Tokenizer::render_chat(req);
+        std::string prompt = tok_.render_chat_for_format(req);
         st->prompt_ids = tok_.encode(prompt);
         int prompt_len = (int)st->prompt_ids.size();
 
@@ -675,7 +675,11 @@ class OpenAIServer {
         }
         sched_cv_.notify_one();
 
-        ParseMode mode = ParseMode::None;
+        ParseMode mode = (tok_.chat_format == ChatFormat::DeepSeek &&
+                          prompt.size() >= 8 &&
+                          prompt.rfind("<think>\n") == prompt.size() - 8)
+            ? ParseMode::Thinking
+            : ParseMode::None;
         std::string full_reasoning, full_content, tool_buf;
         std::vector<json::Value> tool_calls;
         int completion_tokens = 0;
@@ -735,7 +739,22 @@ class OpenAIServer {
                 finish_reason = tool_calls.empty() ? "stop" : "tool_calls";
                 break;
             }
-            if (tid == tok_.message_model_id) {
+            if (tok_.chat_format == ChatFormat::DeepSeek) {
+                if (tok_.think_start_id >= 0 && tid == tok_.think_start_id) {
+                    mode = ParseMode::Thinking;
+                } else if (tok_.think_end_id >= 0 && tid == tok_.think_end_id) {
+                    mode = ParseMode::Content;
+                } else {
+                    std::string piece = tok_.decode_token(tid, true);
+                    if (mode == ParseMode::Thinking) {
+                        full_reasoning += piece;
+                        client_ok = emit_sse_delta("reasoning", piece);
+                    } else {
+                        full_content += piece;
+                        client_ok = emit_sse_delta("content", piece);
+                    }
+                }
+            } else if (tid == tok_.message_model_id) {
                 finish_tool_buf();
                 mode = ParseMode::Header;
             } else if (tid == tok_.thinking_id) {
@@ -903,7 +922,7 @@ class OpenAIServer {
     }
 
 public:
-    OpenAIServer(Inkling2Model& m, Tokenizer& t, std::string name, int port,
+    OpenAIServer(ModelBackend& m, Tokenizer& t, std::string name, int port,
                  std::string otlp_endpoint = "", std::string api_key = "")
         : model_(m),
           tok_(t),

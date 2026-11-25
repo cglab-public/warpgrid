@@ -4,6 +4,7 @@
 #else
 #include "config.hpp"
 #include "dspark.hpp"
+#include "model_backend.hpp"
 #include "safetensors.hpp"
 #include <cublas_v2.h>
 #include <cublasLt.h>
@@ -108,7 +109,7 @@ struct VisitCache {
     __nv_bfloat16* mlp_conv_prefill_snap = nullptr;  // [max_slots, 3, 2304]
 };
 
-class Inkling2Model {
+class Inkling2Model : public ModelBackend {
 public:
     InklingConfig cfg;
     SafetensorsFile st;
@@ -147,14 +148,6 @@ public:
 
     // Extra GPU allocations owned by model
     std::vector<void*> extra_allocs;
-
-    // Runtime workspace
-    int max_slots = 8;
-    int max_seq_len = 32768;
-    int max_batch_tokens = 2048;
-    int max_blocks_per_seq = 0;
-    int num_kv_blocks = 0;
-    int num_snapshots = 0;
 
     int32_t* d_tokens = nullptr;
     int32_t* d_pos = nullptr;                // [1] device pos for CUDA graph decode
@@ -220,15 +213,7 @@ public:
     DSparkDrafter dspark;
     __nv_bfloat16* d_aux_states = nullptr; // [4, max_T, D]
     __nv_bfloat16* d_last_aux = nullptr;   // [4, 1, D] (last committed token's aux features)
-    int draft_k = 0;                       // 0 = disabled, 1..7 = DSpark speculative tokens
-    std::string draft_vocab_file;          // optional frequency-ranked pruned draft vocab binary
-    std::string dflash2_dir;
-    int moe_group_thresh = 64;             // T >= thresh uses grouped cuBLAS prefill MoE (T < 64 stays pure GPU!)
     bool save_conv_snaps = false;
-
-    bool use_bf16_gemv = true;
-    bool use_cuda_graph = true;
-    bool profile_stages = false;
 
     cudaGraph_t decode_graph = nullptr;
     cudaGraphExec_t decode_graph_exec = nullptr;
@@ -252,52 +237,54 @@ public:
     double prof_moe_mxfp8_ms = 0.0;
     double prof_lm_head_ms = 0.0;
     int prof_steps = 0;
-    void reset_profile();
-    void print_profile() const;
+    void reset_profile() override;
+    void print_profile() const override;
 
     Inkling2Model() = default;
-    ~Inkling2Model();
+    ~Inkling2Model() override;
 
-    void load(const std::string& model_dir, int max_seq = 32768, int max_chunk = 512, int n_slots = 8);
-    void reset_cache(int slot_id = 0);
-    void save_prefill_snapshot(int slot_id);
-    void restore_prefill_snapshot(int slot_id);
-    void save_boundary_snapshot(int slot_id, int snap_id);
-    void restore_boundary_snapshot(int slot_id, int snap_id);
-    void set_slot_block_table(int slot_id, const int32_t* blocks, int num_blocks);
+    std::string arch_name() const override { return "inkling2"; }
+
+    void load(const std::string& model_dir, int max_seq = 32768, int max_chunk = 512, int n_slots = 8) override;
+    void reset_cache(int slot_id = 0) override;
+    void save_prefill_snapshot(int slot_id) override;
+    void restore_prefill_snapshot(int slot_id) override;
+    void save_boundary_snapshot(int slot_id, int snap_id) override;
+    void restore_boundary_snapshot(int slot_id, int snap_id) override;
+    void set_slot_block_table(int slot_id, const int32_t* blocks, int num_blocks) override;
 
     // Forward a chunk of tokens for `slot_id` starting at start_pos, returns greedy next token
-    int32_t forward_and_greedy(const int32_t* h_tokens, int T, int start_pos, int slot_id = 0);
+    int32_t forward_and_greedy(const int32_t* h_tokens, int T, int start_pos, int slot_id = 0) override;
 
     // Parallel batched decode: B active sequences (1 token each), returns greedy next token for all B
     void forward_batch_decode_greedy(
         const int32_t* h_tokens, const int32_t* h_slots, const int32_t* h_positions,
-        int B, int32_t* h_out_tokens);
+        int B, int32_t* h_out_tokens) override;
 
     // Speculative verify (slot 0): forward T (<=8) tokens, return greedy next token for ALL T positions
-    void forward_verify_greedy(const int32_t* h_tokens, int T, int start_pos, int32_t* h_out_tokens);
+    void forward_verify_greedy(const int32_t* h_tokens, int T, int start_pos, int32_t* h_out_tokens) override;
 
     // Parallel batched speculative verify: B slots (2..4) x L tokens (2..5), total T = B*L <= 16
     void forward_batch_verify_greedy(
         const int32_t* h_tokens, const int32_t* h_slots, const int32_t* h_positions,
-        int B, int L, int32_t* h_out_tokens);
+        int B, int L, int32_t* h_out_tokens) override;
 
     // Roll back conv states for `slot_id` to post-step `accepted_len - 1` (1 <= accepted_len <= L)
-    void rollback_conv_states(int accepted_len, int slot_id = 0);
+    void rollback_conv_states(int accepted_len, int slot_id = 0) override;
 
     // Save aux states of token index `aux_tok_offset + count - 1` into d_last_aux[slot_id]
     // and store context KV for `[aux_tok_offset .. aux_tok_offset + count - 1]` into dspark slot_id
-    void commit_dspark_context(int count, int start_pos, int slot_id = 0, int aux_tok_offset = 0);
+    void commit_dspark_context(int count, int start_pos, int slot_id = 0, int aux_tok_offset = 0) override;
 
-    int max_dspark_slots() const { return dspark.max_dspark_slots; }
+    int max_dspark_slots() const override { return dspark.max_dspark_slots; }
 
-    void draft_tokens(int32_t anchor_tok, int anchor_pos, int num_draft, int32_t* h_out_drafts, int slot_id = 0) {
+    void draft_tokens(int32_t anchor_tok, int anchor_pos, int num_draft, int32_t* h_out_drafts, int slot_id = 0) override {
         dspark.draft_tokens(anchor_tok, anchor_pos,
                             d_last_aux + (int64_t)slot_id * 4 * cfg.hidden_size,
                             cfg.hidden_size, num_draft, h_out_drafts, slot_id);
     }
 
-    void forward_logits(const int32_t* h_tokens, int T, int start_pos, std::vector<float>& h_logits, int slot_id = 0);
+    void forward_logits(const int32_t* h_tokens, int T, int start_pos, std::vector<float>& h_logits, int slot_id = 0) override;
 
 private:
     void* alloc_gpu(size_t bytes);

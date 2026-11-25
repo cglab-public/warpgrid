@@ -1,6 +1,8 @@
 #include "../src/auth.hpp"
+#include "../src/cli.hpp"
 #include "../src/config.hpp"
 #include "../src/json.hpp"
+#include "../src/model_backend.hpp"
 #include "../src/prefix_cache.hpp"
 #include "../src/safetensors.hpp"
 #include "../src/telemetry.hpp"
@@ -11,8 +13,10 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -516,6 +520,153 @@ static void test_radix_prefix_cache_cross_slot_and_eviction() {
     EXPECT_EQ(cache.free_block_count(), 8);
 }
 
+static void test_cli_parse_engram_and_format_detection() {
+    std::vector<std::string> args = {
+        "warpgrid", "--model", "/tmp/ds.gguf", "--engram", "/tmp/engram.gguf",
+        "--max-seq-len", "32768", "--max-slots", "1", "--port", "9001"
+    };
+    std::vector<char*> argv;
+    for (auto& s : args) argv.push_back(s.data());
+
+    ink::CliOptions opts;
+    std::string err;
+    EXPECT_TRUE(ink::parse_cli_args((int)argv.size(), argv.data(), opts, err));
+    EXPECT_EQ(opts.model_dir, std::string("/tmp/ds.gguf"));
+    EXPECT_EQ(opts.engram_path, std::string("/tmp/engram.gguf"));
+    EXPECT_EQ(opts.max_seq, 32768);
+    EXPECT_EQ(opts.max_slots, 1);
+    EXPECT_EQ(opts.port, 9001);
+    EXPECT_TRUE(!opts.served_name_explicit);
+
+    std::vector<std::string> ple_args = {"warpgrid", "--model", "/tmp/m.gguf", "--ple", "/tmp/ple.gguf", "--served-model-name", "CustomDS"};
+    std::vector<char*> ple_argv;
+    for (auto& s : ple_args) ple_argv.push_back(s.data());
+    ink::CliOptions ple_opts;
+    EXPECT_TRUE(ink::parse_cli_args((int)ple_argv.size(), ple_argv.data(), ple_opts, err));
+    EXPECT_EQ(ple_opts.engram_path, std::string("/tmp/ple.gguf"));
+    EXPECT_EQ(ple_opts.served_name, std::string("CustomDS"));
+    EXPECT_TRUE(ple_opts.served_name_explicit);
+
+    std::vector<std::string> bad_args = {"warpgrid", "--model", "/tmp/m.gguf", "--api-key", ""};
+    std::vector<char*> bad_argv;
+    for (auto& s : bad_args) bad_argv.push_back(s.data());
+    ink::CliOptions bad_opts;
+    EXPECT_TRUE(!ink::parse_cli_args((int)bad_argv.size(), bad_argv.data(), bad_opts, err));
+    EXPECT_TRUE(!err.empty());
+
+    std::string pid_str = std::to_string((int)getpid());
+    std::string tmp_gguf = "/tmp/warpgrid_test_fmt_" + pid_str + ".gguf";
+    {
+        std::ofstream f(tmp_gguf, std::ios::binary);
+        f.write("GGUF\x03\x00\x00\x00", 8);
+    }
+    EXPECT_EQ(ink::detect_model_format(tmp_gguf), ink::ModelFormat::GgufDeepSeekV41);
+    ::unlink(tmp_gguf.c_str());
+
+    std::string tmp_dir = "/tmp/warpgrid_test_ink_" + pid_str;
+    std::string cfg_path = tmp_dir + "/config.json";
+    EXPECT_EQ(::system(("mkdir -p " + tmp_dir).c_str()), 0);
+    {
+        std::ofstream f(cfg_path);
+        f << "{}";
+    }
+    EXPECT_EQ(ink::detect_model_format(tmp_dir), ink::ModelFormat::InklingSafetensors);
+    ::unlink(cfg_path.c_str());
+    ::rmdir(tmp_dir.c_str());
+
+    EXPECT_EQ(ink::detect_model_format("/tmp/definitely_nonexistent_warpgrid_path_99999"), ink::ModelFormat::Unknown);
+}
+
+struct MockModelBackend final : public ink::ModelBackend {
+    int32_t next_token = 42;
+    int last_reset_slot = -1;
+
+    std::string arch_name() const override { return "mock_deepseek41"; }
+    void load(const std::string& path, int ms, int mc, int ns) override {
+        max_seq_len = ms;
+        max_batch_tokens = mc;
+        max_slots = ns;
+        (void)path;
+    }
+    void reset_cache(int slot_id = 0) override { last_reset_slot = slot_id; }
+    int32_t forward_and_greedy(const int32_t*, int, int, int) override { return next_token; }
+    void forward_batch_decode_greedy(const int32_t*, const int32_t*, const int32_t*, int B, int32_t* out) override {
+        for (int i = 0; i < B; ++i) out[i] = next_token + i;
+    }
+    void forward_logits(const int32_t*, int, int, std::vector<float>& logits, int) override {
+        logits.assign(64, 0.0f);
+        logits[(size_t)next_token] = 10.0f;
+    }
+};
+
+static void test_model_backend_polymorphic_interface() {
+    std::unique_ptr<ink::ModelBackend> backend = std::make_unique<MockModelBackend>();
+    backend->engram_path = "/tmp/engram.gguf";
+    backend->load("/tmp/model.gguf", 32768, 1024, 2);
+    EXPECT_EQ(backend->arch_name(), std::string("mock_deepseek41"));
+    EXPECT_EQ(backend->max_seq_len, 32768);
+    EXPECT_EQ(backend->max_batch_tokens, 1024);
+    EXPECT_EQ(backend->max_slots, 2);
+    EXPECT_EQ(backend->max_dspark_slots(), 0);
+    EXPECT_EQ(backend->engram_path, std::string("/tmp/engram.gguf"));
+
+    int32_t tok = 1;
+    EXPECT_EQ(backend->forward_and_greedy(&tok, 1, 0, 0), 42);
+    int32_t in_toks[2] = {1, 2}, in_slots[2] = {0, 1}, in_pos[2] = {0, 0}, out_toks[2] = {0, 0};
+    backend->forward_batch_decode_greedy(in_toks, in_slots, in_pos, 2, out_toks);
+    EXPECT_EQ(out_toks[0], 42);
+    EXPECT_EQ(out_toks[1], 43);
+
+    std::vector<float> logits;
+    backend->forward_logits(&tok, 1, 0, logits, 0);
+    EXPECT_EQ(logits.size(), (size_t)64);
+    EXPECT_TRUE(logits[42] > 9.0f);
+}
+
+static void test_tokenizer_gguf_vectors_and_deepseek_chat_template() {
+    std::vector<std::string> tokens = {
+        "<｜begin▁of▁sentence｜>",
+        "<｜end▁of▁sentence｜>",
+        "<｜User｜>",
+        "<｜Assistant｜>",
+        "<think>",
+        "</think>",
+        "h", "i", "hi", "!"
+    };
+    std::vector<int32_t> token_types = {3, 3, 3, 3, 3, 3, 1, 1, 1, 1};
+    std::vector<std::string> merges = {"h i"};
+
+    ink::Tokenizer tok;
+    tok.load_from_vectors(tokens, merges, token_types, 0, 1, ink::ChatFormat::DeepSeek);
+
+    EXPECT_EQ(tok.bos_id, 0);
+    EXPECT_EQ(tok.eos_id, 1);
+    EXPECT_EQ(tok.think_start_id, 4);
+    EXPECT_EQ(tok.think_end_id, 5);
+    EXPECT_EQ(tok.chat_format, ink::ChatFormat::DeepSeek);
+
+    auto ids = tok.encode("<｜begin▁of▁sentence｜><｜User｜>hi!<｜Assistant｜><think>");
+    EXPECT_EQ(ids.size(), (size_t)6);
+    EXPECT_EQ(ids[0], 0);
+    EXPECT_EQ(ids[1], 2);
+    EXPECT_EQ(ids[2], 8);
+    EXPECT_EQ(ids[3], 9);
+    EXPECT_EQ(ids[4], 3);
+    EXPECT_EQ(ids[5], 4);
+    EXPECT_EQ(tok.decode(ids, true), std::string("hi!"));
+
+    auto req = json::parse(R"({
+        "messages": [
+            {"role": "system", "content": "Be concise."},
+            {"role": "user", "content": "Hello"}
+        ]
+    })");
+    std::string rendered = tok.render_chat_for_format(req);
+    EXPECT_TRUE(rendered.find("<｜begin▁of▁sentence｜>") != std::string::npos);
+    EXPECT_TRUE(rendered.find("Be concise.") != std::string::npos);
+    EXPECT_TRUE(rendered.find("<｜User｜>Hello<｜Assistant｜>") != std::string::npos);
+}
+
 int main() {
     run_test("test_json_roundtrip_and_escaping", test_json_roundtrip_and_escaping);
     run_test("test_config_inkling2_parse", test_config_inkling2_parse);
@@ -526,6 +677,9 @@ int main() {
     run_test("test_telemetry_otlp_payload_and_loopback", test_telemetry_otlp_payload_and_loopback);
     run_test("test_auth_request_line_and_api_key", test_auth_request_line_and_api_key);
     run_test("test_radix_prefix_cache_cross_slot_and_eviction", test_radix_prefix_cache_cross_slot_and_eviction);
+    run_test("test_cli_parse_engram_and_format_detection", test_cli_parse_engram_and_format_detection);
+    run_test("test_model_backend_polymorphic_interface", test_model_backend_polymorphic_interface);
+    run_test("test_tokenizer_gguf_vectors_and_deepseek_chat_template", test_tokenizer_gguf_vectors_and_deepseek_chat_template);
     printf("Host tests: %d passed, %d failed\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;
 }

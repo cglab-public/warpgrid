@@ -1,6 +1,6 @@
 UNAME_S := $(shell uname -s)
 TARGET := warpgrid
-COMMON_HDRS := src/auth.hpp src/config.hpp src/json.hpp src/prefix_cache.hpp src/safetensors.hpp src/telemetry.hpp src/model.hpp src/tokenizer.hpp src/server.hpp
+COMMON_HDRS := src/auth.hpp src/cli.hpp src/config.hpp src/json.hpp src/model_backend.hpp src/prefix_cache.hpp src/safetensors.hpp src/telemetry.hpp src/model.hpp src/tokenizer.hpp src/server.hpp
 
 ifeq ($(UNAME_S),Darwin)
 CXX := clang++
@@ -41,7 +41,7 @@ src/metal/model_metal.o: src/metal/model_metal.mm src/metal/model_metal.hpp $(ME
 $(TARGET): src/main.o src/metal/model_metal.o
 	$(CXX) src/main.o src/metal/model_metal.o -o $(TARGET) $(LDFLAGS)
 
-tests/test_host: tests/test_host.cpp src/auth.hpp src/config.hpp src/json.hpp src/prefix_cache.hpp src/safetensors.hpp src/telemetry.hpp src/tokenizer.hpp
+tests/test_host: tests/test_host.cpp src/auth.hpp src/cli.hpp src/config.hpp src/json.hpp src/model_backend.hpp src/prefix_cache.hpp src/safetensors.hpp src/telemetry.hpp src/tokenizer.hpp
 	$(CXX) $(CXXFLAGS) tests/test_host.cpp -o tests/test_host
 
 tests/test_metal_kernels: tests/test_metal_kernels.mm $(METAL_EMBED_HDR)
@@ -67,7 +67,7 @@ all: $(TARGET)
 $(TARGET): $(SRCS) $(COMMON_HDRS) src/kernels.cuh src/dspark.hpp
 	$(NVCC) $(CXXFLAGS) -gencode arch=compute_121a,code=sm_121a $(SRCS) -o $(TARGET) $(LDFLAGS)
 
-tests/test_host: tests/test_host.cpp src/auth.hpp src/config.hpp src/json.hpp src/prefix_cache.hpp src/safetensors.hpp src/telemetry.hpp src/tokenizer.hpp
+tests/test_host: tests/test_host.cpp src/auth.hpp src/cli.hpp src/config.hpp src/json.hpp src/model_backend.hpp src/prefix_cache.hpp src/safetensors.hpp src/telemetry.hpp src/tokenizer.hpp
 	g++ -O3 -std=c++20 -pthread -Wall -DWARPGRID_METAL tests/test_host.cpp -o tests/test_host
 
 tests/test_dflash2_cuda: tests/test_dflash2_cuda.cu src/dspark.cu src/kernels.cu src/dspark.hpp src/kernels.cuh $(COMMON_HDRS)

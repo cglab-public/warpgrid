@@ -10,6 +10,11 @@
 
 namespace ink {
 
+enum class ChatFormat {
+    Inkling,
+    DeepSeek
+};
+
 // Native C++ Byte-Level BPE Tokenizer + Inkling Chat Template + Reasoning/Tool Parser
 class Tokenizer {
     std::unordered_map<std::string, int32_t> vocab_;
@@ -162,12 +167,70 @@ class Tokenizer {
     }
 
 public:
+    ChatFormat chat_format = ChatFormat::Inkling;
+    int32_t bos_id = -1;
     int32_t eos_id = 200006;         // <|content_model_end_sampling|>
     int32_t end_message_id = 200008; // <|end_message|>
     int32_t thinking_id = 200007;    // <|content_thinking|>
     int32_t content_text_id = 200004;// <|content_text|>
     int32_t invoke_tool_id = 200012; // <|content_invoke_tool_json|>
     int32_t message_model_id = 200001;// <|message_model|>
+    int32_t think_start_id = -1;
+    int32_t think_end_id = -1;
+
+    void load_from_vectors(
+        const std::vector<std::string>& tokens,
+        const std::vector<std::string>& merges,
+        const std::vector<int32_t>& token_types,
+        int32_t bos,
+        int32_t eos,
+        ChatFormat fmt = ChatFormat::DeepSeek) {
+        init_byte_table();
+        vocab_.clear();
+        merges_.clear();
+        special_tokens_.clear();
+        special_id_to_str_.clear();
+        id_to_token_.assign(tokens.size(), "");
+
+        chat_format = fmt;
+        bos_id = bos;
+        eos_id = eos;
+        end_message_id = -1;
+        thinking_id = -1;
+        content_text_id = -1;
+        invoke_tool_id = -1;
+        message_model_id = -1;
+        think_start_id = -1;
+        think_end_id = -1;
+
+        vocab_.reserve(tokens.size() * 2);
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            int32_t id = (int32_t)i;
+            const std::string& t = tokens[i];
+            id_to_token_[i] = t;
+            int32_t ttype = (i < token_types.size()) ? token_types[i] : 1;
+            bool is_special = (ttype == 3 || ttype == 4);
+            if (is_special) {
+                special_tokens_.push_back({t, id});
+                special_id_to_str_[id] = t;
+            } else {
+                vocab_[t] = id;
+            }
+            if (t == "<think>") think_start_id = id;
+            else if (t == "</think>") think_end_id = id;
+            else if (t == "<｜begin▁of▁sentence｜>" && bos_id < 0) bos_id = id;
+            else if (t == "<｜end▁of▁sentence｜>" && eos_id < 0) eos_id = id;
+        }
+        std::sort(special_tokens_.begin(), special_tokens_.end(),
+                  [](const auto& a, const auto& b) { return a.first.size() > b.first.size(); });
+
+        merges_.reserve(merges.size() * 2);
+        for (size_t i = 0; i < merges.size(); ++i) {
+            merges_[merges[i]] = (int32_t)i;
+        }
+        fprintf(stderr, "[warpgrid] Loaded GGUF tokenizer: %zu vocab, %zu merges, %zu special tokens\n",
+                vocab_.size(), merges_.size(), special_tokens_.size());
+    }
 
     void load(const std::string& path) {
         init_byte_table();
@@ -348,6 +411,60 @@ public:
         }
         if (!effort_emitted) emit_effort();
         return out;
+    }
+
+    static std::string render_deepseek_chat(const json::Value& req) {
+        std::string out = "<｜begin▁of▁sentence｜>";
+        bool enable_thinking = true;
+        if (req.contains("chat_template_kwargs") && req["chat_template_kwargs"].is_object()) {
+            const auto& ctk = req["chat_template_kwargs"];
+            if (ctk.contains("enable_thinking")) {
+                enable_thinking = ctk["enable_thinking"].as_bool(true);
+            }
+        }
+        if (req.contains("reasoning_effort") && req["reasoning_effort"].is_string() &&
+            req["reasoning_effort"].as_str() == "none") {
+            enable_thinking = false;
+        }
+
+        const auto& msgs = req["messages"];
+        for (const auto& m : msgs.arr) {
+            std::string role = m["role"].as_str();
+            std::string content;
+            if (m.contains("content") && m["content"].is_string()) {
+                content = m["content"].as_str();
+            } else if (m.contains("content") && m["content"].is_array()) {
+                for (const auto& part : m["content"].arr) {
+                    if (part.is_string()) content += part.as_str();
+                    else if (part.contains("text") && part["text"].is_string()) {
+                        content += part["text"].as_str();
+                    }
+                }
+            }
+            if (role == "system") {
+                out += content;
+            } else if (role == "user") {
+                out += "<｜User｜>" + content;
+            } else if (role == "assistant") {
+                out += "<｜Assistant｜>" + content + "<｜end▁of▁sentence｜>";
+            } else if (role == "tool") {
+                out += "<｜User｜>" + content;
+            }
+        }
+        out += "<｜Assistant｜>";
+        if (enable_thinking) {
+            out += "<think>\n";
+        } else {
+            out += "<think>\n\n</think>\n";
+        }
+        return out;
+    }
+
+    std::string render_chat_for_format(const json::Value& req) const {
+        if (chat_format == ChatFormat::DeepSeek) {
+            return render_deepseek_chat(req);
+        }
+        return render_chat(req);
     }
 };
 
