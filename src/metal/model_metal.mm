@@ -2387,6 +2387,7 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
         impl_->gpu_low_mem = (impl_->gpu_ws_gib <= 24.0);
         impl_->queue = [impl_->device newCommandQueue];
 
+        bool allow_low_mem_snap = false;
         {
             int n_global_visits = 0;
             int n_local_visits = 0;
@@ -2411,19 +2412,21 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
                 ? std::min(phys_ram_gib - 1.2, std::max(impl_->gpu_ws_gib * 1.04, phys_ram_gib - 1.9))
                 : (impl_->gpu_ws_gib * 0.90);
             double avail_kv_gib = std::max(0.5, mem_budget_gib - weight_gib);
-            auto est_kv_gib = [&](int slots, int seq) -> double {
-                int snaps = (impl_->gpu_low_mem && slots == 1) ? 0
-                    : ((slots >= 4 && impl_->gpu_ws_gib >= 48.0) ? std::max(slots, 12) : slots);
+            auto est_kv_gib_with_snaps = [&](int slots, int seq, int snaps) -> double {
                 double g_bytes = (double)n_global_visits * slots * seq * (2.0 * kv_dim_est + 2.0 * cfg.num_key_value_heads * 4.0);
                 double l_bytes = (double)n_local_visits * (slots + snaps) * (cfg.sliding_window_size + max_batch_tokens) * 2.0 * kv_dim_est * 2.0;
                 double d_bytes = 0.0;
                 if (!dflash2_dir.empty()) {
-                    // DFlash 2 allocates 5 layers with fixed SWA=2048 (+ block + 16 = 2072) regardless of max_seq_len
                     d_bytes = 5.0 * (double)std::min(2, slots) * 2072.0 * 2.0 * kv_dim_est * 2.0;
                 } else if (draft_k > 0) {
                     d_bytes = (double)std::min(2, slots) * (seq + 24) * 2.0 * kv_dim_est * 2.0;
                 }
                 return (g_bytes + l_bytes + d_bytes) / (1024.0 * 1024.0 * 1024.0);
+            };
+            auto est_kv_gib = [&](int slots, int seq) -> double {
+                int snaps = (impl_->gpu_low_mem && slots == 1) ? 0
+                    : ((slots >= 4 && impl_->gpu_ws_gib >= 48.0) ? std::max(slots, 12) : slots);
+                return est_kv_gib_with_snaps(slots, seq, snaps);
             };
             int orig_slots = max_slots;
             int orig_seq = max_seq_len;
@@ -2433,13 +2436,20 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
             while (max_seq_len > 2048 && est_kv_gib(max_slots, max_seq_len) > avail_kv_gib) {
                 max_seq_len = std::max(2048, max_seq_len / 2);
             }
+            if (impl_->gpu_low_mem && max_slots == 1 &&
+                est_kv_gib_with_snaps(max_slots, max_seq_len, 1) <= avail_kv_gib) {
+                allow_low_mem_snap = true;
+            }
             fprintf(stderr, "[warpgrid-metal] GPU shape: %s (ws=%.2f GiB, max_tg=%u, apple9=%d, low_mem=%d)\n",
                     impl_->device.name.UTF8String, impl_->gpu_ws_gib, impl_->gpu_max_tg,
                     impl_->gpu_is_apple9 ? 1 : 0, impl_->gpu_low_mem ? 1 : 0);
             if (max_slots != orig_slots || max_seq_len != orig_seq) {
+                double final_est = allow_low_mem_snap
+                    ? est_kv_gib_with_snaps(max_slots, max_seq_len, 1)
+                    : est_kv_gib(max_slots, max_seq_len);
                 fprintf(stderr, "[warpgrid-metal] Memory budget clamped slots %d->%d, max_seq %d->%d (est KV %.2f GiB <= %.2f GiB)\n",
                         orig_slots, max_slots, orig_seq, max_seq_len,
-                        est_kv_gib(max_slots, max_seq_len), avail_kv_gib);
+                        final_est, avail_kv_gib);
             }
         }
 
@@ -2711,7 +2721,7 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
 
         max_blocks_per_seq = (max_seq_len + 63) / 64;
         num_kv_blocks = max_slots * max_blocks_per_seq;
-        num_snapshots = (impl_->gpu_low_mem && max_slots == 1) ? 0
+        num_snapshots = (impl_->gpu_low_mem && max_slots == 1) ? (allow_low_mem_snap ? 1 : 0)
             : ((max_slots >= 4 && impl_->device.recommendedMaxWorkingSetSize >= (48ULL << 30))
                 ? std::max(max_slots, 12) : max_slots);
         impl_->max_blocks_per_seq = max_blocks_per_seq;
