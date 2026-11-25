@@ -733,6 +733,7 @@ kernel void attn_prep_kv_fp8_kernel(
     device float* k_scale_fp8  [[buffer(4)]],
     device float* v_scale_fp8  [[buffer(5)]],
     constant AttnPrepKVParams& p [[buffer(6)]],
+    device const int* block_table [[buffer(7)]],
     uint2 tgid                 [[threadgroup_position_in_grid]],
     uint lane                  [[thread_index_in_simdgroup]])
 {
@@ -741,7 +742,7 @@ kernel void attn_prep_kv_fp8_kernel(
     if (h >= p.n_kv_heads || t >= p.T) return;
 
     uint pos = p.start_pos + t;
-    uint slot = (p.is_local != 0u) ? (pos % p.cache_cap) : pos;
+    long phys = (p.is_local != 0u) ? long(pos % p.cache_cap) : (long(block_table[pos >> 6]) * 64L + long(pos & 63u));
 
     device const bfloat* kin = K_in + (long(t) * long(p.n_kv_heads) + long(h)) * long(p.head_dim);
     device const bfloat* vin = V_in + (long(t) * long(p.n_kv_heads) + long(h)) * long(p.head_dim);
@@ -773,7 +774,7 @@ kernel void attn_prep_kv_fp8_kernel(
     float inv_ks = 1.0f / ks;
     float inv_vs = 1.0f / vs;
 
-    long sc_idx = long(slot) * long(p.n_kv_heads) + long(h);
+    long sc_idx = phys * long(p.n_kv_heads) + long(h);
     if (lane == 0u) {
         k_scale_fp8[sc_idx] = ks;
         v_scale_fp8[sc_idx] = vs;
@@ -903,6 +904,7 @@ kernel void attention_fp8_kernel(
     device const bfloat* sinks      [[buffer(7)]],
     device bfloat* out              [[buffer(8)]],
     constant AttnParams& p          [[buffer(9)]],
+    device const int* block_table   [[buffer(10)]],
     uint2 tgid                      [[threadgroup_position_in_grid]],
     uint lane                       [[thread_index_in_simdgroup]])
 {
@@ -929,8 +931,8 @@ kernel void attention_fp8_kernel(
     float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
     for (uint kp = k_start; kp < k_end; ++kp) {
-        uint slot = (p.is_local != 0u) ? (kp % p.cache_cap) : kp;
-        long sc_idx = long(slot) * long(p.n_kv_heads) + long(kv_h);
+        long phys = (p.is_local != 0u) ? long(kp % p.cache_cap) : (long(block_table[kp >> 6]) * 64L + long(kp & 63u));
+        long sc_idx = phys * long(p.n_kv_heads) + long(kv_h);
         float ks = k_scale_fp8[sc_idx];
         float vs = v_scale_fp8[sc_idx];
         device const uchar* k_ptr = k_cache_fp8 + sc_idx * long(p.head_dim);
@@ -989,6 +991,7 @@ kernel void attention_fp8_splitk_kernel(
     device float2* part_ml          [[buffer(6)]],
     device float* part_acc          [[buffer(7)]],
     constant AttnSplitKParams& p    [[buffer(8)]],
+    device const int* block_table   [[buffer(9)]],
     uint3 tgid                      [[threadgroup_position_in_grid]],
     uint lane                       [[thread_index_in_simdgroup]])
 {
@@ -1025,7 +1028,8 @@ kernel void attention_fp8_splitk_kernel(
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
 
     for (uint kp = ks_pos; kp < ke_pos; ++kp) {
-        long sc_idx = long(kp) * long(p.n_kv_heads) + long(kv_h);
+        long phys = long(block_table[kp >> 6]) * 64L + long(kp & 63u);
+        long sc_idx = phys * long(p.n_kv_heads) + long(kv_h);
         float ks = k_scale_fp8[sc_idx];
         float vs = v_scale_fp8[sc_idx];
         device const uchar* k_ptr = k_cache_fp8 + sc_idx * long(p.head_dim);
@@ -1115,6 +1119,7 @@ kernel void attention_fp8_prefill4_kernel(
     device const bfloat* sinks      [[buffer(7)]],
     device bfloat* out              [[buffer(8)]],
     constant AttnParams& p          [[buffer(9)]],
+    device const int* block_table   [[buffer(10)]],
     uint2 tgid                      [[threadgroup_position_in_grid]],
     uint tid                        [[thread_index_in_threadgroup]],
     uint sg_id                      [[simdgroup_index_in_threadgroup]])
@@ -1166,7 +1171,9 @@ kernel void attention_fp8_prefill4_kernel(
     for (uint kp0 = 0u; kp0 < k_end_max; kp0 += 16u) {
         uint n_kv = min(16u, k_end_max - kp0);
         if (r_load < n_kv) {
-            long sc_idx = long(kp0 + r_load) * long(p.n_kv_heads) + long(kv_h);
+            uint kp = kp0 + r_load;
+            long phys = long(block_table[kp >> 6]) * 64L + long(kp & 63u);
+            long sc_idx = phys * long(p.n_kv_heads) + long(kv_h);
             float ks = k_scale_fp8[sc_idx] * inv_sqrt_d;
             float vs = v_scale_fp8[sc_idx];
             device const uchar* k_ptr = k_cache_fp8 + sc_idx * long(p.head_dim) + long(c_load);

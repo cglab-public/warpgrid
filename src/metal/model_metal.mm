@@ -288,6 +288,10 @@ struct Inkling2Model::Impl {
     std::vector<MetalLayerWeights> layers;
     std::vector<std::pair<int, int>> visits;
     std::vector<MetalVisitCache> caches;
+    int max_blocks_per_seq = 0;
+    int num_kv_blocks = 0;
+    int num_snapshots = 0;
+    id<MTLBuffer> b_block_tables = nil;
 
     id<MTLBuffer> b_dummy = nil;
     id<MTLBuffer> b_tokens = nil;
@@ -920,7 +924,6 @@ struct Inkling2Model::Impl {
                 int s_id = batched_seq ? batch_slots[b] : slot_id;
                 int pos_b = batched_seq ? batch_positions[b] : start_pos;
                 size_t kv_slot_off = (size_t)s_id * (size_t)vc.cap * kv_dim * (vc.is_local ? 2 : 1);
-                size_t sc_slot_off = (size_t)s_id * (size_t)vc.cap * (size_t)cfg.num_key_value_heads * sizeof(float);
                 size_t tok_q_off = (size_t)b * q_dim * 2;
                 size_t tok_r_off = (size_t)b * r_dim * 2;
                 size_t tok_kv_off = (size_t)b * kv_dim * 2;
@@ -955,14 +958,16 @@ struct Inkling2Model::Impl {
                     [enc dispatchThreadgroups:MTLSizeMake((uint32_t)cfg.num_key_value_heads, (uint32_t)t_seq, 1)
                         threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
                 } else {
+                    size_t bt_off = (size_t)s_id * (size_t)max_blocks_per_seq * sizeof(int32_t);
                     [enc setComputePipelineState:pso_attn_prep_kv_fp8];
                     [enc setBuffer:b_K_conv offset:tok_kv_off atIndex:0];
                     [enc setBuffer:b_V_conv offset:tok_kv_off atIndex:1];
-                    [enc setBuffer:vc.k_cache_fp8 offset:kv_slot_off atIndex:2];
-                    [enc setBuffer:vc.v_cache_fp8 offset:kv_slot_off atIndex:3];
-                    [enc setBuffer:vc.k_scale_fp8 offset:sc_slot_off atIndex:4];
-                    [enc setBuffer:vc.v_scale_fp8 offset:sc_slot_off atIndex:5];
+                    [enc setBuffer:vc.k_cache_fp8 offset:0 atIndex:2];
+                    [enc setBuffer:vc.v_cache_fp8 offset:0 atIndex:3];
+                    [enc setBuffer:vc.k_scale_fp8 offset:0 atIndex:4];
+                    [enc setBuffer:vc.v_scale_fp8 offset:0 atIndex:5];
                     [enc setBytes:&kvp length:sizeof(kvp) atIndex:6];
+                    [enc setBuffer:b_block_tables offset:bt_off atIndex:7];
                     [enc dispatchThreadgroups:MTLSizeMake((uint32_t)cfg.num_key_value_heads, (uint32_t)t_seq, 1)
                         threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
                 }
@@ -983,7 +988,6 @@ struct Inkling2Model::Impl {
                 int s_id = batched_seq ? batch_slots[b] : slot_id;
                 int pos_b = batched_seq ? batch_positions[b] : start_pos;
                 size_t kv_slot_off = (size_t)s_id * (size_t)vc.cap * kv_dim * (vc.is_local ? 2 : 1);
-                size_t sc_slot_off = (size_t)s_id * (size_t)vc.cap * (size_t)cfg.num_key_value_heads * sizeof(float);
                 size_t tok_q_off = (size_t)b * q_dim * 2;
                 size_t tok_rel_off = (size_t)b * (size_t)cfg.num_attention_heads * (size_t)cfg.rel_extent * 2;
                 size_t tok_sink_off = (size_t)b * (size_t)cfg.num_attention_heads * 2;
@@ -1006,6 +1010,7 @@ struct Inkling2Model::Impl {
                     [enc dispatchThreadgroups:MTLSizeMake((uint32_t)cfg.num_attention_heads, (uint32_t)t_seq, 1)
                         threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
                 } else if (t_seq <= 8 && (pos_b + t_seq) >= 512) {
+                    size_t bt_off = (size_t)s_id * (size_t)max_blocks_per_seq * sizeof(int32_t);
                     uint32_t k_end = (uint32_t)(pos_b + t_seq);
                     uint32_t num_splits = std::min(64u, std::max(4u, k_end / 512u));
                     AttnSplitKParams skp{
@@ -1016,14 +1021,15 @@ struct Inkling2Model::Impl {
                     };
                     [enc setComputePipelineState:pso_attention_fp8_splitk];
                     [enc setBuffer:b_Q offset:tok_q_off atIndex:0];
-                    [enc setBuffer:vc.k_cache_fp8 offset:kv_slot_off atIndex:1];
-                    [enc setBuffer:vc.v_cache_fp8 offset:kv_slot_off atIndex:2];
-                    [enc setBuffer:vc.k_scale_fp8 offset:sc_slot_off atIndex:3];
-                    [enc setBuffer:vc.v_scale_fp8 offset:sc_slot_off atIndex:4];
+                    [enc setBuffer:vc.k_cache_fp8 offset:0 atIndex:1];
+                    [enc setBuffer:vc.v_cache_fp8 offset:0 atIndex:2];
+                    [enc setBuffer:vc.k_scale_fp8 offset:0 atIndex:3];
+                    [enc setBuffer:vc.v_scale_fp8 offset:0 atIndex:4];
                     [enc setBuffer:b_rel_logits offset:tok_rel_off atIndex:5];
                     [enc setBuffer:b_attn_split_ml offset:0 atIndex:6];
                     [enc setBuffer:b_attn_split_acc offset:0 atIndex:7];
                     [enc setBytes:&skp length:sizeof(skp) atIndex:8];
+                    [enc setBuffer:b_block_tables offset:bt_off atIndex:9];
                     [enc dispatchThreadgroups:MTLSizeMake((uint32_t)cfg.num_attention_heads, (uint32_t)t_seq, num_splits)
                         threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 
@@ -1037,6 +1043,7 @@ struct Inkling2Model::Impl {
                     [enc dispatchThreadgroups:MTLSizeMake((uint32_t)cfg.num_attention_heads, (uint32_t)t_seq, 1)
                         threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
                 } else if (t_seq >= 16) {
+                    size_t bt_off = (size_t)s_id * (size_t)max_blocks_per_seq * sizeof(int32_t);
                     AttnParams ap{
                         (uint32_t)pos_b, (uint32_t)t_seq, (uint32_t)vc.cap, 0u,
                         (uint32_t)cfg.sliding_window_size, (uint32_t)cfg.num_attention_heads,
@@ -1044,18 +1051,20 @@ struct Inkling2Model::Impl {
                     };
                     [enc setComputePipelineState:pso_attention_fp8_prefill4];
                     [enc setBuffer:b_Q offset:tok_q_off atIndex:0];
-                    [enc setBuffer:vc.k_cache_fp8 offset:kv_slot_off atIndex:1];
-                    [enc setBuffer:vc.v_cache_fp8 offset:kv_slot_off atIndex:2];
-                    [enc setBuffer:vc.k_scale_fp8 offset:sc_slot_off atIndex:3];
-                    [enc setBuffer:vc.v_scale_fp8 offset:sc_slot_off atIndex:4];
+                    [enc setBuffer:vc.k_cache_fp8 offset:0 atIndex:1];
+                    [enc setBuffer:vc.v_cache_fp8 offset:0 atIndex:2];
+                    [enc setBuffer:vc.k_scale_fp8 offset:0 atIndex:3];
+                    [enc setBuffer:vc.v_scale_fp8 offset:0 atIndex:4];
                     [enc setBuffer:b_rel_logits offset:tok_rel_off atIndex:5];
                     [enc setBuffer:b_gate offset:tok_q_off atIndex:6];
                     [enc setBuffer:b_sinks offset:tok_sink_off atIndex:7];
                     [enc setBuffer:b_attn_raw offset:tok_q_off atIndex:8];
                     [enc setBytes:&ap length:sizeof(ap) atIndex:9];
+                    [enc setBuffer:b_block_tables offset:bt_off atIndex:10];
                     [enc dispatchThreadgroups:MTLSizeMake((uint32_t)cfg.num_attention_heads, (uint32_t)((t_seq + 15) / 16), 1)
                         threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
                 } else {
+                    size_t bt_off = (size_t)s_id * (size_t)max_blocks_per_seq * sizeof(int32_t);
                     AttnParams ap{
                         (uint32_t)pos_b, (uint32_t)t_seq, (uint32_t)vc.cap, 0u,
                         (uint32_t)cfg.sliding_window_size, (uint32_t)cfg.num_attention_heads,
@@ -1063,15 +1072,16 @@ struct Inkling2Model::Impl {
                     };
                     [enc setComputePipelineState:pso_attention_fp8];
                     [enc setBuffer:b_Q offset:tok_q_off atIndex:0];
-                    [enc setBuffer:vc.k_cache_fp8 offset:kv_slot_off atIndex:1];
-                    [enc setBuffer:vc.v_cache_fp8 offset:kv_slot_off atIndex:2];
-                    [enc setBuffer:vc.k_scale_fp8 offset:sc_slot_off atIndex:3];
-                    [enc setBuffer:vc.v_scale_fp8 offset:sc_slot_off atIndex:4];
+                    [enc setBuffer:vc.k_cache_fp8 offset:0 atIndex:1];
+                    [enc setBuffer:vc.v_cache_fp8 offset:0 atIndex:2];
+                    [enc setBuffer:vc.k_scale_fp8 offset:0 atIndex:3];
+                    [enc setBuffer:vc.v_scale_fp8 offset:0 atIndex:4];
                     [enc setBuffer:b_rel_logits offset:tok_rel_off atIndex:5];
                     [enc setBuffer:b_gate offset:tok_q_off atIndex:6];
                     [enc setBuffer:b_sinks offset:tok_sink_off atIndex:7];
                     [enc setBuffer:b_attn_raw offset:tok_q_off atIndex:8];
                     [enc setBytes:&ap length:sizeof(ap) atIndex:9];
+                    [enc setBuffer:b_block_tables offset:bt_off atIndex:10];
                     [enc dispatchThreadgroups:MTLSizeMake((uint32_t)cfg.num_attention_heads, (uint32_t)t_seq, 1)
                         threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
                 }
@@ -2664,21 +2674,39 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
             for (int i = cfg.loop_core_start; i < cfg.loop_core_end; ++i) impl_->visits.push_back({i, p});
         for (int i = cfg.loop_core_end; i < cfg.num_hidden_layers; ++i) impl_->visits.push_back({i, 0});
 
+        max_blocks_per_seq = (max_seq_len + 63) / 64;
+        num_kv_blocks = max_slots * max_blocks_per_seq;
+        num_snapshots = (max_slots >= 4 && impl_->device.recommendedMaxWorkingSetSize >= (48ULL << 30))
+            ? std::max(max_slots, 12) : max_slots;
+        impl_->max_blocks_per_seq = max_blocks_per_seq;
+        impl_->num_kv_blocks = num_kv_blocks;
+        impl_->num_snapshots = num_snapshots;
+        impl_->b_block_tables = impl_->alloc_shared((size_t)max_slots * (size_t)max_blocks_per_seq * sizeof(int32_t));
+        {
+            int32_t* bt = static_cast<int32_t*>(impl_->b_block_tables.contents);
+            for (int s = 0; s < max_slots; ++s) {
+                for (int b = 0; b < max_blocks_per_seq; ++b) {
+                    bt[(size_t)s * max_blocks_per_seq + b] = s * max_blocks_per_seq + b;
+                }
+            }
+        }
+
         impl_->caches.resize(impl_->visits.size());
         size_t kv_bytes_total = 0;
         for (size_t v = 0; v < impl_->visits.size(); ++v) {
             int lid = impl_->visits[v].first;
             auto& vc = impl_->caches[v];
             vc.is_local = cfg.is_local(lid);
-            vc.cap = vc.is_local ? (cfg.sliding_window_size + max_batch_tokens) : max_seq_len;
+            vc.cap = vc.is_local ? (cfg.sliding_window_size + max_batch_tokens) : (max_blocks_per_seq * 64);
             if (vc.is_local) {
                 size_t kv_sz = (size_t)max_slots * (size_t)vc.cap * kv_dim * 2;
                 vc.k_cache = impl_->alloc_shared(kv_sz);
                 vc.v_cache = impl_->alloc_shared(kv_sz);
                 kv_bytes_total += 2 * kv_sz;
             } else {
-                size_t kv_fp8_sz = (size_t)max_slots * (size_t)vc.cap * kv_dim;
-                size_t sc_sz = (size_t)max_slots * (size_t)vc.cap * (size_t)cfg.num_key_value_heads * sizeof(float);
+                size_t total_pos = (size_t)num_kv_blocks * 64;
+                size_t kv_fp8_sz = total_pos * kv_dim;
+                size_t sc_sz = total_pos * (size_t)cfg.num_key_value_heads * sizeof(float);
                 vc.k_cache_fp8 = impl_->alloc_shared(kv_fp8_sz);
                 vc.v_cache_fp8 = impl_->alloc_shared(kv_fp8_sz);
                 vc.k_scale_fp8 = impl_->alloc_shared(sc_sz);
@@ -2698,15 +2726,15 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
             vc.mlp_conv_snap = impl_->alloc_shared((size_t)n_ds * 8 * 3 * D * 2);
 
             if (vc.is_local) {
-                size_t kv_sz = (size_t)max_slots * (size_t)vc.cap * kv_dim * 2;
+                size_t kv_sz = (size_t)num_snapshots * (size_t)vc.cap * kv_dim * 2;
                 vc.local_k_prefill_snap = impl_->alloc_shared(kv_sz);
                 vc.local_v_prefill_snap = impl_->alloc_shared(kv_sz);
                 kv_bytes_total += 2 * kv_sz;
             }
-            vc.k_conv_prefill_snap = impl_->alloc_shared((size_t)max_slots * 3 * kv_dim * 2);
-            vc.v_conv_prefill_snap = impl_->alloc_shared((size_t)max_slots * 3 * kv_dim * 2);
-            vc.attn_conv_prefill_snap = impl_->alloc_shared((size_t)max_slots * 3 * D * 2);
-            vc.mlp_conv_prefill_snap = impl_->alloc_shared((size_t)max_slots * 3 * D * 2);
+            vc.k_conv_prefill_snap = impl_->alloc_shared((size_t)num_snapshots * 3 * kv_dim * 2);
+            vc.v_conv_prefill_snap = impl_->alloc_shared((size_t)num_snapshots * 3 * kv_dim * 2);
+            vc.attn_conv_prefill_snap = impl_->alloc_shared((size_t)num_snapshots * 3 * D * 2);
+            vc.mlp_conv_prefill_snap = impl_->alloc_shared((size_t)num_snapshots * 3 * D * 2);
         }
 
         int T = max_batch_tokens;
@@ -2805,54 +2833,73 @@ void Inkling2Model::reset_cache(int slot_id) {
     }
 }
 
-void Inkling2Model::save_prefill_snapshot(int slot_id) {
+void Inkling2Model::save_boundary_snapshot(int slot_id, int snap_id) {
+    if (snap_id < 0 || snap_id >= num_snapshots) return;
     int kv_dim = cfg.num_key_value_heads * cfg.head_dim;
     int D = cfg.hidden_size;
     for (auto& vc : impl_->caches) {
         if (vc.is_local) {
             size_t one_kv = (size_t)vc.cap * kv_dim * 2;
-            size_t off = (size_t)slot_id * one_kv;
-            memcpy(static_cast<uint8_t*>(vc.local_k_prefill_snap.contents) + off,
-                   static_cast<uint8_t*>(vc.k_cache.contents) + off, one_kv);
-            memcpy(static_cast<uint8_t*>(vc.local_v_prefill_snap.contents) + off,
-                   static_cast<uint8_t*>(vc.v_cache.contents) + off, one_kv);
+            size_t src_off = (size_t)slot_id * one_kv;
+            size_t dst_off = (size_t)snap_id * one_kv;
+            memcpy(static_cast<uint8_t*>(vc.local_k_prefill_snap.contents) + dst_off,
+                   static_cast<uint8_t*>(vc.k_cache.contents) + src_off, one_kv);
+            memcpy(static_cast<uint8_t*>(vc.local_v_prefill_snap.contents) + dst_off,
+                   static_cast<uint8_t*>(vc.v_cache.contents) + src_off, one_kv);
         }
         size_t k_sz = (size_t)3 * kv_dim * 2;
         size_t d_sz = (size_t)3 * D * 2;
-        memcpy(static_cast<uint8_t*>(vc.k_conv_prefill_snap.contents) + (size_t)slot_id * k_sz,
+        memcpy(static_cast<uint8_t*>(vc.k_conv_prefill_snap.contents) + (size_t)snap_id * k_sz,
                static_cast<uint8_t*>(vc.k_conv_state.contents) + (size_t)slot_id * k_sz, k_sz);
-        memcpy(static_cast<uint8_t*>(vc.v_conv_prefill_snap.contents) + (size_t)slot_id * k_sz,
+        memcpy(static_cast<uint8_t*>(vc.v_conv_prefill_snap.contents) + (size_t)snap_id * k_sz,
                static_cast<uint8_t*>(vc.v_conv_state.contents) + (size_t)slot_id * k_sz, k_sz);
-        memcpy(static_cast<uint8_t*>(vc.attn_conv_prefill_snap.contents) + (size_t)slot_id * d_sz,
+        memcpy(static_cast<uint8_t*>(vc.attn_conv_prefill_snap.contents) + (size_t)snap_id * d_sz,
                static_cast<uint8_t*>(vc.attn_conv_state.contents) + (size_t)slot_id * d_sz, d_sz);
-        memcpy(static_cast<uint8_t*>(vc.mlp_conv_prefill_snap.contents) + (size_t)slot_id * d_sz,
+        memcpy(static_cast<uint8_t*>(vc.mlp_conv_prefill_snap.contents) + (size_t)snap_id * d_sz,
                static_cast<uint8_t*>(vc.mlp_conv_state.contents) + (size_t)slot_id * d_sz, d_sz);
     }
 }
 
-void Inkling2Model::restore_prefill_snapshot(int slot_id) {
+void Inkling2Model::restore_boundary_snapshot(int slot_id, int snap_id) {
+    if (snap_id < 0 || snap_id >= num_snapshots) return;
     int kv_dim = cfg.num_key_value_heads * cfg.head_dim;
     int D = cfg.hidden_size;
     for (auto& vc : impl_->caches) {
         if (vc.is_local) {
             size_t one_kv = (size_t)vc.cap * kv_dim * 2;
-            size_t off = (size_t)slot_id * one_kv;
-            memcpy(static_cast<uint8_t*>(vc.k_cache.contents) + off,
-                   static_cast<uint8_t*>(vc.local_k_prefill_snap.contents) + off, one_kv);
-            memcpy(static_cast<uint8_t*>(vc.v_cache.contents) + off,
-                   static_cast<uint8_t*>(vc.local_v_prefill_snap.contents) + off, one_kv);
+            size_t src_off = (size_t)snap_id * one_kv;
+            size_t dst_off = (size_t)slot_id * one_kv;
+            memcpy(static_cast<uint8_t*>(vc.k_cache.contents) + dst_off,
+                   static_cast<uint8_t*>(vc.local_k_prefill_snap.contents) + src_off, one_kv);
+            memcpy(static_cast<uint8_t*>(vc.v_cache.contents) + dst_off,
+                   static_cast<uint8_t*>(vc.local_v_prefill_snap.contents) + src_off, one_kv);
         }
         size_t k_sz = (size_t)3 * kv_dim * 2;
         size_t d_sz = (size_t)3 * D * 2;
         memcpy(static_cast<uint8_t*>(vc.k_conv_state.contents) + (size_t)slot_id * k_sz,
-               static_cast<uint8_t*>(vc.k_conv_prefill_snap.contents) + (size_t)slot_id * k_sz, k_sz);
+               static_cast<uint8_t*>(vc.k_conv_prefill_snap.contents) + (size_t)snap_id * k_sz, k_sz);
         memcpy(static_cast<uint8_t*>(vc.v_conv_state.contents) + (size_t)slot_id * k_sz,
-               static_cast<uint8_t*>(vc.v_conv_prefill_snap.contents) + (size_t)slot_id * k_sz, k_sz);
+               static_cast<uint8_t*>(vc.v_conv_prefill_snap.contents) + (size_t)snap_id * k_sz, k_sz);
         memcpy(static_cast<uint8_t*>(vc.attn_conv_state.contents) + (size_t)slot_id * d_sz,
-               static_cast<uint8_t*>(vc.attn_conv_prefill_snap.contents) + (size_t)slot_id * d_sz, d_sz);
+               static_cast<uint8_t*>(vc.attn_conv_prefill_snap.contents) + (size_t)snap_id * d_sz, d_sz);
         memcpy(static_cast<uint8_t*>(vc.mlp_conv_state.contents) + (size_t)slot_id * d_sz,
-               static_cast<uint8_t*>(vc.mlp_conv_prefill_snap.contents) + (size_t)slot_id * d_sz, d_sz);
+               static_cast<uint8_t*>(vc.mlp_conv_prefill_snap.contents) + (size_t)snap_id * d_sz, d_sz);
     }
+}
+
+void Inkling2Model::save_prefill_snapshot(int slot_id) {
+    save_boundary_snapshot(slot_id, slot_id);
+}
+
+void Inkling2Model::restore_prefill_snapshot(int slot_id) {
+    restore_boundary_snapshot(slot_id, slot_id);
+}
+
+void Inkling2Model::set_slot_block_table(int slot_id, const int32_t* blocks, int num_blocks) {
+    if (slot_id < 0 || slot_id >= max_slots || num_blocks <= 0) return;
+    int n = std::min(num_blocks, max_blocks_per_seq);
+    int32_t* dst = static_cast<int32_t*>(impl_->b_block_tables.contents) + (size_t)slot_id * max_blocks_per_seq;
+    memcpy(dst, blocks, (size_t)n * sizeof(int32_t));
 }
 
 int32_t Inkling2Model::forward_and_greedy(const int32_t* h_tokens, int T, int start_pos, int slot_id) {

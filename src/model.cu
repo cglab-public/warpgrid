@@ -281,22 +281,27 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
     for (int i = cfg.loop_core_end; i < cfg.num_hidden_layers; ++i) visits.push_back({i, 0});
 
     // Allocate KV caches & conv states for all 48 visits x max_slots
+    max_blocks_per_seq = (max_seq_len + 63) / 64;
+    num_kv_blocks = max_slots * max_blocks_per_seq;
+    num_snapshots = (max_slots >= 4) ? std::max(max_slots, 12) : max_slots;
+
     caches.resize(visits.size());
     size_t kv_bytes_total = 0;
     for (size_t v = 0; v < visits.size(); ++v) {
         int lid = visits[v].first;
         auto& vc = caches[v];
         vc.is_local = cfg.is_local(lid);
-        vc.cap = vc.is_local ? (cfg.sliding_window_size + max_batch_tokens) : max_seq_len;
+        vc.cap = vc.is_local ? (cfg.sliding_window_size + max_batch_tokens) : (max_blocks_per_seq * 64);
         if (vc.is_local) {
             size_t kv_sz = (size_t)max_slots * vc.cap * cfg.num_key_value_heads * cfg.head_dim * sizeof(__nv_bfloat16);
             vc.k_cache = (__nv_bfloat16*)alloc_gpu(kv_sz);
             vc.v_cache = (__nv_bfloat16*)alloc_gpu(kv_sz);
             kv_bytes_total += 2 * kv_sz;
         } else {
-            // Global layers use per-(pos, head) FP8 E4M3 KV cache (2x capacity + 2x 130K decode bandwidth!)
-            size_t kv_fp8_sz = (size_t)max_slots * vc.cap * cfg.num_key_value_heads * cfg.head_dim * sizeof(uint8_t);
-            size_t sc_sz = (size_t)max_slots * vc.cap * cfg.num_key_value_heads * sizeof(float);
+            // Global layers use paged per-(pos, head) FP8 E4M3 KV cache (block_size=64)
+            size_t total_pos = (size_t)num_kv_blocks * 64;
+            size_t kv_fp8_sz = total_pos * cfg.num_key_value_heads * cfg.head_dim * sizeof(uint8_t);
+            size_t sc_sz = total_pos * cfg.num_key_value_heads * sizeof(float);
             vc.k_cache_fp8 = (uint8_t*)alloc_gpu(kv_fp8_sz);
             vc.v_cache_fp8 = (uint8_t*)alloc_gpu(kv_fp8_sz);
             vc.k_scale_fp8 = (float*)alloc_gpu(sc_sz);
@@ -316,17 +321,17 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
         vc.attn_conv_snap = (__nv_bfloat16*)alloc_gpu((size_t)n_ds * 8 * 3 * cfg.hidden_size * sizeof(__nv_bfloat16));
         vc.mlp_conv_snap = (__nv_bfloat16*)alloc_gpu((size_t)n_ds * 8 * 3 * cfg.hidden_size * sizeof(__nv_bfloat16));
 
-        // Prefix-cache end-of-prefill snapshots per slot
+        // Cross-slot prefix-cache boundary snapshots (local SWA ring + conv states)
         if (vc.is_local) {
-            size_t kv_sz = (size_t)max_slots * vc.cap * cfg.num_key_value_heads * cfg.head_dim * sizeof(__nv_bfloat16);
+            size_t kv_sz = (size_t)num_snapshots * vc.cap * cfg.num_key_value_heads * cfg.head_dim * sizeof(__nv_bfloat16);
             vc.local_k_prefill_snap = (__nv_bfloat16*)alloc_gpu(kv_sz);
             vc.local_v_prefill_snap = (__nv_bfloat16*)alloc_gpu(kv_sz);
             kv_bytes_total += 2 * kv_sz;
         }
-        vc.k_conv_prefill_snap = (__nv_bfloat16*)alloc_gpu((size_t)max_slots * 3 * kv_dim * sizeof(__nv_bfloat16));
-        vc.v_conv_prefill_snap = (__nv_bfloat16*)alloc_gpu((size_t)max_slots * 3 * kv_dim * sizeof(__nv_bfloat16));
-        vc.attn_conv_prefill_snap = (__nv_bfloat16*)alloc_gpu((size_t)max_slots * 3 * cfg.hidden_size * sizeof(__nv_bfloat16));
-        vc.mlp_conv_prefill_snap = (__nv_bfloat16*)alloc_gpu((size_t)max_slots * 3 * cfg.hidden_size * sizeof(__nv_bfloat16));
+        vc.k_conv_prefill_snap = (__nv_bfloat16*)alloc_gpu((size_t)num_snapshots * 3 * kv_dim * sizeof(__nv_bfloat16));
+        vc.v_conv_prefill_snap = (__nv_bfloat16*)alloc_gpu((size_t)num_snapshots * 3 * kv_dim * sizeof(__nv_bfloat16));
+        vc.attn_conv_prefill_snap = (__nv_bfloat16*)alloc_gpu((size_t)num_snapshots * 3 * cfg.hidden_size * sizeof(__nv_bfloat16));
+        vc.mlp_conv_prefill_snap = (__nv_bfloat16*)alloc_gpu((size_t)num_snapshots * 3 * cfg.hidden_size * sizeof(__nv_bfloat16));
     }
 
     // Allocate workspace buffers
@@ -340,6 +345,17 @@ void Inkling2Model::load(const std::string& model_dir, int max_seq, int max_chun
     d_pos = (int32_t*)alloc_gpu(sizeof(int32_t));
     d_batch_slots = (int32_t*)alloc_gpu(max_slots * sizeof(int32_t));
     d_batch_pos = (int32_t*)alloc_gpu(max_slots * sizeof(int32_t));
+    d_block_tables = (int32_t*)alloc_gpu((size_t)max_slots * max_blocks_per_seq * sizeof(int32_t));
+    {
+        std::vector<int32_t> init_bt((size_t)max_slots * max_blocks_per_seq);
+        for (int s = 0; s < max_slots; ++s) {
+            for (int b = 0; b < max_blocks_per_seq; ++b) {
+                init_bt[(size_t)s * max_blocks_per_seq + b] = s * max_blocks_per_seq + b;
+            }
+        }
+        CHECK_CUDA(cudaMemcpyAsync(d_block_tables, init_bt.data(),
+                                   init_bt.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    }
     d_stack = (__nv_bfloat16*)alloc_gpu((size_t)6 * T * D * sizeof(__nv_bfloat16));
     d_prelude_part = (__nv_bfloat16*)alloc_gpu((size_t)T * D * sizeof(__nv_bfloat16));
     d_bank = (__nv_bfloat16*)alloc_gpu((size_t)2 * T * D * sizeof(__nv_bfloat16));
@@ -425,42 +441,65 @@ void Inkling2Model::reset_cache(int slot_id) {
     }
 }
 
-void Inkling2Model::save_prefill_snapshot(int slot_id) {
+void Inkling2Model::save_boundary_snapshot(int slot_id, int snap_id) {
+    if (snap_id < 0 || snap_id >= num_snapshots) return;
     int kv_dim = cfg.num_key_value_heads * cfg.head_dim;
     int D = cfg.hidden_size;
     for (auto& vc : caches) {
         if (vc.is_local) {
             size_t one_kv = (size_t)vc.cap * kv_dim * sizeof(__nv_bfloat16);
-            int64_t off = (int64_t)slot_id * vc.cap * kv_dim;
-            CHECK_CUDA(cudaMemcpyAsync(vc.local_k_prefill_snap + off, vc.k_cache + off, one_kv, cudaMemcpyDeviceToDevice, stream));
-            CHECK_CUDA(cudaMemcpyAsync(vc.local_v_prefill_snap + off, vc.v_cache + off, one_kv, cudaMemcpyDeviceToDevice, stream));
+            int64_t src_off = (int64_t)slot_id * vc.cap * kv_dim;
+            int64_t dst_off = (int64_t)snap_id * vc.cap * kv_dim;
+            CHECK_CUDA(cudaMemcpyAsync(vc.local_k_prefill_snap + dst_off, vc.k_cache + src_off, one_kv, cudaMemcpyDeviceToDevice, stream));
+            CHECK_CUDA(cudaMemcpyAsync(vc.local_v_prefill_snap + dst_off, vc.v_cache + src_off, one_kv, cudaMemcpyDeviceToDevice, stream));
         }
-        int64_t k_off = (int64_t)slot_id * 3 * kv_dim;
-        int64_t d_off = (int64_t)slot_id * 3 * D;
-        CHECK_CUDA(cudaMemcpyAsync(vc.k_conv_prefill_snap + k_off, vc.k_conv_state + k_off, 3 * kv_dim * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream));
-        CHECK_CUDA(cudaMemcpyAsync(vc.v_conv_prefill_snap + k_off, vc.v_conv_state + k_off, 3 * kv_dim * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream));
-        CHECK_CUDA(cudaMemcpyAsync(vc.attn_conv_prefill_snap + d_off, vc.attn_conv_state + d_off, 3 * D * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream));
-        CHECK_CUDA(cudaMemcpyAsync(vc.mlp_conv_prefill_snap + d_off, vc.mlp_conv_state + d_off, 3 * D * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream));
+        int64_t k_src = (int64_t)slot_id * 3 * kv_dim;
+        int64_t k_dst = (int64_t)snap_id * 3 * kv_dim;
+        int64_t d_src = (int64_t)slot_id * 3 * D;
+        int64_t d_dst = (int64_t)snap_id * 3 * D;
+        CHECK_CUDA(cudaMemcpyAsync(vc.k_conv_prefill_snap + k_dst, vc.k_conv_state + k_src, 3 * kv_dim * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream));
+        CHECK_CUDA(cudaMemcpyAsync(vc.v_conv_prefill_snap + k_dst, vc.v_conv_state + k_src, 3 * kv_dim * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream));
+        CHECK_CUDA(cudaMemcpyAsync(vc.attn_conv_prefill_snap + d_dst, vc.attn_conv_state + d_src, 3 * D * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream));
+        CHECK_CUDA(cudaMemcpyAsync(vc.mlp_conv_prefill_snap + d_dst, vc.mlp_conv_state + d_src, 3 * D * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream));
     }
 }
 
-void Inkling2Model::restore_prefill_snapshot(int slot_id) {
+void Inkling2Model::restore_boundary_snapshot(int slot_id, int snap_id) {
+    if (snap_id < 0 || snap_id >= num_snapshots) return;
     int kv_dim = cfg.num_key_value_heads * cfg.head_dim;
     int D = cfg.hidden_size;
     for (auto& vc : caches) {
         if (vc.is_local) {
             size_t one_kv = (size_t)vc.cap * kv_dim * sizeof(__nv_bfloat16);
-            int64_t off = (int64_t)slot_id * vc.cap * kv_dim;
-            CHECK_CUDA(cudaMemcpyAsync(vc.k_cache + off, vc.local_k_prefill_snap + off, one_kv, cudaMemcpyDeviceToDevice, stream));
-            CHECK_CUDA(cudaMemcpyAsync(vc.v_cache + off, vc.local_v_prefill_snap + off, one_kv, cudaMemcpyDeviceToDevice, stream));
+            int64_t src_off = (int64_t)snap_id * vc.cap * kv_dim;
+            int64_t dst_off = (int64_t)slot_id * vc.cap * kv_dim;
+            CHECK_CUDA(cudaMemcpyAsync(vc.k_cache + dst_off, vc.local_k_prefill_snap + src_off, one_kv, cudaMemcpyDeviceToDevice, stream));
+            CHECK_CUDA(cudaMemcpyAsync(vc.v_cache + dst_off, vc.local_v_prefill_snap + src_off, one_kv, cudaMemcpyDeviceToDevice, stream));
         }
-        int64_t k_off = (int64_t)slot_id * 3 * kv_dim;
-        int64_t d_off = (int64_t)slot_id * 3 * D;
-        CHECK_CUDA(cudaMemcpyAsync(vc.k_conv_state + k_off, vc.k_conv_prefill_snap + k_off, 3 * kv_dim * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream));
-        CHECK_CUDA(cudaMemcpyAsync(vc.v_conv_state + k_off, vc.v_conv_prefill_snap + k_off, 3 * kv_dim * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream));
-        CHECK_CUDA(cudaMemcpyAsync(vc.attn_conv_state + d_off, vc.attn_conv_prefill_snap + d_off, 3 * D * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream));
-        CHECK_CUDA(cudaMemcpyAsync(vc.mlp_conv_state + d_off, vc.mlp_conv_prefill_snap + d_off, 3 * D * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream));
+        int64_t k_src = (int64_t)snap_id * 3 * kv_dim;
+        int64_t k_dst = (int64_t)slot_id * 3 * kv_dim;
+        int64_t d_src = (int64_t)snap_id * 3 * D;
+        int64_t d_dst = (int64_t)slot_id * 3 * D;
+        CHECK_CUDA(cudaMemcpyAsync(vc.k_conv_state + k_dst, vc.k_conv_prefill_snap + k_src, 3 * kv_dim * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream));
+        CHECK_CUDA(cudaMemcpyAsync(vc.v_conv_state + k_dst, vc.v_conv_prefill_snap + k_src, 3 * kv_dim * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream));
+        CHECK_CUDA(cudaMemcpyAsync(vc.attn_conv_state + d_dst, vc.attn_conv_prefill_snap + d_src, 3 * D * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream));
+        CHECK_CUDA(cudaMemcpyAsync(vc.mlp_conv_state + d_dst, vc.mlp_conv_prefill_snap + d_src, 3 * D * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream));
     }
+}
+
+void Inkling2Model::save_prefill_snapshot(int slot_id) {
+    save_boundary_snapshot(slot_id, slot_id);
+}
+
+void Inkling2Model::restore_prefill_snapshot(int slot_id) {
+    restore_boundary_snapshot(slot_id, slot_id);
+}
+
+void Inkling2Model::set_slot_block_table(int slot_id, const int32_t* blocks, int num_blocks) {
+    if (slot_id < 0 || slot_id >= max_slots || num_blocks <= 0) return;
+    int n = std::min(num_blocks, max_blocks_per_seq);
+    CHECK_CUDA(cudaMemcpyAsync(d_block_tables + (int64_t)slot_id * max_blocks_per_seq,
+                               blocks, (size_t)n * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
 }
 
 void Inkling2Model::linear_bf16(
@@ -846,13 +885,13 @@ void Inkling2Model::forward_internal(const int32_t* h_tokens, int T, int start_p
         // 3. K/V short convs
         mark_start();
         int64_t kv_slot_off = (int64_t)slot_id * vc.cap * kv_dim;
-        int64_t sc_slot_off = (int64_t)slot_id * vc.cap * cfg.num_key_value_heads;
         __nv_bfloat16* slot_k_cache = vc.k_cache ? (vc.k_cache + kv_slot_off) : nullptr;
         __nv_bfloat16* slot_v_cache = vc.v_cache ? (vc.v_cache + kv_slot_off) : nullptr;
-        uint8_t* slot_k_fp8 = vc.k_cache_fp8 ? (vc.k_cache_fp8 + kv_slot_off) : nullptr;
-        uint8_t* slot_v_fp8 = vc.v_cache_fp8 ? (vc.v_cache_fp8 + kv_slot_off) : nullptr;
-        float* slot_k_sc = vc.k_scale_fp8 ? (vc.k_scale_fp8 + sc_slot_off) : nullptr;
-        float* slot_v_sc = vc.v_scale_fp8 ? (vc.v_scale_fp8 + sc_slot_off) : nullptr;
+        uint8_t* slot_k_fp8 = vc.k_cache_fp8;
+        uint8_t* slot_v_fp8 = vc.v_cache_fp8;
+        float* slot_k_sc = vc.k_scale_fp8;
+        float* slot_v_sc = vc.v_scale_fp8;
+        const int32_t* slot_bt = (!lw.is_local) ? (d_block_tables + (int64_t)slot_id * max_blocks_per_seq) : nullptr;
         __nv_bfloat16* slot_k_cs = vc.k_conv_state + (int64_t)slot_id * 3 * kv_dim;
         __nv_bfloat16* slot_v_cs = vc.v_conv_state + (int64_t)slot_id * 3 * kv_dim;
         __nv_bfloat16* slot_attn_cs = vc.attn_conv_state + (int64_t)slot_id * 3 * D;
@@ -882,7 +921,7 @@ void Inkling2Model::forward_internal(const int32_t* h_tokens, int T, int start_p
             cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim, cfg.d_rel,
             cfg.qk_l2_clip_threshold, cfg.rel_l2_clip_threshold,
             cfg.log_scaling_n_floor, cfg.log_scaling_alpha, cfg.rms_norm_eps, stream,
-            slot_k_fp8, slot_v_fp8, slot_k_sc, slot_v_sc);
+            slot_k_fp8, slot_v_fp8, slot_k_sc, slot_v_sc, slot_bt);
 
         // 5. Relative position bias: rel_logits[T*24, 1024] = R[T*24, 16] @ rel_proj[16, 1024]
         {
@@ -903,7 +942,7 @@ void Inkling2Model::forward_internal(const int32_t* h_tokens, int T, int start_p
             d_Q, slot_k_cache, slot_v_cache, d_rel_logits, d_gate, d_sinks, d_attn_raw,
             d_split_scratch, start_pos, dev_pos, T, vc.cap, lw.is_local, cfg.sliding_window_size,
             cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim, cfg.rel_extent, stream,
-            slot_k_fp8, slot_v_fp8, slot_k_sc, slot_v_sc);
+            slot_k_fp8, slot_v_fp8, slot_k_sc, slot_v_sc, slot_bt);
         mark_end(prof_attn_sconv_ms);
 
         mark_start();
@@ -1174,7 +1213,8 @@ void Inkling2Model::forward_batch_decode_internal(int B) {
             B, vc.cap, lw.is_local, cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim, cfg.d_rel,
             cfg.qk_l2_clip_threshold, cfg.rel_l2_clip_threshold,
             cfg.log_scaling_n_floor, cfg.log_scaling_alpha, cfg.rms_norm_eps, stream,
-            vc.k_cache_fp8, vc.v_cache_fp8, vc.k_scale_fp8, vc.v_scale_fp8);
+            vc.k_cache_fp8, vc.v_cache_fp8, vc.k_scale_fp8, vc.v_scale_fp8,
+            d_block_tables, max_blocks_per_seq);
 
         {
             float alpha = 1.0f, beta = 0.0f;
@@ -1190,7 +1230,8 @@ void Inkling2Model::forward_batch_decode_internal(int B) {
             d_Q, vc.k_cache, vc.v_cache, d_rel_logits, d_gate, d_sinks, d_attn_raw,
             d_batch_slots, d_batch_pos, B, vc.cap, lw.is_local, cfg.sliding_window_size,
             cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim, cfg.rel_extent, stream,
-            vc.k_cache_fp8, vc.v_cache_fp8, vc.k_scale_fp8, vc.v_scale_fp8);
+            vc.k_cache_fp8, vc.v_cache_fp8, vc.k_scale_fp8, vc.v_scale_fp8,
+            d_block_tables, max_blocks_per_seq);
         launch_fp8_small_gemm(d_attn_raw, lw.wo_fp8, lw.wo_sc, d_attn_proj, nullptr, B, D, q_dim, stream);
         launch_sconv_static_batched(d_attn_proj, lw.attn_sconv_w, vc.attn_conv_state, d_batch_slots, d_attn_out, B, D, stream);
 
@@ -1436,7 +1477,8 @@ void Inkling2Model::forward_batch_verify_internal(int B, int L) {
             B, L, vc.cap, lw.is_local, cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim, cfg.d_rel,
             cfg.qk_l2_clip_threshold, cfg.rel_l2_clip_threshold,
             cfg.log_scaling_n_floor, cfg.log_scaling_alpha, cfg.rms_norm_eps, stream,
-            vc.k_cache_fp8, vc.v_cache_fp8, vc.k_scale_fp8, vc.v_scale_fp8);
+            vc.k_cache_fp8, vc.v_cache_fp8, vc.k_scale_fp8, vc.v_scale_fp8,
+            d_block_tables, max_blocks_per_seq);
 
         {
             float alpha = 1.0f, beta = 0.0f;
@@ -1452,7 +1494,8 @@ void Inkling2Model::forward_batch_verify_internal(int B, int L) {
             d_Q, vc.k_cache, vc.v_cache, d_rel_logits, d_gate, d_sinks, d_attn_raw,
             d_batch_slots, d_batch_pos, B, L, vc.cap, lw.is_local, cfg.sliding_window_size,
             cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim, cfg.rel_extent, stream,
-            vc.k_cache_fp8, vc.v_cache_fp8, vc.k_scale_fp8, vc.v_scale_fp8, d_split_scratch);
+            vc.k_cache_fp8, vc.v_cache_fp8, vc.k_scale_fp8, vc.v_scale_fp8, d_split_scratch,
+            d_block_tables, max_blocks_per_seq);
         if (T <= 8) launch_fp8_small_gemm(d_attn_raw, lw.wo_fp8, lw.wo_sc, d_attn_proj, nullptr, T, D, q_dim, stream);
         else linear_bf16(d_attn_raw, lw.wo, d_attn_proj, T, D, q_dim);
         launch_sconv_static_batch_verify(d_attn_proj, lw.attn_sconv_w, vc.attn_conv_state, vc.attn_conv_snap, d_batch_slots, d_attn_out, B, L, D, stream);

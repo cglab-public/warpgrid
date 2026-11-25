@@ -1,6 +1,7 @@
 #include "../src/auth.hpp"
 #include "../src/config.hpp"
 #include "../src/json.hpp"
+#include "../src/prefix_cache.hpp"
 #include "../src/safetensors.hpp"
 #include "../src/telemetry.hpp"
 #include "../src/tokenizer.hpp"
@@ -432,6 +433,87 @@ static void test_auth_request_line_and_api_key() {
         "GET /v1/models?Authorization=Bearer%20sk-warpgrid-secret HTTP/1.1\r\n"
         "X-Custom: Authorization: Bearer sk-warpgrid-secret";
     EXPECT_TRUE(!ink::is_request_authorized(spoofed, "sk-warpgrid-secret"));
+
+    // Case-insensitive Content-Length parsing (e.g. Python urllib sends "Content-length:")
+    EXPECT_EQ(ink::parse_content_length("POST /v1/chat/completions HTTP/1.1\r\nContent-length: 123456"), (size_t)123456);
+    EXPECT_EQ(ink::parse_content_length("POST /v1/chat/completions HTTP/1.1\r\nCONTENT-LENGTH: 42"), (size_t)42);
+    EXPECT_EQ(ink::parse_content_length("GET /health HTTP/1.1\r\nHost: localhost"), (size_t)0);
+}
+
+static void test_radix_prefix_cache_cross_slot_and_eviction() {
+    ink::RadixPrefixCache cache;
+    cache.init(8, 2); // 8 physical blocks (512 tokens), 2 boundary snapshots
+
+    // Build two prompts sharing a 128-token system prompt + different suffixes
+    std::vector<int32_t> sys(128);
+    for (int i = 0; i < 128; ++i) sys[i] = 1000 + i;
+    std::vector<int32_t> p1 = sys;
+    for (int i = 0; i < 70; ++i) p1.push_back(2000 + i); // len = 198
+    std::vector<int32_t> p2 = sys;
+    for (int i = 0; i < 40; ++i) p2.push_back(3000 + i); // len = 168
+
+    EXPECT_EQ(ink::compute_lcp_aligned(p1, p2), 128);
+    EXPECT_EQ(cache.peek_prefix_hit(p1), 0);
+
+    // Slot 0 prefills p1: allocates 4 blocks (256 tokens), publishes shared 128-tok boundary
+    std::vector<int32_t> s0;
+    for (int i = 0; i < 4; ++i) s0.push_back(cache.alloc_block());
+    EXPECT_EQ(cache.free_block_count(), 4);
+
+    int32_t snap0 = cache.alloc_snapshot();
+    EXPECT_TRUE(snap0 >= 0);
+    int32_t attached = cache.publish_prefix(p1, 2, s0, snap0);
+    EXPECT_EQ(attached, snap0);
+    EXPECT_EQ(cache.cached_block_count(), 2);
+
+    // Slot 1 arrives concurrently with p2 -> hits exact 128-token shared prefix & pins same physical blocks!
+    auto m2 = cache.acquire_prefix(p2);
+    EXPECT_EQ(m2.hit_tokens, 128);
+    EXPECT_EQ(m2.snap_id, snap0);
+    EXPECT_EQ(m2.phys_blocks.size(), (size_t)2);
+    EXPECT_EQ(m2.phys_blocks[0], s0[0]);
+    EXPECT_EQ(m2.phys_blocks[1], s0[1]);
+
+    // While m2 holds a snapshot pin on snap0, exhausting the snapshot pool must NOT evict snap0!
+    int32_t snap1 = cache.alloc_snapshot();
+    EXPECT_TRUE(snap1 >= 0 && snap1 != snap0);
+    // Attach snap1 to a second node? No free snaps left, and snap0 is pinned, so alloc_snapshot returns -1
+    EXPECT_EQ(cache.alloc_snapshot(), -1);
+    // Once m2 finishes restoring and releases its snapshot pin, snap0 becomes evictable again
+    cache.release_snapshot_pin(m2.snap_id);
+    int32_t recycled = cache.alloc_snapshot();
+    EXPECT_EQ(recycled, snap0);
+    // Re-attach snap0 for the rest of the test
+    cache.publish_prefix(p1, 2, s0, recycled);
+
+    // Slot 0 and Slot 1 both hold blocks 0..1; Slot 1 allocates 1 private suffix block
+    std::vector<int32_t> s1 = m2.phys_blocks;
+    s1.push_back(cache.alloc_block());
+    EXPECT_EQ(cache.free_block_count(), 3);
+
+    // Release Slot 0 -> shared blocks stay pinned by Slot 1; Slot 0's 2 private blocks return to free pool
+    cache.release_slot_blocks(s0);
+    EXPECT_EQ(cache.free_block_count(), 5);
+
+    // Release Slot 1 -> shared blocks stay in cache (unreferenced, evictable), private block returns
+    cache.release_slot_blocks(s1);
+    EXPECT_EQ(cache.free_block_count(), 6);
+    EXPECT_EQ(cache.cached_block_count(), 2);
+    EXPECT_EQ(cache.peek_prefix_hit(p2), 128);
+
+    // Allocate all 8 blocks -> forces LRU eviction of the 2 unreferenced cached blocks
+    std::vector<int32_t> s2;
+    for (int i = 0; i < 8; ++i) {
+        int32_t b = cache.alloc_block();
+        EXPECT_TRUE(b >= 0);
+        s2.push_back(b);
+    }
+    EXPECT_EQ(cache.alloc_block(), -1); // Pool exhausted while all 8 blocks are active
+    EXPECT_EQ(cache.cached_block_count(), 0);
+    EXPECT_EQ(cache.peek_prefix_hit(p2), 0);
+
+    cache.release_slot_blocks(s2);
+    EXPECT_EQ(cache.free_block_count(), 8);
 }
 
 int main() {
@@ -443,6 +525,7 @@ int main() {
     run_test("test_telemetry_metrics_and_formats", test_telemetry_metrics_and_formats);
     run_test("test_telemetry_otlp_payload_and_loopback", test_telemetry_otlp_payload_and_loopback);
     run_test("test_auth_request_line_and_api_key", test_auth_request_line_and_api_key);
+    run_test("test_radix_prefix_cache_cross_slot_and_eviction", test_radix_prefix_cache_cross_slot_and_eviction);
     printf("Host tests: %d passed, %d failed\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;
 }

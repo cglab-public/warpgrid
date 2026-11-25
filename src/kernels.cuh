@@ -107,7 +107,8 @@ void launch_attn_prep(
     float qk_clip, float rel_clip, float log_n_floor, float log_alpha, float eps,
     cudaStream_t stream,
     uint8_t* k_cache_fp8 = nullptr, uint8_t* v_cache_fp8 = nullptr,
-    float* k_scale_fp8 = nullptr, float* v_scale_fp8 = nullptr);
+    float* k_scale_fp8 = nullptr, float* v_scale_fp8 = nullptr,
+    const int32_t* block_table = nullptr);
 
 // Attention forward (if d_pos != nullptr & T==1, reads q_pos from *d_pos with fixed splits for CUDA graph)
 void launch_attention(
@@ -123,7 +124,8 @@ void launch_attention(
     int n_heads, int n_kv_heads, int head_dim, int rel_extent,
     cudaStream_t stream,
     const uint8_t* k_cache_fp8 = nullptr, const uint8_t* v_cache_fp8 = nullptr,
-    const float* k_scale_fp8 = nullptr, const float* v_scale_fp8 = nullptr);
+    const float* k_scale_fp8 = nullptr, const float* v_scale_fp8 = nullptr,
+    const int32_t* block_table = nullptr);
 
 // MoE router: top-K from sigmoid(x @ W.T) + bias, normalized * route_scale
 void launch_moe_router(
@@ -302,7 +304,8 @@ void launch_attn_prep_batched(
     float qk_clip, float rel_clip, float log_n_floor, float log_alpha, float eps,
     cudaStream_t stream,
     uint8_t* k_cache_fp8_pool = nullptr, uint8_t* v_cache_fp8_pool = nullptr,
-    float* k_scale_fp8_pool = nullptr, float* v_scale_fp8_pool = nullptr);
+    float* k_scale_fp8_pool = nullptr, float* v_scale_fp8_pool = nullptr,
+    const int32_t* block_tables = nullptr, int max_blocks_per_seq = 0);
 
 void launch_attention_batched(
     const __nv_bfloat16* Q,
@@ -314,7 +317,8 @@ void launch_attention_batched(
     int n_heads, int n_kv_heads, int head_dim, int rel_extent,
     cudaStream_t stream,
     const uint8_t* k_cache_fp8_pool = nullptr, const uint8_t* v_cache_fp8_pool = nullptr,
-    const float* k_scale_fp8_pool = nullptr, const float* v_scale_fp8_pool = nullptr);
+    const float* k_scale_fp8_pool = nullptr, const float* v_scale_fp8_pool = nullptr,
+    const int32_t* block_tables = nullptr, int max_blocks_per_seq = 0);
 
 // Multi-slot batched speculative verify kernels (B active sequences, L tokens each, total T = B * L)
 void launch_sconv_static_batch_verify(
@@ -346,7 +350,8 @@ void launch_attn_prep_batch_verify(
     float qk_clip, float rel_clip, float log_n_floor, float log_alpha, float eps,
     cudaStream_t stream,
     uint8_t* k_cache_fp8_pool = nullptr, uint8_t* v_cache_fp8_pool = nullptr,
-    float* k_scale_fp8_pool = nullptr, float* v_scale_fp8_pool = nullptr);
+    float* k_scale_fp8_pool = nullptr, float* v_scale_fp8_pool = nullptr,
+    const int32_t* block_tables = nullptr, int max_blocks_per_seq = 0);
 
 void launch_attention_batch_verify(
     const __nv_bfloat16* Q,
@@ -359,7 +364,8 @@ void launch_attention_batch_verify(
     cudaStream_t stream,
     const uint8_t* k_cache_fp8_pool = nullptr, const uint8_t* v_cache_fp8_pool = nullptr,
     const float* k_scale_fp8_pool = nullptr, const float* v_scale_fp8_pool = nullptr,
-    float* split_scratch = nullptr);
+    float* split_scratch = nullptr,
+    const int32_t* block_tables = nullptr, int max_blocks_per_seq = 0);
 
 // Final logit softcap + greedy argmax on GPU
 void launch_softcap_argmax(

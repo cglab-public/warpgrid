@@ -67,6 +67,36 @@ inline bool is_public_endpoint(std::string_view method, std::string_view path) {
     return method == "GET" && path == "/health";
 }
 
+// Extract Content-Length from an HTTP header block (case-insensitive header name).
+inline size_t parse_content_length(std::string_view header_block) {
+    size_t pos = header_block.find('\n');
+    if (pos == std::string_view::npos) return 0;
+    ++pos;
+    while (pos < header_block.size()) {
+        size_t eol = header_block.find('\n', pos);
+        std::string_view line = (eol == std::string_view::npos)
+            ? header_block.substr(pos)
+            : header_block.substr(pos, eol - pos);
+        if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+        size_t colon = line.find(':');
+        if (colon != std::string_view::npos && colon > 0) {
+            std::string_view name = line.substr(0, colon);
+            if (ascii_iequals(name, "content-length")) {
+                std::string_view val = trim_http_ows(line.substr(colon + 1));
+                size_t len = 0;
+                for (char c : val) {
+                    if (c < '0' || c > '9') break;
+                    len = len * 10 + static_cast<size_t>(c - '0');
+                }
+                return len;
+            }
+        }
+        if (eol == std::string_view::npos) break;
+        pos = eol + 1;
+    }
+    return 0;
+}
+
 // Validate an HTTP header block (request line + headers, without trailing \r\n\r\n)
 // against an optional expected API key.
 // Accepts:

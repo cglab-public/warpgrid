@@ -152,11 +152,15 @@ public:
     int max_slots = 8;
     int max_seq_len = 32768;
     int max_batch_tokens = 2048;
+    int max_blocks_per_seq = 0;
+    int num_kv_blocks = 0;
+    int num_snapshots = 0;
 
     int32_t* d_tokens = nullptr;
     int32_t* d_pos = nullptr;                // [1] device pos for CUDA graph decode
     int32_t* d_batch_slots = nullptr;        // [max_slots] for batched decode
     int32_t* d_batch_pos = nullptr;          // [max_slots] for batched decode
+    int32_t* d_block_tables = nullptr;       // [max_slots, max_blocks_per_seq] paged global KV block table
     __nv_bfloat16* d_stack = nullptr;        // [6, max_T, D]
     __nv_bfloat16* d_prelude_part = nullptr; // [max_T, D]
     __nv_bfloat16* d_bank = nullptr;         // [2, max_T, D]
@@ -258,6 +262,9 @@ public:
     void reset_cache(int slot_id = 0);
     void save_prefill_snapshot(int slot_id);
     void restore_prefill_snapshot(int slot_id);
+    void save_boundary_snapshot(int slot_id, int snap_id);
+    void restore_boundary_snapshot(int slot_id, int snap_id);
+    void set_slot_block_table(int slot_id, const int32_t* blocks, int num_blocks);
 
     // Forward a chunk of tokens for `slot_id` starting at start_pos, returns greedy next token
     int32_t forward_and_greedy(const int32_t* h_tokens, int T, int start_pos, int slot_id = 0);

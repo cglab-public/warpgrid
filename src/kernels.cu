@@ -693,6 +693,10 @@ __global__ void attn_prep_q_r_kernel(
     }
 }
 
+__device__ __forceinline__ int64_t paged_kv_pos(const int32_t* __restrict__ block_table, int pos) {
+    return block_table ? ((int64_t)block_table[pos >> 6] * 64 + (pos & 63)) : (int64_t)pos;
+}
+
 __global__ void attn_prep_kv_kernel(
     const __nv_bfloat16* __restrict__ K_in,
     const __nv_bfloat16* __restrict__ V_in,
@@ -703,14 +707,15 @@ __global__ void attn_prep_kv_kernel(
     float* __restrict__ k_scale_fp8,
     float* __restrict__ v_scale_fp8,
     int start_pos, const int32_t* __restrict__ d_pos, int T, int cache_cap, bool is_local,
-    int n_kv_heads, int head_dim, float qk_clip, float eps)
+    int n_kv_heads, int head_dim, float qk_clip, float eps,
+    const int32_t* __restrict__ block_table)
 {
     int h = blockIdx.x;
     int t = blockIdx.y;
     if (h >= n_kv_heads || t >= T) return;
 
     int pos = (d_pos ? *d_pos : start_pos) + t;
-    int slot = is_local ? (pos % cache_cap) : pos;
+    int64_t slot = is_local ? (int64_t)(pos % cache_cap) : paged_kv_pos(block_table, pos);
 
     const __nv_bfloat16* kin = K_in + ((int64_t)t * n_kv_heads + h) * head_dim;
     const __nv_bfloat16* vin = V_in + ((int64_t)t * n_kv_heads + h) * head_dim;
@@ -775,14 +780,15 @@ void launch_attn_prep(
     int n_heads, int n_kv_heads, int head_dim, int d_rel,
     float qk_clip, float rel_clip, float log_n_floor, float log_alpha, float eps,
     cudaStream_t stream,
-    uint8_t* k_cache_fp8, uint8_t* v_cache_fp8, float* k_scale_fp8, float* v_scale_fp8)
+    uint8_t* k_cache_fp8, uint8_t* v_cache_fp8, float* k_scale_fp8, float* v_scale_fp8,
+    const int32_t* block_table)
 {
     attn_prep_q_r_kernel<<<dim3(n_heads, T), 32, 0, stream>>>(
         Q, R, q_scale, r_scale, start_pos, d_pos, T, is_local, n_heads, head_dim, d_rel,
         qk_clip, rel_clip, log_n_floor, log_alpha);
     attn_prep_kv_kernel<<<dim3(n_kv_heads, T), 32, 0, stream>>>(
         K_in, V_in, k_cache, v_cache, k_cache_fp8, v_cache_fp8, k_scale_fp8, v_scale_fp8,
-        start_pos, d_pos, T, cache_cap, is_local, n_kv_heads, head_dim, qk_clip, eps);
+        start_pos, d_pos, T, cache_cap, is_local, n_kv_heads, head_dim, qk_clip, eps, block_table);
 }
 
 // ============================================================================
@@ -801,7 +807,8 @@ __global__ void attn_decode_split_kernel(
     const __nv_bfloat16* __restrict__ rel_logits,
     float* __restrict__ split_scratch, // [n_heads, num_splits, head_dim + 2]
     int start_pos, const int32_t* __restrict__ d_pos, int num_splits, int cache_cap, bool is_local, int window_size,
-    int n_heads, int n_kv_heads, int head_dim, int rel_extent)
+    int n_heads, int n_kv_heads, int head_dim, int rel_extent,
+    const int32_t* __restrict__ block_table)
 {
     int h = blockIdx.x;
     int s = blockIdx.y;
@@ -834,11 +841,11 @@ __global__ void attn_decode_split_kernel(
 
     int kv_stride = n_kv_heads * head_dim;
     for (int kp = my_start + wid; kp < my_end; kp += nwarps) {
-        int slot = is_local ? (kp % cache_cap) : kp;
+        int64_t slot = is_local ? (int64_t)(kp % cache_cap) : paged_kv_pos(block_table, kp);
         float dot = 0.0f;
         float vv0, vv1, vv2, vv3;
         if (k_cache_fp8) {
-            int64_t sc_idx = (int64_t)slot * n_kv_heads + kv_h;
+            int64_t sc_idx = slot * n_kv_heads + kv_h;
             float ks = k_scale_fp8[sc_idx];
             float vs = v_scale_fp8[sc_idx];
             const uint8_t* k_ptr = k_cache_fp8 + sc_idx * head_dim;
@@ -1163,7 +1170,8 @@ __global__ void attn_small_t_multiwarp_kernel(
     const __nv_bfloat16* __restrict__ sinks,
     __nv_bfloat16* __restrict__ out,
     int start_pos, const int32_t* __restrict__ d_pos, int T, int cache_cap, bool is_local, int window_size,
-    int n_heads, int n_kv_heads, int head_dim, int rel_extent)
+    int n_heads, int n_kv_heads, int head_dim, int rel_extent,
+    const int32_t* __restrict__ block_table)
 {
     int h = blockIdx.x;
     int t = blockIdx.y;
@@ -1191,11 +1199,11 @@ __global__ void attn_small_t_multiwarp_kernel(
     int kv_stride = n_kv_heads * head_dim;
 
     for (int kp = k_start + wid; kp < k_end; kp += nwarps) {
-        int slot = is_local ? (kp % cache_cap) : kp;
+        int64_t slot = is_local ? (int64_t)(kp % cache_cap) : paged_kv_pos(block_table, kp);
         float dot = 0.0f;
         float vv0, vv1, vv2, vv3;
         if (k_cache_fp8) {
-            int64_t sc_idx = (int64_t)slot * n_kv_heads + kv_h;
+            int64_t sc_idx = slot * n_kv_heads + kv_h;
             float ks = k_scale_fp8[sc_idx];
             float vs = v_scale_fp8[sc_idx];
             const uint8_t* k_ptr = k_cache_fp8 + sc_idx * head_dim;
@@ -1279,7 +1287,8 @@ __global__ void attn_small_t_gqa3_split_kernel(
     float* __restrict__ split_scratch, // [T, n_heads, num_splits, 130]
     int start_pos, const int32_t* __restrict__ d_pos, int T, int num_splits,
     int cache_cap, bool is_local, int window_size,
-    int n_heads, int n_kv_heads, int rel_extent)
+    int n_heads, int n_kv_heads, int rel_extent,
+    const int32_t* __restrict__ block_table)
 {
     int kv_h = blockIdx.x;
     int s = blockIdx.y;
@@ -1333,15 +1342,15 @@ __global__ void attn_small_t_gqa3_split_kernel(
                 int kk = idx >> 3;
                 int col = idx & 7;
                 int kp = k_base + kk;
-                int slot = is_local ? (kp % cache_cap) : kp;
-                int64_t sc_idx = (int64_t)slot * n_kv_heads + kv_h;
+                int64_t slot = is_local ? (int64_t)(kp % cache_cap) : paged_kv_pos(block_table, kp);
+                int64_t sc_idx = slot * n_kv_heads + kv_h;
                 reinterpret_cast<uint4*>(sm_k.u8[kk])[col] = reinterpret_cast<const uint4*>(k_cache_fp8 + sc_idx * 128)[col];
                 reinterpret_cast<uint4*>(sm_v.u8[kk])[col] = reinterpret_cast<const uint4*>(v_cache_fp8 + sc_idx * 128)[col];
             }
             if (threadIdx.x < tile_len) {
                 int kp = k_base + threadIdx.x;
-                int slot = is_local ? (kp % cache_cap) : kp;
-                int64_t sc_idx = (int64_t)slot * n_kv_heads + kv_h;
+                int64_t slot = is_local ? (int64_t)(kp % cache_cap) : paged_kv_pos(block_table, kp);
+                int64_t sc_idx = slot * n_kv_heads + kv_h;
                 sm_ks[threadIdx.x] = k_scale_fp8[sc_idx];
                 sm_vs[threadIdx.x] = v_scale_fp8[sc_idx];
             }
@@ -1474,7 +1483,8 @@ __global__ void attn_prefill_wmma_kernel(
     const __nv_bfloat16* __restrict__ sinks,
     __nv_bfloat16* __restrict__ out,
     int start_pos, const int32_t* __restrict__ d_pos, int T, int cache_cap, bool is_local, int window_size,
-    int n_heads, int n_kv_heads, int rel_extent)
+    int n_heads, int n_kv_heads, int rel_extent,
+    const int32_t* __restrict__ block_table)
 {
     extern __shared__ uint8_t smem_raw[];
     // Dynamic SMEM layout (60 KiB total):
@@ -1556,9 +1566,9 @@ __global__ void attn_prefill_wmma_kernel(
             int d8 = idx & 15;
             if (bk < k_len) {
                 int kp = kb + bk;
-                int slot = is_local ? (kp % cache_cap) : kp;
+                int64_t slot = is_local ? (int64_t)(kp % cache_cap) : paged_kv_pos(block_table, kp);
                 if (k_cache_fp8) {
-                    int64_t sc_idx = (int64_t)slot * n_kv_heads + kv_h;
+                    int64_t sc_idx = slot * n_kv_heads + kv_h;
                     float ks = k_scale_fp8[sc_idx];
                     float vs = v_scale_fp8[sc_idx];
                     uint2 ku = reinterpret_cast<const uint2*>(k_cache_fp8 + sc_idx * 128)[d8];
@@ -1714,7 +1724,8 @@ __global__ void attn_prefill_wmma_gqa3_bk64_kernel(
     const __nv_bfloat16* __restrict__ sinks,
     __nv_bfloat16* __restrict__ out,
     int start_pos, const int32_t* __restrict__ d_pos, int T, int cache_cap, bool is_local, int window_size,
-    int n_heads, int n_kv_heads, int rel_extent)
+    int n_heads, int n_kv_heads, int rel_extent,
+    const int32_t* __restrict__ block_table)
 {
     extern __shared__ uint8_t smem_raw[];
     // Dynamic SMEM layout (74 KiB total):
@@ -1793,9 +1804,9 @@ __global__ void attn_prefill_wmma_gqa3_bk64_kernel(
             int d8 = idx & 15;
             if (bk < k_len) {
                 int kp = kb + bk;
-                int slot = is_local ? (kp % cache_cap) : kp;
+                int64_t slot = is_local ? (int64_t)(kp % cache_cap) : paged_kv_pos(block_table, kp);
                 if (k_cache_fp8) {
-                    int64_t sc_idx = (int64_t)slot * n_kv_heads + kv_h;
+                    int64_t sc_idx = slot * n_kv_heads + kv_h;
                     float ks = k_scale_fp8[sc_idx];
                     float vs = v_scale_fp8[sc_idx];
                     uint2 ku = reinterpret_cast<const uint2*>(k_cache_fp8 + sc_idx * 128)[d8];
@@ -1947,7 +1958,8 @@ void launch_attention(
     int start_pos, const int32_t* d_pos, int T, int cache_cap, bool is_local, int window_size,
     int n_heads, int n_kv_heads, int head_dim, int rel_extent, cudaStream_t stream,
     const uint8_t* k_cache_fp8, const uint8_t* v_cache_fp8,
-    const float* k_scale_fp8, const float* v_scale_fp8)
+    const float* k_scale_fp8, const float* v_scale_fp8,
+    const int32_t* block_table)
 {
     if (T == 1) {
         int num_splits = d_pos ? (is_local ? 4 : 8) : 1;
@@ -1960,7 +1972,7 @@ void launch_attention(
             Q, k_cache, v_cache, k_cache_fp8, v_cache_fp8, k_scale_fp8, v_scale_fp8,
             rel_logits, split_scratch,
             start_pos, d_pos, num_splits, cache_cap, is_local, window_size,
-            n_heads, n_kv_heads, head_dim, rel_extent);
+            n_heads, n_kv_heads, head_dim, rel_extent, block_table);
         attn_decode_merge_kernel<<<n_heads, 32, 0, stream>>>(
             split_scratch, gate, sinks, out, num_splits, n_heads, head_dim);
     } else if (T >= 16 && head_dim == 128 && n_heads == n_kv_heads * 3) {
@@ -1974,7 +1986,7 @@ void launch_attention(
             Q, k_cache, v_cache, k_cache_fp8, v_cache_fp8, k_scale_fp8, v_scale_fp8,
             rel_logits, gate, sinks, out,
             start_pos, d_pos, T, cache_cap, is_local, window_size,
-            n_heads, n_kv_heads, rel_extent);
+            n_heads, n_kv_heads, rel_extent, block_table);
     } else if (T >= 16 && head_dim == 128) {
         static bool smem_set = false;
         const size_t smem_bytes = 61440;
@@ -1986,14 +1998,14 @@ void launch_attention(
             Q, k_cache, v_cache, k_cache_fp8, v_cache_fp8, k_scale_fp8, v_scale_fp8,
             rel_logits, gate, sinks, out,
             start_pos, d_pos, T, cache_cap, is_local, window_size,
-            n_heads, n_kv_heads, rel_extent);
+            n_heads, n_kv_heads, rel_extent, block_table);
     } else if (T >= 2 && T <= 15 && head_dim == 128 && n_heads == n_kv_heads * 3 && split_scratch != nullptr) {
         int num_splits = is_local ? 4 : 12;
         attn_small_t_gqa3_split_kernel<<<dim3(n_kv_heads, num_splits), T * 32, 0, stream>>>(
             Q, k_cache, v_cache, k_cache_fp8, v_cache_fp8, k_scale_fp8, v_scale_fp8,
             rel_logits, split_scratch,
             start_pos, d_pos, T, num_splits, cache_cap, is_local, window_size,
-            n_heads, n_kv_heads, rel_extent);
+            n_heads, n_kv_heads, rel_extent, block_table);
         attn_small_t_gqa3_merge_kernel<<<dim3(n_heads, T), 32, 0, stream>>>(
             split_scratch, gate, sinks, out, num_splits, n_heads);
     } else {
@@ -2001,7 +2013,7 @@ void launch_attention(
             Q, k_cache, v_cache, k_cache_fp8, v_cache_fp8, k_scale_fp8, v_scale_fp8,
             rel_logits, gate, sinks, out,
             start_pos, d_pos, T, cache_cap, is_local, window_size,
-            n_heads, n_kv_heads, head_dim, rel_extent);
+            n_heads, n_kv_heads, head_dim, rel_extent, block_table);
     }
 }
 
@@ -3910,7 +3922,8 @@ __global__ void attn_prep_kv_batched_kernel(
     float* __restrict__ v_scale_fp8_pool,
     const int32_t* __restrict__ slot_ids,
     const int32_t* __restrict__ positions,
-    int B, int cache_cap, bool is_local, int n_kv_heads, int head_dim, float qk_clip, float eps)
+    int B, int cache_cap, bool is_local, int n_kv_heads, int head_dim, float qk_clip, float eps,
+    const int32_t* __restrict__ block_tables, int max_blocks_per_seq)
 {
     int h = blockIdx.x;
     int b = blockIdx.y;
@@ -3918,6 +3931,7 @@ __global__ void attn_prep_kv_batched_kernel(
     int slot = slot_ids[b];
     int pos = positions[b];
     int kpos = is_local ? (pos % cache_cap) : pos;
+    const int32_t* bt = (!is_local && block_tables) ? (block_tables + (int64_t)slot * max_blocks_per_seq) : nullptr;
 
     const __nv_bfloat16* kin = K_in + ((int64_t)b * n_kv_heads + h) * head_dim;
     const __nv_bfloat16* vin = V_in + ((int64_t)b * n_kv_heads + h) * head_dim;
@@ -3943,7 +3957,7 @@ __global__ void attn_prep_kv_batched_kernel(
         float ks = __shfl_sync(0xffffffff, warp_reduce_max(km), 0); ks = (ks > 0.0f) ? (ks / 448.0f) : 1.0f;
         float vs = __shfl_sync(0xffffffff, warp_reduce_max(vm), 0); vs = (vs > 0.0f) ? (vs / 448.0f) : 1.0f;
         float inv_ks = 1.0f / ks, inv_vs = 1.0f / vs;
-        int64_t sc_idx = ((int64_t)slot * cache_cap + kpos) * n_kv_heads + h;
+        int64_t sc_idx = (bt ? paged_kv_pos(bt, pos) : ((int64_t)slot * cache_cap + kpos)) * n_kv_heads + h;
         if (threadIdx.x == 0) { k_scale_fp8_pool[sc_idx] = ks; v_scale_fp8_pool[sc_idx] = vs; }
         uint8_t* kdst = k_cache_fp8_pool + sc_idx * head_dim;
         uint8_t* vdst = v_cache_fp8_pool + sc_idx * head_dim;
@@ -3973,14 +3987,16 @@ void launch_attn_prep_batched(
     const int32_t* d_slot_ids, const int32_t* d_positions,
     int B, int cache_cap, bool is_local, int n_heads, int n_kv_heads, int head_dim, int d_rel,
     float qk_clip, float rel_clip, float log_n_floor, float log_alpha, float eps, cudaStream_t stream,
-    uint8_t* k_cache_fp8_pool, uint8_t* v_cache_fp8_pool, float* k_scale_fp8_pool, float* v_scale_fp8_pool)
+    uint8_t* k_cache_fp8_pool, uint8_t* v_cache_fp8_pool, float* k_scale_fp8_pool, float* v_scale_fp8_pool,
+    const int32_t* block_tables, int max_blocks_per_seq)
 {
     attn_prep_q_r_batched_kernel<<<dim3(n_heads, B), 32, 0, stream>>>(
         Q, R, q_scale, r_scale, d_positions, B, is_local, n_heads, head_dim, d_rel,
         qk_clip, rel_clip, log_n_floor, log_alpha);
     attn_prep_kv_batched_kernel<<<dim3(n_kv_heads, B), 32, 0, stream>>>(
         K_in, V_in, k_cache_pool, v_cache_pool, k_cache_fp8_pool, v_cache_fp8_pool, k_scale_fp8_pool, v_scale_fp8_pool,
-        d_slot_ids, d_positions, B, cache_cap, is_local, n_kv_heads, head_dim, qk_clip, eps);
+        d_slot_ids, d_positions, B, cache_cap, is_local, n_kv_heads, head_dim, qk_clip, eps,
+        block_tables, max_blocks_per_seq);
 }
 
 // Batched decode attention: 1 block (4 warps) per (h, b), parallelizing over K positions
@@ -3999,7 +4015,8 @@ __global__ void attn_decode_batched_kernel(
     const int32_t* __restrict__ slot_ids,
     const int32_t* __restrict__ positions,
     int B, int cache_cap, bool is_local, int window_size,
-    int n_heads, int n_kv_heads, int head_dim, int rel_extent)
+    int n_heads, int n_kv_heads, int head_dim, int rel_extent,
+    const int32_t* __restrict__ block_tables, int max_blocks_per_seq)
 {
     int h = blockIdx.x;
     int b = blockIdx.y;
@@ -4007,6 +4024,7 @@ __global__ void attn_decode_batched_kernel(
 
     int slot = slot_ids[b];
     int q_pos = positions[b];
+    const int32_t* bt = (!is_local && block_tables) ? (block_tables + (int64_t)slot * max_blocks_per_seq) : nullptr;
     int k_start = is_local ? max(0, q_pos - window_size + 1) : 0;
     int k_end = q_pos + 1;
     int kv_h = h / (n_heads / n_kv_heads);
@@ -4036,7 +4054,7 @@ __global__ void attn_decode_batched_kernel(
         float dot = 0.0f;
         float vv0, vv1, vv2, vv3;
         if (k_cache_fp8_pool) {
-            int64_t sc_idx = ((int64_t)slot * cache_cap + kslot) * n_kv_heads + kv_h;
+            int64_t sc_idx = (bt ? paged_kv_pos(bt, kp) : ((int64_t)slot * cache_cap + kslot)) * n_kv_heads + kv_h;
             float ks = k_scale_fp8_pool[sc_idx];
             float vs = v_scale_fp8_pool[sc_idx];
             const uint8_t* k_ptr = k_cache_fp8_pool + sc_idx * head_dim;
@@ -4123,7 +4141,8 @@ __global__ void attn_decode_batched_gqa3_kernel(
     const int32_t* __restrict__ slot_ids,
     const int32_t* __restrict__ positions,
     int B, int cache_cap, bool is_local, int window_size,
-    int n_heads, int n_kv_heads, int rel_extent)
+    int n_heads, int n_kv_heads, int rel_extent,
+    const int32_t* __restrict__ block_tables, int max_blocks_per_seq)
 {
     int kv_h = blockIdx.x;
     int b = blockIdx.y;
@@ -4131,6 +4150,7 @@ __global__ void attn_decode_batched_gqa3_kernel(
 
     int slot = slot_ids[b];
     int q_pos = positions[b];
+    const int32_t* bt = (!is_local && block_tables) ? (block_tables + (int64_t)slot * max_blocks_per_seq) : nullptr;
     int k_start = is_local ? max(0, q_pos - window_size + 1) : 0;
     int k_end = q_pos + 1;
 
@@ -4170,7 +4190,7 @@ __global__ void attn_decode_batched_gqa3_kernel(
         float vv0, vv1, vv2, vv3;
         float k_mult = inv_sqrt_d;
         if (k_cache_fp8_pool) {
-            int64_t sc_idx = ((int64_t)slot * cache_cap + kslot) * n_kv_heads + kv_h;
+            int64_t sc_idx = (bt ? paged_kv_pos(bt, kp) : ((int64_t)slot * cache_cap + kslot)) * n_kv_heads + kv_h;
             k_mult *= k_scale_fp8_pool[sc_idx];
             float vs = v_scale_fp8_pool[sc_idx];
             const uint8_t* k_ptr = k_cache_fp8_pool + sc_idx * 128;
@@ -4257,18 +4277,21 @@ void launch_attention_batched(
     int B, int cache_cap, bool is_local, int window_size,
     int n_heads, int n_kv_heads, int head_dim, int rel_extent, cudaStream_t stream,
     const uint8_t* k_cache_fp8_pool, const uint8_t* v_cache_fp8_pool,
-    const float* k_scale_fp8_pool, const float* v_scale_fp8_pool)
+    const float* k_scale_fp8_pool, const float* v_scale_fp8_pool,
+    const int32_t* block_tables, int max_blocks_per_seq)
 {
     if (head_dim == 128 && n_heads == n_kv_heads * 3) {
         attn_decode_batched_gqa3_kernel<<<dim3(n_kv_heads, B), 256, 0, stream>>>(
             Q, k_cache_pool, v_cache_pool, k_cache_fp8_pool, v_cache_fp8_pool, k_scale_fp8_pool, v_scale_fp8_pool,
             rel_logits, gate, sinks, out, d_slot_ids, d_positions,
-            B, cache_cap, is_local, window_size, n_heads, n_kv_heads, rel_extent);
+            B, cache_cap, is_local, window_size, n_heads, n_kv_heads, rel_extent,
+            block_tables, max_blocks_per_seq);
     } else {
         attn_decode_batched_kernel<<<dim3(n_heads, B), 128, 0, stream>>>(
             Q, k_cache_pool, v_cache_pool, k_cache_fp8_pool, v_cache_fp8_pool, k_scale_fp8_pool, v_scale_fp8_pool,
             rel_logits, gate, sinks, out, d_slot_ids, d_positions,
-            B, cache_cap, is_local, window_size, n_heads, n_kv_heads, head_dim, rel_extent);
+            B, cache_cap, is_local, window_size, n_heads, n_kv_heads, head_dim, rel_extent,
+            block_tables, max_blocks_per_seq);
     }
 }
 
@@ -4436,7 +4459,8 @@ __global__ void attn_prep_kv_batch_verify_kernel(
     float* __restrict__ v_scale_fp8_pool,
     const int32_t* __restrict__ slot_ids,
     const int32_t* __restrict__ positions,
-    int B, int L, int cache_cap, bool is_local, int n_kv_heads, int head_dim, float qk_clip, float eps)
+    int B, int L, int cache_cap, bool is_local, int n_kv_heads, int head_dim, float qk_clip, float eps,
+    const int32_t* __restrict__ block_tables, int max_blocks_per_seq)
 {
     int h = blockIdx.x;
     int t = blockIdx.y;
@@ -4446,6 +4470,7 @@ __global__ void attn_prep_kv_batch_verify_kernel(
     int slot = slot_ids[b];
     int pos = positions[b] + j;
     int kpos = is_local ? (pos % cache_cap) : pos;
+    const int32_t* bt = (!is_local && block_tables) ? (block_tables + (int64_t)slot * max_blocks_per_seq) : nullptr;
 
     const __nv_bfloat16* kin = K_in + ((int64_t)t * n_kv_heads + h) * head_dim;
     const __nv_bfloat16* vin = V_in + ((int64_t)t * n_kv_heads + h) * head_dim;
@@ -4471,7 +4496,7 @@ __global__ void attn_prep_kv_batch_verify_kernel(
         float ks = __shfl_sync(0xffffffff, warp_reduce_max(km), 0); ks = (ks > 0.0f) ? (ks / 448.0f) : 1.0f;
         float vs = __shfl_sync(0xffffffff, warp_reduce_max(vm), 0); vs = (vs > 0.0f) ? (vs / 448.0f) : 1.0f;
         float inv_ks = 1.0f / ks, inv_vs = 1.0f / vs;
-        int64_t sc_idx = ((int64_t)slot * cache_cap + kpos) * n_kv_heads + h;
+        int64_t sc_idx = (bt ? paged_kv_pos(bt, pos) : ((int64_t)slot * cache_cap + kpos)) * n_kv_heads + h;
         if (threadIdx.x == 0) { k_scale_fp8_pool[sc_idx] = ks; v_scale_fp8_pool[sc_idx] = vs; }
         uint8_t* kdst = k_cache_fp8_pool + sc_idx * head_dim;
         uint8_t* vdst = v_cache_fp8_pool + sc_idx * head_dim;
@@ -4501,14 +4526,16 @@ void launch_attn_prep_batch_verify(
     const int32_t* d_slot_ids, const int32_t* d_positions,
     int B, int L, int cache_cap, bool is_local, int n_heads, int n_kv_heads, int head_dim, int d_rel,
     float qk_clip, float rel_clip, float log_n_floor, float log_alpha, float eps, cudaStream_t stream,
-    uint8_t* k_cache_fp8_pool, uint8_t* v_cache_fp8_pool, float* k_scale_fp8_pool, float* v_scale_fp8_pool)
+    uint8_t* k_cache_fp8_pool, uint8_t* v_cache_fp8_pool, float* k_scale_fp8_pool, float* v_scale_fp8_pool,
+    const int32_t* block_tables, int max_blocks_per_seq)
 {
     attn_prep_q_r_batch_verify_kernel<<<dim3(n_heads, B * L), 32, 0, stream>>>(
         Q, R, q_scale, r_scale, d_positions, B, L, is_local, n_heads, head_dim, d_rel,
         qk_clip, rel_clip, log_n_floor, log_alpha);
     attn_prep_kv_batch_verify_kernel<<<dim3(n_kv_heads, B * L), 32, 0, stream>>>(
         K_in, V_in, k_cache_pool, v_cache_pool, k_cache_fp8_pool, v_cache_fp8_pool, k_scale_fp8_pool, v_scale_fp8_pool,
-        d_slot_ids, d_positions, B, L, cache_cap, is_local, n_kv_heads, head_dim, qk_clip, eps);
+        d_slot_ids, d_positions, B, L, cache_cap, is_local, n_kv_heads, head_dim, qk_clip, eps,
+        block_tables, max_blocks_per_seq);
 }
 
 __global__ void attn_batch_verify_kernel(
@@ -4526,7 +4553,8 @@ __global__ void attn_batch_verify_kernel(
     const int32_t* __restrict__ slot_ids,
     const int32_t* __restrict__ positions,
     int B, int L, int cache_cap, bool is_local, int window_size,
-    int n_heads, int n_kv_heads, int head_dim, int rel_extent)
+    int n_heads, int n_kv_heads, int head_dim, int rel_extent,
+    const int32_t* __restrict__ block_tables, int max_blocks_per_seq)
 {
     int h = blockIdx.x;
     int t = blockIdx.y;
@@ -4536,6 +4564,7 @@ __global__ void attn_batch_verify_kernel(
     int j = t % L;
     int slot = slot_ids[b];
     int q_pos = positions[b] + j;
+    const int32_t* bt = (!is_local && block_tables) ? (block_tables + (int64_t)slot * max_blocks_per_seq) : nullptr;
     int k_start = is_local ? max(0, q_pos - window_size + 1) : 0;
     int k_end = q_pos + 1;
     int kv_h = h / (n_heads / n_kv_heads);
@@ -4565,7 +4594,7 @@ __global__ void attn_batch_verify_kernel(
         float dot = 0.0f;
         float vv0, vv1, vv2, vv3;
         if (k_cache_fp8_pool) {
-            int64_t sc_idx = ((int64_t)slot * cache_cap + kslot) * n_kv_heads + kv_h;
+            int64_t sc_idx = (bt ? paged_kv_pos(bt, kp) : ((int64_t)slot * cache_cap + kslot)) * n_kv_heads + kv_h;
             float ks = k_scale_fp8_pool[sc_idx];
             float vs = v_scale_fp8_pool[sc_idx];
             const uint8_t* k_ptr = k_cache_fp8_pool + sc_idx * head_dim;
@@ -4650,7 +4679,8 @@ __global__ void attn_batch_verify_gqa3_split_kernel(
     const int32_t* __restrict__ slot_ids,
     const int32_t* __restrict__ positions,
     int B, int L, int num_splits, int cache_cap, bool is_local, int window_size,
-    int n_heads, int n_kv_heads, int rel_extent)
+    int n_heads, int n_kv_heads, int rel_extent,
+    const int32_t* __restrict__ block_tables, int max_blocks_per_seq)
 {
     int kb = blockIdx.x;
     int s = blockIdx.y;
@@ -4662,6 +4692,7 @@ __global__ void attn_batch_verify_gqa3_split_kernel(
 
     int slot = slot_ids[b];
     int sp = positions[b];
+    const int32_t* bt = (!is_local && block_tables) ? (block_tables + (int64_t)slot * max_blocks_per_seq) : nullptr;
     int blk_k_start = is_local ? max(0, sp - window_size + 1) : 0;
     int blk_k_end = sp + L;
     int total_k = blk_k_end - blk_k_start;
@@ -4711,14 +4742,14 @@ __global__ void attn_batch_verify_gqa3_split_kernel(
                 int col = idx & 7;
                 int kp = k_base + kk;
                 int kslot = is_local ? (kp % cache_cap) : kp;
-                int64_t sc_idx = ((int64_t)slot * cache_cap + kslot) * n_kv_heads + kv_h;
+                int64_t sc_idx = (bt ? paged_kv_pos(bt, kp) : ((int64_t)slot * cache_cap + kslot)) * n_kv_heads + kv_h;
                 reinterpret_cast<uint4*>(sm_k.u8[kk])[col] = reinterpret_cast<const uint4*>(k_cache_fp8_pool + sc_idx * 128)[col];
                 reinterpret_cast<uint4*>(sm_v.u8[kk])[col] = reinterpret_cast<const uint4*>(v_cache_fp8_pool + sc_idx * 128)[col];
             }
             if (threadIdx.x < tile_len) {
                 int kp = k_base + threadIdx.x;
                 int kslot = is_local ? (kp % cache_cap) : kp;
-                int64_t sc_idx = ((int64_t)slot * cache_cap + kslot) * n_kv_heads + kv_h;
+                int64_t sc_idx = (bt ? paged_kv_pos(bt, kp) : ((int64_t)slot * cache_cap + kslot)) * n_kv_heads + kv_h;
                 sm_ks[threadIdx.x] = k_scale_fp8_pool[sc_idx];
                 sm_vs[threadIdx.x] = v_scale_fp8_pool[sc_idx];
             }
@@ -4804,21 +4835,24 @@ void launch_attention_batch_verify(
     int n_heads, int n_kv_heads, int head_dim, int rel_extent, cudaStream_t stream,
     const uint8_t* k_cache_fp8_pool, const uint8_t* v_cache_fp8_pool,
     const float* k_scale_fp8_pool, const float* v_scale_fp8_pool,
-    float* split_scratch)
+    float* split_scratch,
+    const int32_t* block_tables, int max_blocks_per_seq)
 {
     if (head_dim == 128 && n_heads == n_kv_heads * 3 && B * L <= 16 && L <= 8 && split_scratch != nullptr) {
         int num_splits = is_local ? 4 : max(2, min(12, 48 / (n_kv_heads * B)));
         attn_batch_verify_gqa3_split_kernel<<<dim3(n_kv_heads * B, num_splits), L * 32, 0, stream>>>(
             Q, k_cache_pool, v_cache_pool, k_cache_fp8_pool, v_cache_fp8_pool, k_scale_fp8_pool, v_scale_fp8_pool,
             rel_logits, split_scratch, d_slot_ids, d_positions,
-            B, L, num_splits, cache_cap, is_local, window_size, n_heads, n_kv_heads, rel_extent);
+            B, L, num_splits, cache_cap, is_local, window_size, n_heads, n_kv_heads, rel_extent,
+            block_tables, max_blocks_per_seq);
         attn_small_t_gqa3_merge_kernel<<<dim3(n_heads, B * L), 32, 0, stream>>>(
             split_scratch, gate, sinks, out, num_splits, n_heads);
     } else {
         attn_batch_verify_kernel<<<dim3(n_heads, B * L), 128, 0, stream>>>(
             Q, k_cache_pool, v_cache_pool, k_cache_fp8_pool, v_cache_fp8_pool, k_scale_fp8_pool, v_scale_fp8_pool,
             rel_logits, gate, sinks, out, d_slot_ids, d_positions,
-            B, L, cache_cap, is_local, window_size, n_heads, n_kv_heads, head_dim, rel_extent);
+            B, L, cache_cap, is_local, window_size, n_heads, n_kv_heads, head_dim, rel_extent,
+            block_tables, max_blocks_per_seq);
     }
 }
 

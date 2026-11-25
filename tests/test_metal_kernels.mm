@@ -565,6 +565,11 @@ static void test_attention_fp8_splitk() {
     id<MTLBuffer> bOutSplit = g_ctx.buf(T * n_heads * head_dim * 2);
     id<MTLBuffer> bPartML = g_ctx.buf(T * n_heads * num_splits * 2 * 4);
     id<MTLBuffer> bPartAcc = g_ctx.buf(T * n_heads * num_splits * head_dim * 4);
+    const uint32_t num_blks = (S + 63u) / 64u;
+    id<MTLBuffer> bBlockTable = g_ctx.buf(num_blks * sizeof(int32_t));
+    // Reversed block table to verify paged global KV indirection across all 4 Metal FP8 kernels!
+    int32_t* bt_ptr = (int32_t*)bBlockTable.contents;
+    for (uint32_t b = 0; b < num_blks; ++b) bt_ptr[b] = (int32_t)(num_blks - 1u - b);
 
     uint16_t* kr = (uint16_t*)bKraw.contents;
     uint16_t* vr = (uint16_t*)bVraw.contents;
@@ -606,6 +611,7 @@ static void test_attention_fp8_splitk() {
     [enc setBuffer:bKsc offset:0 atIndex:4];
     [enc setBuffer:bVsc offset:0 atIndex:5];
     [enc setBytes:&kvp length:sizeof(kvp) atIndex:6];
+    [enc setBuffer:bBlockTable offset:0 atIndex:7];
     [enc dispatchThreadgroups:MTLSizeMake(n_kv_heads, S, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 
     uint32_t start_pos = S - T;
@@ -621,6 +627,7 @@ static void test_attention_fp8_splitk() {
     [enc setBuffer:bSinks offset:0 atIndex:7];
     [enc setBuffer:bOutRef offset:0 atIndex:8];
     [enc setBytes:&ap length:sizeof(ap) atIndex:9];
+    [enc setBuffer:bBlockTable offset:0 atIndex:10];
     [enc dispatchThreadgroups:MTLSizeMake(n_heads, T, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 
     AttnSplitKParams skp{start_pos, T, S, 0u, 128u, n_heads, n_kv_heads, head_dim, rel_extent, num_splits};
@@ -634,6 +641,7 @@ static void test_attention_fp8_splitk() {
     [enc setBuffer:bPartML offset:0 atIndex:6];
     [enc setBuffer:bPartAcc offset:0 atIndex:7];
     [enc setBytes:&skp length:sizeof(skp) atIndex:8];
+    [enc setBuffer:bBlockTable offset:0 atIndex:9];
     [enc dispatchThreadgroups:MTLSizeMake(n_heads, T, num_splits) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 
     [enc setComputePipelineState:p_red];
@@ -673,6 +681,7 @@ static void test_attention_fp8_splitk() {
     [enc2 setBuffer:bSinks offset:0 atIndex:7];
     [enc2 setBuffer:bOutFlash offset:0 atIndex:8];
     [enc2 setBytes:&ap length:sizeof(ap) atIndex:9];
+    [enc2 setBuffer:bBlockTable offset:0 atIndex:10];
     [enc2 dispatchThreadgroups:MTLSizeMake(n_heads, (T + 15u) / 16u, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     [enc2 endEncoding];
     EXPECT_TRUE(g_ctx.run_cb(cb2));

@@ -18,6 +18,9 @@ public:
     int max_slots = 8;
     int max_seq_len = 32768;
     int max_batch_tokens = 2048;
+    int max_blocks_per_seq = 0;
+    int num_kv_blocks = 0;
+    int num_snapshots = 0;
 
     int draft_k = 0;
     std::string draft_vocab_file;
@@ -36,6 +39,9 @@ public:
     void reset_cache(int slot_id = 0);
     void save_prefill_snapshot(int slot_id);
     void restore_prefill_snapshot(int slot_id);
+    void save_boundary_snapshot(int slot_id, int snap_id);
+    void restore_boundary_snapshot(int slot_id, int snap_id);
+    void set_slot_block_table(int slot_id, const int32_t* blocks, int num_blocks);
 
     int32_t forward_and_greedy(const int32_t* h_tokens, int T, int start_pos, int slot_id = 0);
 

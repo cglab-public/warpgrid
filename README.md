@@ -89,7 +89,7 @@ Measured end-to-end over the live OpenAI-compatible HTTP/SSE server (`./warpgrid
 - **2-Row/SIMDgroup W8A16 FP8 & Deduplicated Small-Batch MoE (Apple Metal):** Hits **94%** of M5 Max's `465.69 GB/s` DRAM bandwidth on the 200K LM head (`1.05 ms`), with grouped `simdgroup_matrix` MoE prefill, FlashAttention-2 FP8 prefill, Split-K FP8 decode, and runtime MSL fallback for Macs without Xcode.
 - **Compact `Q3_G64` / `Q2_G64` Native MoE Quantizer (`scripts/quantize_q2.py`):** Activation-`imatrix` Lloyd-Max bit-split 3-bit (`Q3_G64`, 3.5 bpw) and 2-bit (`Q2_G64`, 2.5 bpw) MoE weights (`18×Q3_G64 + 6×Q2_G64`) + automatic `low_mem` BF16-dense release (−1.2 GiB), delivering **90.0% HumanEval Pass@1 (93.8% retention vs 18 GiB NVFP4)** and **25.45 tok/s** coding with DFlash 2 on a **16 GB Apple M4 Mac mini** (**+58%** vs `llama.cpp` `IQ2_XXS`).
 - **Full-Step CUDA Graphs:** Captured per-`T` (`1..8`) single-slot verify, per-`B` (`1..8`) parallel decode, batched `B=2` speculative verify, and graphed DSpark / DFlash 2 drafting.
-- **Exact Prefix Caching:** Per-slot end-of-prefill snapshots (local SWA ring + conv states) delivering **9.4×–656.9×** warm TTFT speedups and reporting `usage.prompt_tokens_details.cached_tokens`.
+- **Paged Radix Prefix Cache & Chunked Prefill Interleaving:** Block-size 64 paged FP8 global KV with cross-slot refcounted sharing, LRU eviction, leader/follower concurrent prefix deduplication, and chunked prefill interleaving — delivering **9.4×–656.9×** warm TTFT speedups and **`1.58s` vs `80.49s` (51×) TTFT separation** on `c=8 @ 30K` (4 shared / 4 unshared, `99.87%` cross-slot cache hit) while reporting `usage.prompt_tokens_details.cached_tokens`.
 
 ---
 
@@ -192,8 +192,8 @@ Optional authentication: pass `--api-key <key>` or set `WARPGRID_API_KEY=<key>` 
 
 - ~~**Apple Metal Backend:**~~ Shipped (`src/metal/`, zero-Python/zero-MLX, M3/M4/M5 + 16 GB `Q2_G64`).
 - ~~**DFlash 2 Block-Diffusion Speculative Drafting:**~~ Shipped on both Apple Metal and NVIDIA Blackwell CUDA.
+- ~~**Paged Radix Prefix Cache & Chunked Prefill Interleaving:**~~ Shipped (`src/prefix_cache.hpp`, block-size 64 paged FP8 global KV on CUDA & Metal, leader/follower concurrent prefix sharing, chunked prefill interleaving).
 - **Multi-Model Support:** Generalize beyond `Inkling-2-Mini` to additional NVFP4 / MoE / dense Transformer families.
-- **Paged Radix Prefix Cache & Chunked Prefill Interleaving:** Cross-slot shared system prompts and zero-stall decode during 100K+ incoming prefills.
 
 ---
 

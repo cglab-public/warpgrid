@@ -2,6 +2,7 @@
 #include "auth.hpp"
 #include "json.hpp"
 #include "model.hpp"
+#include "prefix_cache.hpp"
 #include "telemetry.hpp"
 #include "tokenizer.hpp"
 #include <arpa/inet.h>
@@ -46,7 +47,13 @@ class OpenAIServer {
         int slot_id = -1;
         int pos = 0;
         int cached_tokens = 0;
-        bool use_prefill_snap = false;
+        int32_t hit_snap_id = -1;
+        int shared_checkpoint_pos = 0;
+        bool prefill_initialized = false;
+        bool prefill_done = false;
+        bool can_commit_ds = false;
+        int cp_shared = 0;
+        int cp_end = 0;
         int generated = 0;
         int32_t last_tok = 0;
         bool dspark_ready = false;
@@ -175,10 +182,23 @@ class OpenAIServer {
         std::vector<bool> slot_used(max_slots, false);
         std::vector<bool> slot_dspark_valid(max_slots, false);
         std::vector<int> slot_dspark_written(max_slots, 0);
-        std::vector<std::vector<int32_t>> slot_full_tokens(max_slots);
-        std::vector<std::vector<int32_t>> slot_prefill_tokens(max_slots);
+        std::vector<std::vector<int32_t>> slot_blocks(max_slots);
+        RadixPrefixCache prefix_cache;
+        prefix_cache.init(model_.num_kv_blocks, model_.num_snapshots);
         std::vector<std::shared_ptr<RequestState>> active;
         std::vector<float> logits;
+
+        auto ensure_blocks = [&](int sid, int end_pos) -> bool {
+            int needed = (end_pos + kKvBlockSize - 1) / kKvBlockSize;
+            if ((int)slot_blocks[sid].size() >= needed) return true;
+            while ((int)slot_blocks[sid].size() < needed) {
+                int32_t blk = prefix_cache.alloc_block();
+                if (blk < 0) return false;
+                slot_blocks[sid].push_back(blk);
+            }
+            model_.set_slot_block_table(sid, slot_blocks[sid].data(), (int)slot_blocks[sid].size());
+            return true;
+        };
 
         auto publish_slot = [&](const std::shared_ptr<RequestState>& r) {
             SlotTelemetry st;
@@ -191,139 +211,231 @@ class OpenAIServer {
             metrics_.update_slot(st);
         };
         auto release_slot = [&](int sid) {
+            prefix_cache.release_slot_blocks(slot_blocks[sid]);
             slot_used[sid] = false;
             metrics_.clear_slot(sid);
         };
 
-        auto is_strict_prefix = [](const std::vector<int32_t>& cached, const std::vector<int32_t>& prompt) -> int {
-            if (cached.empty() || cached.size() >= prompt.size()) return 0;
-            for (size_t i = 0; i < cached.size(); ++i) {
-                if (cached[i] != prompt[i]) return 0;
+        auto has_active_leader = [&]() -> bool {
+            for (const auto& r : active) {
+                if (!r->prefill_done && r->shared_checkpoint_pos > 0 && r->pos < r->shared_checkpoint_pos) {
+                    return true;
+                }
             }
-            return (int)cached.size();
+            return false;
         };
 
         while (!stop_worker_) {
-            // 1. Admit pending requests into free slots (choosing best prefix-cache match!)
+            // 1. Admit pending requests into free slots using cross-slot paged RadixPrefixCache!
             {
                 std::unique_lock<std::mutex> lk(sched_mu_);
                 if (active.empty() && pending_.empty()) {
                     sched_cv_.wait(lk, [&]() { return stop_worker_ || !pending_.empty(); });
                     if (stop_worker_) break;
                 }
-                while (!pending_.empty() && (int)active.size() < max_slots) {
-                    auto req = pending_.front();
-                    int best_slot = -1;
-                    int best_hit = 0;
-                    bool best_snap = false;
+                while (!pending_.empty() && (int)active.size() < max_slots && !has_active_leader()) {
                     int first_free = -1;
                     for (int s = 0; s < max_slots; ++s) {
-                        if (slot_used[s]) continue;
-                        if (first_free < 0) first_free = s;
-                        int h_full = is_strict_prefix(slot_full_tokens[s], req->prompt_ids);
-                        if (h_full > best_hit) { best_hit = h_full; best_slot = s; best_snap = false; }
-                        int h_pre = is_strict_prefix(slot_prefill_tokens[s], req->prompt_ids);
-                        if (h_pre > best_hit) { best_hit = h_pre; best_slot = s; best_snap = true; }
+                        if (!slot_used[s]) { first_free = s; break; }
                     }
                     if (first_free < 0) break;
-                    pending_.pop_front();
-                    int chosen = (best_slot >= 0) ? best_slot : first_free;
-                    slot_used[chosen] = true;
-                    req->slot_id = chosen;
-                    req->cached_tokens = best_hit;
-                    req->use_prefill_snap = best_snap;
+
+                    // Pick the pending request with the smallest remaining uncached prefill
+                    // (so cache-hit requests aren't head-of-line blocked behind cold 30K prefills!).
+                    size_t best_idx = 0;
+                    int best_rem = std::numeric_limits<int>::max();
+                    int best_peek_hit = 0;
+                    for (size_t i = 0; i < pending_.size(); ++i) {
+                        int hit = prefix_cache.peek_prefix_hit(pending_[i]->prompt_ids);
+                        int rem = (int)pending_[i]->prompt_ids.size() - hit;
+                        if (rem < best_rem) {
+                            best_rem = rem;
+                            best_idx = i;
+                            best_peek_hit = hit;
+                        }
+                    }
+
+                    auto req = pending_[best_idx];
+                    int peek_hit = best_peek_hit;
+                    // Leader/follower detection: if another queued request shares a longer uncached
+                    // prefix with `req`, admit `req` alone first so it prefills and publishes that
+                    // shared prefix before followers are admitted!
+                    int shared_lcp = 0;
+                    for (size_t j = 0; j < pending_.size(); ++j) {
+                        if (j == best_idx) continue;
+                        int lcp = compute_lcp_aligned(req->prompt_ids, pending_[j]->prompt_ids);
+                        if (lcp > peek_hit && lcp > shared_lcp) shared_lcp = lcp;
+                    }
+
+                    pending_.erase(pending_.begin() + (ptrdiff_t)best_idx);
+                    PrefixMatch match = prefix_cache.acquire_prefix(req->prompt_ids);
+                    slot_used[first_free] = true;
+                    slot_blocks[first_free] = std::move(match.phys_blocks);
+                    req->slot_id = first_free;
+                    req->cached_tokens = match.hit_tokens;
+                    req->hit_snap_id = match.snap_id;
+                    req->shared_checkpoint_pos = shared_lcp;
+                    if (!slot_blocks[first_free].empty()) {
+                        model_.set_slot_block_table(first_free, slot_blocks[first_free].data(),
+                                                    (int)slot_blocks[first_free].size());
+                    }
                     active.push_back(req);
                     metrics_.on_dequeue();
                     publish_slot(req);
+                    if (shared_lcp > peek_hit) {
+                        // Break so leader prefills & checkpoints shared_lcp before admitting followers
+                        break;
+                    }
                 }
             }
 
-            // 2. Prefill any newly admitted requests (pos == 0)
-            for (auto it = active.begin(); it != active.end(); ) {
-                auto& r = *it;
-                if (r->pos > 0) { ++it; continue; }
+            // 2. Chunked Prefill Interleaving:
+            //    - Finish any tiny remaining prefills (<= 1 chunk, e.g. cache hits & short prompts) immediately.
+            //    - If any request just finished prefill (generated < 4), go straight to decode so it emits
+            //      its first visible SSE token without waiting behind a cold 30K prefill chunk.
+            //    - Otherwise run ONE prefill chunk (max_chunk) on ONE prefilling request (leader first),
+            //      then interleave batched decode steps for all ready-to-decode slots!
+            int chunk = model_.max_batch_tokens;
+            bool did_heavy_chunk = false;
+            bool defer_heavy_for_ttft = false;
+            for (const auto& r : active) {
+                if (r->prefill_done && r->generated < 4) { defer_heavy_for_ttft = true; break; }
+            }
+
+            for (size_t idx = 0; idx < active.size(); ) {
+                auto& r = active[idx];
+                if (r->prefill_done) { ++idx; continue; }
                 int plen = (int)r->prompt_ids.size();
-                if (plen + r->max_tokens > model_.max_seq_len) {
-                    r->mark_done("prompt + max_tokens exceeds max_seq_len");
-                    release_slot(r->slot_id);
-                    it = active.erase(it);
-                    continue;
-                }
-                int p = r->cached_tokens;
-                if (p > 0) {
-                    if (r->use_prefill_snap) {
-                        model_.restore_prefill_snapshot(r->slot_id);
+
+                if (!r->prefill_initialized) {
+                    if (plen + r->max_tokens > model_.max_seq_len) {
+                        if (r->hit_snap_id >= 0) {
+                            prefix_cache.release_snapshot_pin(r->hit_snap_id);
+                            r->hit_snap_id = -1;
+                        }
+                        r->mark_done("prompt + max_tokens exceeds max_seq_len");
+                        release_slot(r->slot_id);
+                        active.erase(active.begin() + (ptrdiff_t)idx);
+                        continue;
                     }
-                } else {
-                    model_.reset_cache(r->slot_id);
-                }
-                bool can_commit_ds = false;
-                if (r->slot_id < model_.max_dspark_slots() && model_.draft_k > 0) {
-                    if (r->cached_tokens == 0) {
+                    if (!ensure_blocks(r->slot_id, plen)) {
+                        if (r->hit_snap_id >= 0) {
+                            prefix_cache.release_snapshot_pin(r->hit_snap_id);
+                            r->hit_snap_id = -1;
+                        }
+                        r->mark_done("KV cache block pool exhausted");
+                        release_slot(r->slot_id);
+                        active.erase(active.begin() + (ptrdiff_t)idx);
+                        continue;
+                    }
+                    if (r->cached_tokens > 0) {
+                        model_.restore_boundary_snapshot(r->slot_id, r->hit_snap_id);
+                        prefix_cache.release_snapshot_pin(r->hit_snap_id);
+                        r->hit_snap_id = -1;
+                        slot_dspark_valid[r->slot_id] = false;
+                        r->pos = r->cached_tokens;
+                    } else {
+                        model_.reset_cache(r->slot_id);
+                        r->pos = 0;
+                    }
+                    r->can_commit_ds = false;
+                    if (r->slot_id < model_.max_dspark_slots() && model_.draft_k > 0 && r->cached_tokens == 0) {
                         slot_dspark_valid[r->slot_id] = true;
                         slot_dspark_written[r->slot_id] = 0;
-                        can_commit_ds = true;
-                    } else if (!r->use_prefill_snap && slot_dspark_valid[r->slot_id] &&
-                               slot_dspark_written[r->slot_id] == r->cached_tokens) {
-                        can_commit_ds = true;
-                    } else if (r->use_prefill_snap && slot_dspark_valid[r->slot_id] &&
-                               slot_dspark_written[r->slot_id] < (model_.dflash2_dir.empty() ? 1024 : 2048)) {
-                        can_commit_ds = true;
-                    } else {
-                        slot_dspark_valid[r->slot_id] = false;
+                        r->can_commit_ds = true;
                     }
+                    r->cp_shared = (r->shared_checkpoint_pos > r->pos && r->shared_checkpoint_pos < plen)
+                        ? r->shared_checkpoint_pos : 0;
+                    r->cp_end = (plen > kKvBlockSize)
+                        ? (((plen - 1) / kKvBlockSize) * kKvBlockSize) : 0;
+                    if (r->cp_end <= r->pos) r->cp_end = 0;
+                    r->prefill_initialized = true;
                 }
-                int chunk = model_.max_batch_tokens;
-                int32_t first_tok = 0;
-                std::mt19937 rng(r->seed);
-                while (p < plen) {
-                    int n = std::min(chunk, plen - p);
-                    bool last = (p + n == plen);
-                    if (last && r->temperature > 0.0f) {
-                        model_.forward_logits(r->prompt_ids.data() + p, n, p, logits, r->slot_id);
-                        first_tok = sample_token(logits, r->temperature, r->top_p, rng);
-                    } else {
-                        first_tok = model_.forward_and_greedy(r->prompt_ids.data() + p, n, p, r->slot_id);
-                    }
-                    if (can_commit_ds) {
-                        model_.commit_dspark_context(n, p, r->slot_id);
-                        slot_dspark_written[r->slot_id] = p + n;
-                        r->dspark_ready = true;
-                    }
-                    p += n;
-                    r->pos = p;
-                    publish_slot(r);
-                }
-                model_.save_prefill_snapshot(r->slot_id);
-                slot_prefill_tokens[r->slot_id] = r->prompt_ids;
-                slot_full_tokens[r->slot_id] = r->prompt_ids;
 
-                r->pos = plen;
-                r->last_tok = first_tok;
-                r->generated = 1;
-                r->push_token(first_tok);
-                publish_slot(r);
-                if (first_tok == tok_.eos_id || r->generated >= r->max_tokens) {
-                    r->mark_done();
-                    release_slot(r->slot_id);
-                    it = active.erase(it);
-                } else {
-                    ++it;
+                int rem = plen - r->pos;
+                bool is_tiny = (rem <= chunk);
+                bool is_leader = (r->cp_shared > 0 && r->pos < r->cp_shared);
+                if (!is_tiny) {
+                    if (did_heavy_chunk || defer_heavy_for_ttft) { ++idx; continue; }
+                    if (has_active_leader() && !is_leader) { ++idx; continue; }
                 }
+
+                int p = r->pos;
+                int n = std::min(chunk, plen - p);
+                if (r->cp_shared > 0 && p < r->cp_shared && p + n > r->cp_shared) {
+                    n = r->cp_shared - p;
+                } else if (r->cp_end > 0 && p < r->cp_end && p + n > r->cp_end) {
+                    n = r->cp_end - p;
+                }
+                bool last = (p + n == plen);
+                int32_t first_tok = 0;
+                if (last && r->temperature > 0.0f) {
+                    std::mt19937 rng(r->seed);
+                    model_.forward_logits(r->prompt_ids.data() + p, n, p, logits, r->slot_id);
+                    first_tok = sample_token(logits, r->temperature, r->top_p, rng);
+                } else {
+                    first_tok = model_.forward_and_greedy(r->prompt_ids.data() + p, n, p, r->slot_id);
+                }
+                if (r->can_commit_ds) {
+                    model_.commit_dspark_context(n, p, r->slot_id);
+                    slot_dspark_written[r->slot_id] = p + n;
+                    r->dspark_ready = true;
+                }
+                p += n;
+                r->pos = p;
+                publish_slot(r);
+
+                if ((r->cp_shared > 0 && p == r->cp_shared) || (r->cp_end > 0 && p == r->cp_end)) {
+                    int32_t sid = prefix_cache.alloc_snapshot();
+                    if (sid >= 0) model_.save_boundary_snapshot(r->slot_id, sid);
+                    prefix_cache.publish_prefix(r->prompt_ids, p / kKvBlockSize,
+                                                slot_blocks[r->slot_id], sid);
+                    model_.set_slot_block_table(r->slot_id, slot_blocks[r->slot_id].data(),
+                                                (int)slot_blocks[r->slot_id].size());
+                }
+                if (!is_tiny) did_heavy_chunk = true;
+
+                if (last) {
+                    r->prefill_done = true;
+                    r->last_tok = first_tok;
+                    r->generated = 1;
+                    r->push_token(first_tok);
+                    publish_slot(r);
+                    defer_heavy_for_ttft = true;
+                    if (first_tok == tok_.eos_id || r->generated >= r->max_tokens) {
+                        r->mark_done();
+                        release_slot(r->slot_id);
+                        active.erase(active.begin() + (ptrdiff_t)idx);
+                        continue;
+                    }
+                }
+                ++idx;
             }
 
             if (active.empty()) continue;
 
-            // If more requests arrived while we were prefilling and we have free slots, admit & prefill them first!
+            // Collect ready-to-decode slots
+            std::vector<size_t> dec_indices;
+            dec_indices.reserve(active.size());
+            for (size_t i = 0; i < active.size(); ++i) {
+                if (active[i]->prefill_done) dec_indices.push_back(i);
+            }
+            bool any_prefilling = (dec_indices.size() < active.size());
+
+            // If more requests arrived and we have free slots (and aren't waiting on a leader),
+            // admit them before decoding unless we have new decoders waiting for their first visible token!
             bool has_pending = false;
             {
                 std::lock_guard<std::mutex> lk(sched_mu_);
                 has_pending = !pending_.empty();
             }
-            if (has_pending && (int)active.size() < max_slots) continue;
+            if (dec_indices.empty()) continue;
+            if (has_pending && (int)active.size() < max_slots && !has_active_leader() && !defer_heavy_for_ttft) {
+                continue;
+            }
 
             // 3. Single active request on slot 0 with DSpark enabled -> speculative decode!
-            if (active.size() == 1 && !has_pending && active[0]->slot_id == 0 &&
+            if (!any_prefilling && active.size() == 1 && !has_pending && active[0]->slot_id == 0 &&
                 active[0]->dspark_ready && model_.draft_k > 0 && active[0]->temperature <= 0.0f)
             {
                 auto& r = active[0];
@@ -342,6 +454,12 @@ class OpenAIServer {
                     continue;
                 }
                 int32_t drafts[8], verify_in[8], verify_out[8];
+                if (!ensure_blocks(r->slot_id, r->pos + cur_k + 1)) {
+                    r->mark_done("KV cache block pool exhausted");
+                    release_slot(r->slot_id);
+                    active.clear();
+                    continue;
+                }
                 model_.draft_tokens(r->last_tok, r->pos, cur_k, drafts, 0);
                 verify_in[0] = r->last_tok;
                 for (int j = 0; j < cur_k; ++j) verify_in[j + 1] = drafts[j];
@@ -364,10 +482,6 @@ class OpenAIServer {
                 if (emitted < cur_k + 1) model_.rollback_conv_states(emitted);
                 model_.commit_dspark_context(emitted, r->pos);
                 slot_dspark_written[r->slot_id] = r->pos + emitted;
-                // Record the `emitted` tokens that were committed to slot 0's KV/conv cache
-                for (int j = 0; j < emitted; ++j) {
-                    slot_full_tokens[r->slot_id].push_back(verify_in[j]);
-                }
 
                 bool done = false;
                 for (int j = 0; j < acc && !done && r->generated < r->max_tokens; ++j) {
@@ -392,9 +506,7 @@ class OpenAIServer {
             }
 
             // 3b. Batched DSpark speculative decode for B = 1..2 active sequences on DSpark slots (0..1)!
-            // (Physics crossover verified in r24: at B>=3, k=1 adds ~6ms draft overhead + 1.6-2x MoE expert fanout,
-            //  making standard B=3..8 parallel decode +17% faster: 110.40 vs 92.17 agg at c=8.)
-            if (active.size() >= 1 && active.size() <= 2 && !has_pending && model_.draft_k > 0) {
+            if (!any_prefilling && active.size() >= 1 && active.size() <= 2 && !has_pending && model_.draft_k > 0) {
                 int B = (int)active.size();
                 bool all_ds = true;
                 int min_rem = 1000000;
@@ -413,6 +525,11 @@ class OpenAIServer {
                     int32_t drafts[8][8];
                     int32_t verify_in[16], verify_out[16];
                     int32_t h_slots[8], h_pos[8];
+                    bool blocks_ok = true;
+                    for (int b = 0; b < B; ++b) {
+                        if (!ensure_blocks(active[b]->slot_id, active[b]->pos + L)) { blocks_ok = false; break; }
+                    }
+                    if (blocks_ok) {
                     for (int b = 0; b < B; ++b) {
                         auto& r = active[b];
                         h_slots[b] = r->slot_id;
@@ -438,9 +555,6 @@ class OpenAIServer {
                         if (emitted < L) model_.rollback_conv_states(emitted, r->slot_id);
                         model_.commit_dspark_context(emitted, r->pos, r->slot_id, b * L);
                         slot_dspark_written[r->slot_id] = r->pos + emitted;
-                        for (int j = 0; j < emitted; ++j) {
-                            slot_full_tokens[r->slot_id].push_back(verify_in[b * L + j]);
-                        }
                         bool done = false;
                         for (int j = 0; j < acc && !done && r->generated < r->max_tokens; ++j) {
                             r->push_token(drafts[b][j]);
@@ -462,40 +576,62 @@ class OpenAIServer {
                         }
                     }
                     continue;
+                    }
                 }
             }
 
-            // 4. Parallel continuous-batching decode step across ALL B active sequences!
-            // (Invalidate dspark_ready on slot 0 since batched decode doesn't update DSpark KV)
-            int B = (int)active.size();
-            int32_t h_toks[8], h_slots[8], h_pos[8], h_out[8];
-            for (int b = 0; b < B; ++b) {
-                active[b]->dspark_ready = false;
-                slot_dspark_valid[active[b]->slot_id] = false;
-                h_toks[b] = active[b]->last_tok;
-                h_slots[b] = active[b]->slot_id;
-                h_pos[b] = active[b]->pos;
-                slot_full_tokens[active[b]->slot_id].push_back(active[b]->last_tok);
-            }
-            model_.forward_batch_decode_greedy(h_toks, h_slots, h_pos, B, h_out);
-
-            for (int b = B - 1; b >= 0; --b) {
-                auto& r = active[b];
-                if (r->cancelled) {
-                    r->mark_done();
-                    release_slot(r->slot_id);
-                    active.erase(active.begin() + b);
-                    continue;
+            // 4. Parallel continuous-batching decode step across ALL ready-to-decode sequences!
+            // When prefilling slots are interleaved, run up to 4 decode steps per chunk so newly
+            // finished cache-hit requests emit their first visible token immediately and stream smoothly.
+            int decode_burst = any_prefilling ? 4 : 1;
+            for (int step = 0; step < decode_burst; ++step) {
+                std::vector<size_t> batch_idx;
+                batch_idx.reserve(active.size());
+                for (size_t i = 0; i < active.size(); ++i) {
+                    if (active[i]->prefill_done) batch_idx.push_back(i);
                 }
-                r->last_tok = h_out[b];
-                r->pos += 1;
-                r->generated += 1;
-                r->push_token(r->last_tok);
-                publish_slot(r);
-                if (r->last_tok == tok_.eos_id || r->generated >= r->max_tokens) {
-                    r->mark_done();
-                    release_slot(r->slot_id);
-                    active.erase(active.begin() + b);
+                for (int k = (int)batch_idx.size() - 1; k >= 0; --k) {
+                    auto& r = active[batch_idx[k]];
+                    if (!ensure_blocks(r->slot_id, r->pos + 1)) {
+                        r->mark_done("KV cache block pool exhausted");
+                        release_slot(r->slot_id);
+                        active.erase(active.begin() + (ptrdiff_t)batch_idx[k]);
+                        batch_idx.erase(batch_idx.begin() + k);
+                        for (size_t m = (size_t)k; m < batch_idx.size(); ++m) batch_idx[m]--;
+                    }
+                }
+                if (batch_idx.empty()) break;
+                int B = (int)batch_idx.size();
+                int32_t h_toks[8], h_slots[8], h_pos[8], h_out[8];
+                for (int b = 0; b < B; ++b) {
+                    auto& r = active[batch_idx[b]];
+                    r->dspark_ready = false;
+                    slot_dspark_valid[r->slot_id] = false;
+                    h_toks[b] = r->last_tok;
+                    h_slots[b] = r->slot_id;
+                    h_pos[b] = r->pos;
+                }
+                model_.forward_batch_decode_greedy(h_toks, h_slots, h_pos, B, h_out);
+
+                for (int b = B - 1; b >= 0; --b) {
+                    size_t ai = batch_idx[b];
+                    auto& r = active[ai];
+                    if (r->cancelled) {
+                        r->mark_done();
+                        release_slot(r->slot_id);
+                        active.erase(active.begin() + (ptrdiff_t)ai);
+                        continue;
+                    }
+                    r->last_tok = h_out[b];
+                    r->pos += 1;
+                    r->generated += 1;
+                    r->push_token(r->last_tok);
+                    publish_slot(r);
+                    if (r->last_tok == tok_.eos_id || r->generated >= r->max_tokens) {
+                        r->mark_done();
+                        release_slot(r->slot_id);
+                        active.erase(active.begin() + (ptrdiff_t)ai);
+                    }
                 }
             }
         }
@@ -734,11 +870,7 @@ class OpenAIServer {
                             return;
                         }
                     }
-                    auto cl_pos = hdrs.find("Content-Length:");
-                    if (cl_pos == std::string_view::npos) cl_pos = hdrs.find("content-length:");
-                    if (cl_pos != std::string_view::npos) {
-                        content_len = (size_t)std::strtoull(buf.c_str() + cl_pos + 15, nullptr, 10);
-                    }
+                    content_len = parse_content_length(hdrs);
                 }
             }
             if (header_end != std::string::npos && buf.size() >= header_end + 4 + content_len) break;
