@@ -108,8 +108,10 @@ struct DsLayerWeights {
     WeightBuf ffn_gate_dense;
     WeightBuf ffn_up_dense;
     WeightBuf ffn_down_dense;
+    id<MTLBuffer> hc_attn_pre = nil;
     id<MTLBuffer> hc_attn_mat = nil;
     id<MTLBuffer> hc_attn_post = nil;
+    id<MTLBuffer> hc_ffn_pre = nil;
     id<MTLBuffer> hc_ffn_mat = nil;
     id<MTLBuffer> hc_ffn_post = nil;
 };
@@ -129,6 +131,7 @@ struct DeepSeekV41Model::Impl {
 
     WeightBuf lm_head;
     id<MTLBuffer> output_norm = nil;
+    id<MTLBuffer> default_hc_pre = nil;
     std::vector<DsLayerWeights> layers;
     std::vector<DsLayerKv> kv_caches;
     std::vector<std::vector<int32_t>> slot_tok_history;
@@ -353,6 +356,11 @@ void DeepSeekV41Model::load(const std::string& model_path, int max_seq, int max_
     impl_->kv_caches.resize((size_t)cfg.num_hidden_layers);
     impl_->slot_tok_history.assign((size_t)max_slots, {});
     impl_->has_mhc = false;
+    {
+        size_t hc_m = (size_t)std::max(1, cfg.hc_mult);
+        impl_->default_hc_pre = impl_->alloc_buf(hc_m * sizeof(float));
+        static_cast<float*>(impl_->default_hc_pre.contents)[0] = 1.0f;
+    }
     size_t kv_layer_bytes = (size_t)max_slots * (size_t)max_seq_len * (size_t)cfg.num_key_value_heads * (size_t)cfg.head_dim * sizeof(float);
 
     for (int l = 0; l < cfg.num_hidden_layers; ++l) {
@@ -389,11 +397,17 @@ void DeepSeekV41Model::load(const std::string& model_path, int max_seq, int max_
 
         size_t hc_m = (size_t)std::max(1, cfg.hc_mult);
         if (gguf.has_tensor(p + "hc_attn_mat.weight")) {
+            lw.hc_attn_pre = gguf.has_tensor(p + "hc_attn_pre.weight")
+                ? impl_->load_f32_1d(gguf, p + "hc_attn_pre.weight", hc_m, 0.0f)
+                : impl_->default_hc_pre;
             lw.hc_attn_mat = impl_->load_f32_1d(gguf, p + "hc_attn_mat.weight", hc_m * hc_m, 0.0f);
             lw.hc_attn_post = impl_->load_f32_1d(gguf, p + "hc_attn_post.weight", hc_m, 1.0f / (float)hc_m);
             impl_->has_mhc = true;
         }
         if (gguf.has_tensor(p + "hc_ffn_mat.weight")) {
+            lw.hc_ffn_pre = gguf.has_tensor(p + "hc_ffn_pre.weight")
+                ? impl_->load_f32_1d(gguf, p + "hc_ffn_pre.weight", hc_m, 0.0f)
+                : impl_->default_hc_pre;
             lw.hc_ffn_mat = impl_->load_f32_1d(gguf, p + "hc_ffn_mat.weight", hc_m * hc_m, 0.0f);
             lw.hc_ffn_post = impl_->load_f32_1d(gguf, p + "hc_ffn_post.weight", hc_m, 1.0f / (float)hc_m);
             impl_->has_mhc = true;
@@ -590,8 +604,9 @@ void DeepSeekV41Model::forward_logits(const int32_t* h_tokens, int T, int start_
             DsStreamCollapseParams scp{(uint32_t)T, (uint32_t)D, (uint32_t)std::max(1, cfg.hc_mult)};
             [enc setComputePipelineState:impl_->pso("ds_mhc_collapse_f32")];
             [enc setBuffer:impl_->b_streams_a offset:0 atIndex:0];
-            [enc setBuffer:impl_->b_hidden offset:0 atIndex:1];
-            [enc setBytes:&scp length:sizeof(scp) atIndex:2];
+            [enc setBuffer:(lw.hc_ffn_pre != nil ? lw.hc_ffn_pre : impl_->default_hc_pre) offset:0 atIndex:1];
+            [enc setBuffer:impl_->b_hidden offset:0 atIndex:2];
+            [enc setBytes:&scp length:sizeof(scp) atIndex:3];
             [enc dispatchThreads:MTLSizeMake((uint32_t)D, (uint32_t)T, 1)
                 threadsPerThreadgroup:MTLSizeMake(std::min<uint32_t>(64u, (uint32_t)D), 1, 1)];
         } else {
@@ -706,11 +721,15 @@ void DeepSeekV41Model::forward_logits(const int32_t* h_tokens, int T, int start_
             [enc setBytes:&mp length:sizeof(mp) atIndex:5];
             [enc dispatchThreadgroups:MTLSizeMake(((uint32_t)D + 63u) / 64u, (uint32_t)T, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
             std::swap(impl_->b_streams_a, impl_->b_streams_b);
+            id<MTLBuffer> next_pre = ((l + 1) < cfg.num_hidden_layers && impl_->layers[(size_t)(l + 1)].hc_attn_pre != nil)
+                ? impl_->layers[(size_t)(l + 1)].hc_attn_pre
+                : impl_->default_hc_pre;
             DsStreamCollapseParams scp{(uint32_t)T, (uint32_t)D, (uint32_t)std::max(1, cfg.hc_mult)};
             [enc setComputePipelineState:impl_->pso("ds_mhc_collapse_f32")];
             [enc setBuffer:impl_->b_streams_a offset:0 atIndex:0];
-            [enc setBuffer:impl_->b_hidden offset:0 atIndex:1];
-            [enc setBytes:&scp length:sizeof(scp) atIndex:2];
+            [enc setBuffer:next_pre offset:0 atIndex:1];
+            [enc setBuffer:impl_->b_hidden offset:0 atIndex:2];
+            [enc setBytes:&scp length:sizeof(scp) atIndex:3];
             [enc dispatchThreads:MTLSizeMake((uint32_t)D, (uint32_t)T, 1)
                 threadsPerThreadgroup:MTLSizeMake(std::min<uint32_t>(64u, (uint32_t)D), 1, 1)];
         } else {

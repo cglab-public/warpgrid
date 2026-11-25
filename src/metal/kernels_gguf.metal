@@ -679,17 +679,18 @@ kernel void ds_mhc_expand_f32(
 
 kernel void ds_mhc_collapse_f32(
     device const float* streams [[buffer(0)]],
-    device float* hidden [[buffer(1)]],
-    constant DsStreamCollapseParams& p [[buffer(2)]],
+    device const float* h_pre [[buffer(1)]],
+    device float* hidden [[buffer(2)]],
+    constant DsStreamCollapseParams& p [[buffer(3)]],
     uint2 gid [[thread_position_in_grid]]) {
     uint d = gid.x;
     uint t = gid.y;
     if (d >= p.D || t >= p.T) return;
     float acc = 0.0f;
     for (uint r = 0; r < p.hc_mult; ++r) {
-        acc += streams[(ulong(t) * p.hc_mult + r) * p.D + d];
+        acc += h_pre[r] * streams[(ulong(t) * p.hc_mult + r) * p.D + d];
     }
-    hidden[ulong(t) * p.D + d] = acc / float(max(1u, p.hc_mult));
+    hidden[ulong(t) * p.D + d] = acc;
 }
 
 kernel void ds_swiglu_f32(

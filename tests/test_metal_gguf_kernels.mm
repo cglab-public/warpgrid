@@ -616,6 +616,30 @@ static void test_ds_mhc_sinkhorn_doubly_stochastic() {
             }
         }
     }
+
+    std::vector<float> h_pre = {1.0f, 0.0f, 0.0f, 0.0f};
+    id<MTLComputePipelineState> pcol = g_ctx.pso("ds_mhc_collapse_f32");
+    EXPECT_TRUE(pcol != nil);
+    id<MTLBuffer> bpre = [g_ctx.dev newBufferWithBytes:h_pre.data() length:h_pre.size() * sizeof(float) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> bhid = [g_ctx.dev newBufferWithLength:(size_t)T * D * sizeof(float) options:MTLResourceStorageModeShared];
+    struct { uint32_t T; uint32_t D; uint32_t hc_mult; } scp{T, D, M};
+    id<MTLCommandBuffer> cb2 = [g_ctx.q commandBuffer];
+    id<MTLComputeCommandEncoder> enc2 = [cb2 computeCommandEncoder];
+    [enc2 setComputePipelineState:pcol];
+    [enc2 setBuffer:bout offset:0 atIndex:0];
+    [enc2 setBuffer:bpre offset:0 atIndex:1];
+    [enc2 setBuffer:bhid offset:0 atIndex:2];
+    [enc2 setBytes:&scp length:sizeof(scp) atIndex:3];
+    [enc2 dispatchThreads:MTLSizeMake(D, T, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    [enc2 endEncoding];
+    [cb2 commit];
+    [cb2 waitUntilCompleted];
+    const float* hid = static_cast<const float*>(bhid.contents);
+    for (uint32_t t = 0; t < T; ++t) {
+        for (uint32_t d = 0; d < D; ++d) {
+            EXPECT_TRUE(std::abs(hid[t * D + d] - out[(t * M + 0) * D + d]) < 1e-5f);
+        }
+    }
 }
 
 static void test_ds_router_topk6_sigmoid_bias() {
