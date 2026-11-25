@@ -1,6 +1,6 @@
 UNAME_S := $(shell uname -s)
 TARGET := warpgrid
-COMMON_HDRS := src/auth.hpp src/cli.hpp src/config.hpp src/engram.hpp src/gguf.hpp src/json.hpp src/model_backend.hpp src/prefix_cache.hpp src/safetensors.hpp src/telemetry.hpp src/model.hpp src/tokenizer.hpp src/server.hpp
+COMMON_HDRS := src/auth.hpp src/cli.hpp src/config.hpp src/deepseek_config.hpp src/engram.hpp src/gguf.hpp src/json.hpp src/model_backend.hpp src/prefix_cache.hpp src/safetensors.hpp src/telemetry.hpp src/model.hpp src/tokenizer.hpp src/server.hpp
 
 ifeq ($(UNAME_S),Darwin)
 CXX := clang++
@@ -46,16 +46,19 @@ src/metal/kernels_gguf_source_embed.hpp: src/metal/kernels_gguf.metal
 	xxd -i src/metal/kernels_gguf.metal | sed -e 's/unsigned char .*=/static const unsigned char kGgufMetalSourceBytes[] =/' -e 's/unsigned int .*=/static const unsigned int kGgufMetalSourceLen =/' > src/metal/kernels_gguf_source_embed.hpp
 endif
 
-src/main.o: src/main.cpp $(COMMON_HDRS) src/metal/model_metal.hpp
+src/main.o: src/main.cpp $(COMMON_HDRS) src/metal/model_metal.hpp src/metal/deepseek_v41_metal.hpp
 	$(CXX) $(CXXFLAGS) -c src/main.cpp -o src/main.o
 
 src/metal/model_metal.o: src/metal/model_metal.mm src/metal/model_metal.hpp $(METAL_EMBED_HDR) $(COMMON_HDRS)
 	$(CXX) $(OBJCXXFLAGS) -c src/metal/model_metal.mm -o src/metal/model_metal.o
 
-$(TARGET): src/main.o src/metal/model_metal.o
-	$(CXX) src/main.o src/metal/model_metal.o -o $(TARGET) $(LDFLAGS)
+src/metal/deepseek_v41_metal.o: src/metal/deepseek_v41_metal.mm src/metal/deepseek_v41_metal.hpp $(GGUF_METAL_EMBED_HDR) $(COMMON_HDRS)
+	$(CXX) $(OBJCXXFLAGS) -c src/metal/deepseek_v41_metal.mm -o src/metal/deepseek_v41_metal.o
 
-tests/test_host: tests/test_host.cpp src/auth.hpp src/cli.hpp src/config.hpp src/engram.hpp src/gguf.hpp src/json.hpp src/model_backend.hpp src/prefix_cache.hpp src/safetensors.hpp src/telemetry.hpp src/tokenizer.hpp
+$(TARGET): src/main.o src/metal/model_metal.o src/metal/deepseek_v41_metal.o
+	$(CXX) src/main.o src/metal/model_metal.o src/metal/deepseek_v41_metal.o -o $(TARGET) $(LDFLAGS)
+
+tests/test_host: tests/test_host.cpp src/auth.hpp src/cli.hpp src/config.hpp src/deepseek_config.hpp src/engram.hpp src/gguf.hpp src/json.hpp src/model_backend.hpp src/prefix_cache.hpp src/safetensors.hpp src/telemetry.hpp src/tokenizer.hpp
 	$(CXX) $(CXXFLAGS) tests/test_host.cpp -o tests/test_host
 
 tests/test_metal_kernels: tests/test_metal_kernels.mm $(METAL_EMBED_HDR)
@@ -70,7 +73,7 @@ test: tests/test_host tests/test_metal_kernels tests/test_metal_gguf_kernels
 	./tests/test_metal_gguf_kernels
 
 clean:
-	rm -f $(TARGET) src/main.o src/metal/model_metal.o src/metal/kernels.air src/metal/kernels.metallib src/metal/kernels_metallib_embed.hpp src/metal/kernels_source_embed.hpp src/metal/kernels_gguf.air src/metal/kernels_gguf.metallib src/metal/kernels_gguf_metallib_embed.hpp src/metal/kernels_gguf_source_embed.hpp tests/test_host tests/test_metal_kernels tests/test_metal_gguf_kernels
+	rm -f $(TARGET) src/main.o src/metal/model_metal.o src/metal/deepseek_v41_metal.o src/metal/kernels.air src/metal/kernels.metallib src/metal/kernels_metallib_embed.hpp src/metal/kernels_source_embed.hpp src/metal/kernels_gguf.air src/metal/kernels_gguf.metallib src/metal/kernels_gguf_metallib_embed.hpp src/metal/kernels_gguf_source_embed.hpp tests/test_host tests/test_metal_kernels tests/test_metal_gguf_kernels
 
 else
 NVCC ?= /usr/local/cuda/bin/nvcc
@@ -85,7 +88,7 @@ all: $(TARGET)
 $(TARGET): $(SRCS) $(COMMON_HDRS) src/kernels.cuh src/dspark.hpp
 	$(NVCC) $(CXXFLAGS) -gencode arch=compute_121a,code=sm_121a $(SRCS) -o $(TARGET) $(LDFLAGS)
 
-tests/test_host: tests/test_host.cpp src/auth.hpp src/cli.hpp src/config.hpp src/engram.hpp src/gguf.hpp src/json.hpp src/model_backend.hpp src/prefix_cache.hpp src/safetensors.hpp src/telemetry.hpp src/tokenizer.hpp
+tests/test_host: tests/test_host.cpp src/auth.hpp src/cli.hpp src/config.hpp src/deepseek_config.hpp src/engram.hpp src/gguf.hpp src/json.hpp src/model_backend.hpp src/prefix_cache.hpp src/safetensors.hpp src/telemetry.hpp src/tokenizer.hpp
 	g++ -O3 -std=c++20 -pthread -Wall -DWARPGRID_METAL tests/test_host.cpp -o tests/test_host
 
 tests/test_dflash2_cuda: tests/test_dflash2_cuda.cu src/dspark.cu src/kernels.cu src/dspark.hpp src/kernels.cuh $(COMMON_HDRS)

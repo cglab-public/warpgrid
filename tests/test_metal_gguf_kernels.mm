@@ -80,6 +80,32 @@ struct GgufMoeParams {
     uint32_t expert_stride_bytes;
 };
 
+struct DsMhcParams {
+    uint32_t T;
+    uint32_t D;
+    uint32_t hc_mult;
+    uint32_t sinkhorn_iters;
+    float eps;
+};
+
+struct DsRouterParams {
+    uint32_t T;
+    uint32_t E;
+    uint32_t top_k;
+    uint32_t has_bias;
+    float route_scale;
+};
+
+struct DsAttnParams {
+    uint32_t T;
+    uint32_t start_pos;
+    uint32_t n_heads;
+    uint32_t n_kv_heads;
+    uint32_t head_dim;
+    uint32_t max_seq;
+    float scale;
+};
+
 struct MetalGgufCtx {
     id<MTLDevice> dev = nil;
     id<MTLCommandQueue> q = nil;
@@ -523,6 +549,183 @@ static void test_gguf_moe_topk6_accumulate() {
     }
 }
 
+static void test_ds_mhc_sinkhorn_doubly_stochastic() {
+    const uint32_t T = 2, D = 32, M = 4, ITERS = 20;
+    std::vector<float> streams((size_t)T * M * D);
+    std::vector<float> sublayer((size_t)T * D);
+    for (size_t i = 0; i < streams.size(); ++i) streams[i] = std::sin((float)(i + 1) * 0.19f);
+    for (size_t i = 0; i < sublayer.size(); ++i) sublayer[i] = std::cos((float)(i + 2) * 0.11f);
+
+    std::vector<float> h_logits = {
+         0.5f, -0.2f,  0.1f,  0.3f,
+        -0.1f,  0.6f, -0.3f,  0.2f,
+         0.2f, -0.1f,  0.7f, -0.2f,
+         0.0f,  0.3f, -0.1f,  0.8f
+    };
+    std::vector<float> h_post = {0.25f, 0.25f, 0.25f, 0.25f};
+
+    std::vector<float> mat(M * M);
+    for (size_t i = 0; i < M * M; ++i) mat[i] = std::exp(h_logits[i]);
+    for (uint32_t it = 0; it < ITERS; ++it) {
+        for (uint32_t r = 0; r < M; ++r) {
+            float s = 1e-6f;
+            for (uint32_t c = 0; c < M; ++c) s += mat[r * M + c];
+            for (uint32_t c = 0; c < M; ++c) mat[r * M + c] /= s;
+        }
+        for (uint32_t c = 0; c < M; ++c) {
+            float s = 1e-6f;
+            for (uint32_t r = 0; r < M; ++r) s += mat[r * M + c];
+            for (uint32_t r = 0; r < M; ++r) mat[r * M + c] /= s;
+        }
+    }
+
+    id<MTLComputePipelineState> p = g_ctx.pso("ds_mhc_sinkhorn_mix");
+    EXPECT_TRUE(p != nil);
+    id<MTLBuffer> bs = [g_ctx.dev newBufferWithBytes:streams.data() length:streams.size() * sizeof(float) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> bsub = [g_ctx.dev newBufferWithBytes:sublayer.data() length:sublayer.size() * sizeof(float) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> bmat = [g_ctx.dev newBufferWithBytes:h_logits.data() length:h_logits.size() * sizeof(float) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> bpost = [g_ctx.dev newBufferWithBytes:h_post.data() length:h_post.size() * sizeof(float) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> bout = [g_ctx.dev newBufferWithLength:streams.size() * sizeof(float) options:MTLResourceStorageModeShared];
+    DsMhcParams params{T, D, M, ITERS, 1e-6f};
+
+    id<MTLCommandBuffer> cb = [g_ctx.q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:p];
+    [enc setBuffer:bs offset:0 atIndex:0];
+    [enc setBuffer:bsub offset:0 atIndex:1];
+    [enc setBuffer:bmat offset:0 atIndex:2];
+    [enc setBuffer:bpost offset:0 atIndex:3];
+    [enc setBuffer:bout offset:0 atIndex:4];
+    [enc setBytes:&params length:sizeof(params) atIndex:5];
+    [enc dispatchThreadgroups:MTLSizeMake((D + 63) / 64, T, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    [enc endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+
+    const float* out = static_cast<const float*>(bout.contents);
+    for (uint32_t t = 0; t < T; ++t) {
+        for (uint32_t r = 0; r < M; ++r) {
+            for (uint32_t d = 0; d < D; ++d) {
+                float ref = h_post[r] * sublayer[t * D + d];
+                for (uint32_t c = 0; c < M; ++c) {
+                    ref += mat[r * M + c] * streams[(t * M + c) * D + d];
+                }
+                EXPECT_TRUE(std::abs(out[(t * M + r) * D + d] - ref) < 1e-4f);
+            }
+        }
+    }
+}
+
+static void test_ds_router_topk6_sigmoid_bias() {
+    const uint32_t T = 2, E = 32, K = 6;
+    std::vector<float> logits((size_t)T * E);
+    std::vector<float> bias(E);
+    for (size_t i = 0; i < logits.size(); ++i) logits[i] = std::sin((float)(i + 1) * 0.37f) * 2.0f;
+    for (size_t i = 0; i < E; ++i) bias[i] = std::cos((float)(i + 3) * 0.23f) * 0.2f;
+
+    id<MTLComputePipelineState> p = g_ctx.pso("ds_router_topk_f32");
+    EXPECT_TRUE(p != nil);
+    id<MTLBuffer> bl = [g_ctx.dev newBufferWithBytes:logits.data() length:logits.size() * sizeof(float) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> bb = [g_ctx.dev newBufferWithBytes:bias.data() length:bias.size() * sizeof(float) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> bids = [g_ctx.dev newBufferWithLength:(size_t)T * K * sizeof(int32_t) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> bw = [g_ctx.dev newBufferWithLength:(size_t)T * K * sizeof(float) options:MTLResourceStorageModeShared];
+    DsRouterParams params{T, E, K, 1, 1.0f};
+
+    id<MTLCommandBuffer> cb = [g_ctx.q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:p];
+    [enc setBuffer:bl offset:0 atIndex:0];
+    [enc setBuffer:bb offset:0 atIndex:1];
+    [enc setBuffer:bids offset:0 atIndex:2];
+    [enc setBuffer:bw offset:0 atIndex:3];
+    [enc setBytes:&params length:sizeof(params) atIndex:4];
+    [enc dispatchThreadgroups:MTLSizeMake(T, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    [enc endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+
+    const int32_t* ids = static_cast<const int32_t*>(bids.contents);
+    const float* weights = static_cast<const float*>(bw.contents);
+    for (uint32_t t = 0; t < T; ++t) {
+        std::vector<std::pair<float, int32_t>> scored(E);
+        std::vector<float> sig(E);
+        for (uint32_t e = 0; e < E; ++e) {
+            sig[e] = 1.0f / (1.0f + std::exp(-logits[t * E + e]));
+            scored[e] = {sig[e] + bias[e], (int32_t)e};
+        }
+        std::sort(scored.begin(), scored.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+        float sum = 1e-20f;
+        for (uint32_t k = 0; k < K; ++k) sum += sig[(size_t)scored[k].second];
+        for (uint32_t k = 0; k < K; ++k) {
+            EXPECT_TRUE(ids[t * K + k] == scored[k].second);
+            float ref_w = sig[(size_t)scored[k].second] / sum;
+            EXPECT_TRUE(std::abs(weights[t * K + k] - ref_w) < 1e-4f);
+        }
+    }
+}
+
+static void test_ds_csa_hca_causal_attention() {
+    const uint32_t T = 3, H = 4, HKV = 2, HD = 16, MAX_SEQ = 8;
+    std::vector<float> q((size_t)T * H * HD);
+    std::vector<float> k_cache((size_t)MAX_SEQ * HKV * HD, 0.0f);
+    std::vector<float> v_cache((size_t)MAX_SEQ * HKV * HD, 0.0f);
+    for (size_t i = 0; i < q.size(); ++i) q[i] = std::sin((float)(i + 1) * 0.21f);
+    for (uint32_t p = 0; p < T; ++p) {
+        for (uint32_t j = 0; j < HKV * HD; ++j) {
+            k_cache[(size_t)p * HKV * HD + j] = std::cos((float)(p * 17 + j + 1) * 0.13f);
+            v_cache[(size_t)p * HKV * HD + j] = std::sin((float)(p * 11 + j + 2) * 0.17f);
+        }
+    }
+
+    id<MTLComputePipelineState> pso = g_ctx.pso("ds_csa_hca_attn_f32");
+    EXPECT_TRUE(pso != nil);
+    id<MTLBuffer> bq = [g_ctx.dev newBufferWithBytes:q.data() length:q.size() * sizeof(float) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> bk = [g_ctx.dev newBufferWithBytes:k_cache.data() length:k_cache.size() * sizeof(float) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> bv = [g_ctx.dev newBufferWithBytes:v_cache.data() length:v_cache.size() * sizeof(float) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> bo = [g_ctx.dev newBufferWithLength:q.size() * sizeof(float) options:MTLResourceStorageModeShared];
+    float scale = 1.0f / std::sqrt((float)HD);
+    DsAttnParams params{T, 0, H, HKV, HD, MAX_SEQ, scale};
+
+    id<MTLCommandBuffer> cb = [g_ctx.q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:bq offset:0 atIndex:0];
+    [enc setBuffer:bk offset:0 atIndex:1];
+    [enc setBuffer:bv offset:0 atIndex:2];
+    [enc setBuffer:bo offset:0 atIndex:3];
+    [enc setBytes:&params length:sizeof(params) atIndex:4];
+    [enc dispatchThreadgroups:MTLSizeMake(H, T, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    [enc endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+
+    const float* out = static_cast<const float*>(bo.contents);
+    for (uint32_t t = 0; t < T; ++t) {
+        for (uint32_t h = 0; h < H; ++h) {
+            uint32_t kvh = h / (H / HKV);
+            std::vector<float> scores(t + 1);
+            float mx = -1e30f;
+            for (uint32_t s = 0; s <= t; ++s) {
+                float dot = 0.0f;
+                for (uint32_t d = 0; d < HD; ++d) {
+                    dot += q[(t * H + h) * HD + d] * k_cache[(s * HKV + kvh) * HD + d];
+                }
+                scores[s] = dot * scale;
+                if (scores[s] > mx) mx = scores[s];
+            }
+            float denom = 0.0f;
+            for (uint32_t s = 0; s <= t; ++s) { scores[s] = std::exp(scores[s] - mx); denom += scores[s]; }
+            for (uint32_t d = 0; d < HD; ++d) {
+                float ref = 0.0f;
+                for (uint32_t s = 0; s <= t; ++s) {
+                    ref += (scores[s] / denom) * v_cache[(s * HKV + kvh) * HD + d];
+                }
+                EXPECT_TRUE(std::abs(out[(t * H + h) * HD + d] - ref) < 1e-4f);
+            }
+        }
+    }
+}
+
 int main() {
     @autoreleasepool {
         if (!g_ctx.init()) {
@@ -537,6 +740,9 @@ int main() {
         run_test("test_gguf_gemv_q6_k", test_gguf_gemv_q6_k);
         run_test("test_gguf_gemv_q2_k", test_gguf_gemv_q2_k);
         run_test("test_gguf_moe_topk6_accumulate", test_gguf_moe_topk6_accumulate);
+        run_test("test_ds_mhc_sinkhorn_doubly_stochastic", test_ds_mhc_sinkhorn_doubly_stochastic);
+        run_test("test_ds_router_topk6_sigmoid_bias", test_ds_router_topk6_sigmoid_bias);
+        run_test("test_ds_csa_hca_causal_attention", test_ds_csa_hca_causal_attention);
         printf("GGUF Metal kernel tests: %d passed, %d failed\n", g_passed, g_failed);
         return g_failed == 0 ? 0 : 1;
     }

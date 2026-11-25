@@ -1,6 +1,9 @@
 #include "cli.hpp"
 #include "model.hpp"
 #include "model_backend.hpp"
+#ifdef WARPGRID_METAL
+#include "metal/deepseek_v41_metal.hpp"
+#endif
 #include "server.hpp"
 #include "tokenizer.hpp"
 #include <chrono>
@@ -27,26 +30,36 @@ int main(int argc, char** argv) {
 
     try {
         ink::ModelFormat fmt = ink::detect_model_format(opts.model_dir);
-        if (fmt == ink::ModelFormat::GgufDeepSeekV41) {
-            if (!opts.served_name_explicit) opts.served_name = "DeepSeek-V4.1-Flash";
-            throw std::runtime_error("GGUF DeepSeek-V4.1-Flash backend is not yet enabled in this build");
-        }
         if (fmt == ink::ModelFormat::Unknown) {
             throw std::runtime_error("Unsupported or missing model path: " + opts.model_dir);
         }
 
         ink::Tokenizer tok;
-        tok.load(opts.model_dir + "/tokenizer.json");
+        std::unique_ptr<ink::ModelBackend> model;
 
-        std::unique_ptr<ink::ModelBackend> model = std::make_unique<ink::Inkling2Model>();
-        model->use_bf16_gemv = !opts.no_gemv;
-        model->use_cuda_graph = !opts.no_graph;
-        model->draft_k = (opts.draft_k == 0 && !opts.dflash2_dir.empty()) ? 7 : opts.draft_k;
-        model->draft_vocab_file = opts.draft_vocab_file;
-        model->dflash2_dir = opts.dflash2_dir;
-        model->engram_path = opts.engram_path;
-        model->moe_group_thresh = opts.moe_group_thresh;
-        model->load(opts.model_dir, opts.max_seq, opts.max_chunk, opts.max_slots);
+        if (fmt == ink::ModelFormat::GgufDeepSeekV41) {
+            if (!opts.served_name_explicit) opts.served_name = "DeepSeek-V4.1-Flash";
+#ifdef WARPGRID_METAL
+            auto ds = std::make_unique<ink::DeepSeekV41Model>();
+            ds->engram_path = opts.engram_path;
+            ds->load(opts.model_dir, opts.max_seq, opts.max_chunk, opts.max_slots);
+            ds->load_tokenizer(tok);
+            model = std::move(ds);
+#else
+            throw std::runtime_error("GGUF DeepSeek-V4.1-Flash backend is currently enabled on Apple Metal only (CUDA port in Story 6)");
+#endif
+        } else {
+            tok.load(opts.model_dir + "/tokenizer.json");
+            model = std::make_unique<ink::Inkling2Model>();
+            model->use_bf16_gemv = !opts.no_gemv;
+            model->use_cuda_graph = !opts.no_graph;
+            model->draft_k = (opts.draft_k == 0 && !opts.dflash2_dir.empty()) ? 7 : opts.draft_k;
+            model->draft_vocab_file = opts.draft_vocab_file;
+            model->dflash2_dir = opts.dflash2_dir;
+            model->engram_path = opts.engram_path;
+            model->moe_group_thresh = opts.moe_group_thresh;
+            model->load(opts.model_dir, opts.max_seq, opts.max_chunk, opts.max_slots);
+        }
 
         if (!opts.dump_imatrix_path.empty()) {
 #ifdef WARPGRID_METAL

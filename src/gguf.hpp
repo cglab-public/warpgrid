@@ -505,10 +505,10 @@ class GgufFile {
         }
 
         sh.data_offset = (c.pos + alignment - 1) & ~(alignment - 1);
-        if (sh.data_offset > sh.file_size) {
+        if (!shard_tensors.empty() && sh.data_offset > sh.file_size) {
             throw std::runtime_error("GGUF data offset out of bounds in: " + path);
         }
-        size_t data_avail = sh.file_size - sh.data_offset;
+        size_t data_avail = (sh.data_offset <= sh.file_size) ? (sh.file_size - sh.data_offset) : 0;
         for (const auto& ti : shard_tensors) {
             if (ti.offset > data_avail || ti.nbytes > data_avail - (size_t)ti.offset) {
                 throw std::runtime_error("Tensor data out of bounds in GGUF: " + ti.name);

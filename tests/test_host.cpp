@@ -1,6 +1,7 @@
 #include "../src/auth.hpp"
 #include "../src/cli.hpp"
 #include "../src/config.hpp"
+#include "../src/deepseek_config.hpp"
 #include "../src/engram.hpp"
 #include "../src/gguf.hpp"
 #include "../src/json.hpp"
@@ -860,6 +861,83 @@ static void test_engram_nvme_mmap_dequant_and_cache() {
     ::unlink(p_iq4.c_str());
 }
 
+static void test_deepseek_config_from_gguf() {
+    std::string pid_str = std::to_string((int)getpid());
+    std::string p = "/tmp/warpgrid_dscfg_" + pid_str + ".gguf";
+    {
+        std::ofstream f(p, std::ios::binary);
+        f.write("GGUF", 4);
+        write_u32_le(f, 3);
+        write_u64_le(f, 0);
+        write_u64_le(f, 11);
+
+        write_gguf_str(f, "general.architecture");
+        write_u32_le(f, 8);
+        write_gguf_str(f, "deepseek41");
+
+        write_gguf_str(f, "deepseek41.block_count");
+        write_u32_le(f, 4);
+        write_u32_le(f, 40);
+
+        write_gguf_str(f, "deepseek41.embedding_length");
+        write_u32_le(f, 4);
+        write_u32_le(f, 4096);
+
+        write_gguf_str(f, "deepseek41.vocab_size");
+        write_u32_le(f, 4);
+        write_u32_le(f, 129280);
+
+        write_gguf_str(f, "deepseek41.attention.head_count");
+        write_u32_le(f, 4);
+        write_u32_le(f, 32);
+
+        write_gguf_str(f, "deepseek41.attention.head_count_kv");
+        write_u32_le(f, 4);
+        write_u32_le(f, 8);
+
+        write_gguf_str(f, "deepseek41.expert_count");
+        write_u32_le(f, 4);
+        write_u32_le(f, 384);
+
+        write_gguf_str(f, "deepseek41.expert_used_count");
+        write_u32_le(f, 4);
+        write_u32_le(f, 6);
+
+        write_gguf_str(f, "deepseek41.expert_shared_count");
+        write_u32_le(f, 4);
+        write_u32_le(f, 1);
+
+        write_gguf_str(f, "deepseek41.hyper_connection.count");
+        write_u32_le(f, 4);
+        write_u32_le(f, 4);
+
+        write_gguf_str(f, "deepseek41.hyper_connection.sinkhorn_iterations");
+        write_u32_le(f, 4);
+        write_u32_le(f, 20);
+    }
+
+    ink::GgufFile gf;
+    gf.open(p);
+    auto cfg = ink::DeepSeekConfig::from_gguf(gf);
+    ::unlink(p.c_str());
+
+    EXPECT_EQ(cfg.arch, std::string("deepseek41"));
+    EXPECT_EQ(cfg.num_hidden_layers, 40);
+    EXPECT_EQ(cfg.encoder_layers, 20);
+    EXPECT_EQ(cfg.hidden_size, 4096);
+    EXPECT_EQ(cfg.vocab_size, 129280);
+    EXPECT_EQ(cfg.num_attention_heads, 32);
+    EXPECT_EQ(cfg.num_key_value_heads, 8);
+    EXPECT_EQ(cfg.n_routed_experts, 384);
+    EXPECT_EQ(cfg.num_experts_per_tok, 6);
+    EXPECT_EQ(cfg.n_shared_experts, 1);
+    EXPECT_EQ(cfg.hc_mult, 4);
+    EXPECT_EQ(cfg.hc_sinkhorn_iters, 20);
+    EXPECT_TRUE(cfg.is_encoder_layer(0));
+    EXPECT_TRUE(cfg.is_encoder_layer(19));
+    EXPECT_TRUE(!cfg.is_encoder_layer(20));
+}
+
 int main() {
     run_test("test_json_roundtrip_and_escaping", test_json_roundtrip_and_escaping);
     run_test("test_config_inkling2_parse", test_config_inkling2_parse);
@@ -875,6 +953,7 @@ int main() {
     run_test("test_tokenizer_gguf_vectors_and_deepseek_chat_template", test_tokenizer_gguf_vectors_and_deepseek_chat_template);
     run_test("test_gguf_v3_single_and_multishard_reader", test_gguf_v3_single_and_multishard_reader);
     run_test("test_engram_nvme_mmap_dequant_and_cache", test_engram_nvme_mmap_dequant_and_cache);
+    run_test("test_deepseek_config_from_gguf", test_deepseek_config_from_gguf);
     printf("Host tests: %d passed, %d failed\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;
 }
