@@ -1,4 +1,5 @@
 #pragma once
+#include "auth.hpp"
 #include "json.hpp"
 #include "model.hpp"
 #include "telemetry.hpp"
@@ -28,6 +29,7 @@ class OpenAIServer {
     Tokenizer& tok_;
     std::string served_name_;
     int port_;
+    std::string api_key_;
     ServerMetrics metrics_;
     OtlpExporter otlp_;
 
@@ -96,15 +98,34 @@ class OpenAIServer {
         return true;
     }
 
-    static void send_text(int fd, int status, const char* content_type, const std::string& body) {
-        std::string hdr = "HTTP/1.1 " + std::to_string(status) + (status == 200 ? " OK" : " Error") +
+    static const char* http_status_text(int status) {
+        switch (status) {
+            case 200: return "OK";
+            case 400: return "Bad Request";
+            case 401: return "Unauthorized";
+            case 404: return "Not Found";
+            default:  return "Error";
+        }
+    }
+
+    static void send_text(int fd, int status, const char* content_type, const std::string& body,
+                          const std::string& extra_headers = "") {
+        std::string hdr = "HTTP/1.1 " + std::to_string(status) + " " + http_status_text(status) +
                           "\r\nContent-Type: " + content_type + "\r\nContent-Length: " +
-                          std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n";
+                          std::to_string(body.size()) + "\r\n" + extra_headers +
+                          "Connection: close\r\n\r\n";
         send_all(fd, hdr + body);
     }
 
     static void send_json(int fd, int status, const std::string& body) {
         send_text(fd, status, "application/json", body);
+    }
+
+    static void send_unauthorized(int fd) {
+        send_text(fd, 401, "application/json",
+                  "{\"error\":{\"message\":\"Unauthorized: invalid or missing API key\","
+                  "\"type\":\"authentication_error\",\"code\":\"invalid_api_key\"}}",
+                  "WWW-Authenticate: Bearer\r\n");
     }
 
     static int32_t sample_token(const std::vector<float>& logits, float temp, float top_p, std::mt19937& rng) {
@@ -693,6 +714,7 @@ class OpenAIServer {
         char tmp[4096];
         size_t header_end = std::string::npos;
         size_t content_len = 0;
+        std::string method, path;
 
         while (true) {
             ssize_t n = ::recv(fd, tmp, sizeof(tmp), 0);
@@ -701,11 +723,21 @@ class OpenAIServer {
             if (header_end == std::string::npos) {
                 header_end = buf.find("\r\n\r\n");
                 if (header_end != std::string::npos) {
-                    std::string hdrs = buf.substr(0, header_end);
+                    std::string_view hdrs(buf.data(), header_end);
+                    std::string_view req_line = hdrs.substr(0, hdrs.find("\r\n"));
+                    bool valid_req_line = parse_request_line(req_line, method, path);
+                    if (!api_key_.empty()) {
+                        bool is_pub = valid_req_line && is_public_endpoint(method, path);
+                        if (!is_pub && !is_request_authorized(hdrs, api_key_)) {
+                            send_unauthorized(fd);
+                            ::close(fd);
+                            return;
+                        }
+                    }
                     auto cl_pos = hdrs.find("Content-Length:");
-                    if (cl_pos == std::string::npos) cl_pos = hdrs.find("content-length:");
-                    if (cl_pos != std::string::npos) {
-                        content_len = (size_t)std::strtoull(hdrs.c_str() + cl_pos + 15, nullptr, 10);
+                    if (cl_pos == std::string_view::npos) cl_pos = hdrs.find("content-length:");
+                    if (cl_pos != std::string_view::npos) {
+                        content_len = (size_t)std::strtoull(buf.c_str() + cl_pos + 15, nullptr, 10);
                     }
                 }
             }
@@ -713,18 +745,17 @@ class OpenAIServer {
         }
         if (header_end == std::string::npos) { ::close(fd); return; }
 
-        std::string req_line = buf.substr(0, buf.find("\r\n"));
         std::string body = buf.substr(header_end + 4, content_len);
 
-        if (req_line.rfind("GET /health", 0) == 0) {
+        if (method == "GET" && path == "/health") {
             send_json(fd, 200, "{\"status\":\"ok\"}");
-        } else if (req_line.rfind("GET /status", 0) == 0) {
+        } else if (method == "GET" && path == "/status") {
             send_json(fd, 200, metrics_.format_status_json());
-        } else if (req_line.rfind("GET /metrics", 0) == 0) {
+        } else if (method == "GET" && path == "/metrics") {
             send_text(fd, 200, "text/plain; version=0.0.4; charset=utf-8", metrics_.format_prometheus());
-        } else if (req_line.rfind("GET /v1/models", 0) == 0) {
+        } else if (method == "GET" && path == "/v1/models") {
             send_json(fd, 200, "{\"object\":\"list\",\"data\":[{\"id\":" + json::escape_str(served_name_) + ",\"object\":\"model\"}]}");
-        } else if (req_line.rfind("POST /v1/chat/completions", 0) == 0) {
+        } else if (method == "POST" && path == "/v1/chat/completions") {
             try {
                 auto req = json::parse(body);
                 handle_chat(fd, req);
@@ -740,11 +771,13 @@ class OpenAIServer {
     }
 
 public:
-    OpenAIServer(Inkling2Model& m, Tokenizer& t, std::string name, int port, std::string otlp_endpoint = "")
+    OpenAIServer(Inkling2Model& m, Tokenizer& t, std::string name, int port,
+                 std::string otlp_endpoint = "", std::string api_key = "")
         : model_(m),
           tok_(t),
           served_name_(std::move(name)),
           port_(port),
+          api_key_(std::move(api_key)),
           metrics_(served_name_,
 #ifdef WARPGRID_METAL
                    "metal",
@@ -775,8 +808,8 @@ public:
             throw std::runtime_error("bind failed on port " + std::to_string(port_));
         }
         ::listen(sfd, 128);
-        fprintf(stderr, "[warpgrid] Listening on 0.0.0.0:%d (model: %s, max_slots=%d, continuous batching ON)\n",
-                port_, served_name_.c_str(), model_.max_slots);
+        fprintf(stderr, "[warpgrid] Listening on 0.0.0.0:%d (model: %s, max_slots=%d, continuous batching ON, auth=%s)\n",
+                port_, served_name_.c_str(), model_.max_slots, api_key_.empty() ? "OFF" : "ON");
         while (true) {
             int cfd = ::accept(sfd, nullptr, nullptr);
             if (cfd < 0) continue;

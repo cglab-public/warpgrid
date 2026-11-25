@@ -34,6 +34,8 @@ Every finished, cancelled, or errored request logs a single line to `stderr`:
 
 ```bash
 curl -s http://localhost:8888/status | jq
+# If --api-key / WARPGRID_API_KEY is enabled:
+curl -s -H "Authorization: Bearer $WARPGRID_API_KEY" http://localhost:8888/status | jq
 ```
 
 Returns live server metadata (`model`, `backend`, `uptime_s`, `max_slots`, `max_seq_len`, `dflash2_enabled`, `otlp_enabled`), request counters (`total`, `active`, `pending`, `cancelled`, `error`), token & prefix-cache totals, latency averages (`ttft_ms_avg`, `decode_tok_per_sec`), speculative stats (`steps`, `drafted`, `accepted`, `accept_ratio`, `mean_tokens_per_step`), and per-slot live state (`slot_id`, `active`, `pos`, `cached_tokens`, `generated`, `dflash2_active`).

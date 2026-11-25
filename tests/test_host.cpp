@@ -1,3 +1,4 @@
+#include "../src/auth.hpp"
 #include "../src/config.hpp"
 #include "../src/json.hpp"
 #include "../src/safetensors.hpp"
@@ -355,6 +356,84 @@ static void test_telemetry_otlp_payload_and_loopback() {
     EXPECT_TRUE(received.find("chat.completions") != std::string::npos);
 }
 
+static void test_auth_request_line_and_api_key() {
+    // Constant-time equality
+    EXPECT_TRUE(ink::constant_time_eq("secret-key-123", "secret-key-123"));
+    EXPECT_TRUE(!ink::constant_time_eq("secret-key-123", "secret-key-124"));
+    EXPECT_TRUE(!ink::constant_time_eq("secret-key-123", "secret-key-12"));
+    EXPECT_TRUE(!ink::constant_time_eq("secret", ""));
+    EXPECT_TRUE(ink::constant_time_eq("", ""));
+
+    // Request line parsing & public endpoint rules
+    std::string method, path;
+    EXPECT_TRUE(ink::parse_request_line("GET /health HTTP/1.1", method, path));
+    EXPECT_EQ(method, std::string("GET"));
+    EXPECT_EQ(path, std::string("/health"));
+    EXPECT_TRUE(ink::is_public_endpoint(method, path));
+
+    EXPECT_TRUE(ink::parse_request_line("GET /health?probe=1 HTTP/1.1", method, path));
+    EXPECT_EQ(path, std::string("/health"));
+    EXPECT_TRUE(ink::is_public_endpoint(method, path));
+
+    EXPECT_TRUE(ink::parse_request_line("GET /healthcheck HTTP/1.1", method, path));
+    EXPECT_TRUE(!ink::is_public_endpoint(method, path));
+
+    EXPECT_TRUE(ink::parse_request_line("POST /health HTTP/1.1", method, path));
+    EXPECT_TRUE(!ink::is_public_endpoint(method, path));
+
+    EXPECT_TRUE(ink::parse_request_line("POST /v1/chat/completions HTTP/1.1", method, path));
+    EXPECT_EQ(method, std::string("POST"));
+    EXPECT_EQ(path, std::string("/v1/chat/completions"));
+    EXPECT_TRUE(!ink::is_public_endpoint(method, path));
+
+    EXPECT_TRUE(!ink::parse_request_line("MALFORMED", method, path));
+
+    // Auth disabled when expected key is empty
+    const std::string no_auth_req =
+        "POST /v1/chat/completions HTTP/1.1\r\n"
+        "Host: localhost:8888\r\n"
+        "Content-Type: application/json";
+    EXPECT_TRUE(ink::is_request_authorized(no_auth_req, ""));
+    EXPECT_TRUE(!ink::is_request_authorized(no_auth_req, "sk-warpgrid-secret"));
+
+    // Standard OpenAI Bearer auth (including case-insensitive header/scheme and OWS)
+    const std::string bearer_ok =
+        "POST /v1/chat/completions HTTP/1.1\r\n"
+        "Host: localhost:8888\r\n"
+        "Authorization: Bearer sk-warpgrid-secret";
+    EXPECT_TRUE(ink::is_request_authorized(bearer_ok, "sk-warpgrid-secret"));
+    EXPECT_TRUE(!ink::is_request_authorized(bearer_ok, "sk-wrong"));
+
+    const std::string bearer_ci =
+        "GET /v1/models HTTP/1.1\r\n"
+        "authorization:   bearer\tsk-warpgrid-secret  ";
+    EXPECT_TRUE(ink::is_request_authorized(bearer_ci, "sk-warpgrid-secret"));
+
+    // Reject missing space after Bearer or wrong scheme
+    const std::string bearer_bad_scheme =
+        "GET /v1/models HTTP/1.1\r\n"
+        "Authorization: Basic sk-warpgrid-secret";
+    EXPECT_TRUE(!ink::is_request_authorized(bearer_bad_scheme, "sk-warpgrid-secret"));
+
+    const std::string bearer_no_space =
+        "GET /v1/models HTTP/1.1\r\n"
+        "Authorization: Bearersk-warpgrid-secret";
+    EXPECT_TRUE(!ink::is_request_authorized(bearer_no_space, "sk-warpgrid-secret"));
+
+    // X-API-Key header support
+    const std::string x_api_key_ok =
+        "GET /status HTTP/1.1\r\n"
+        "x-api-key: sk-warpgrid-secret";
+    EXPECT_TRUE(ink::is_request_authorized(x_api_key_ok, "sk-warpgrid-secret"));
+    EXPECT_TRUE(!ink::is_request_authorized(x_api_key_ok, "sk-other"));
+
+    // Must not match key appearing in an unrelated header or request line
+    const std::string spoofed =
+        "GET /v1/models?Authorization=Bearer%20sk-warpgrid-secret HTTP/1.1\r\n"
+        "X-Custom: Authorization: Bearer sk-warpgrid-secret";
+    EXPECT_TRUE(!ink::is_request_authorized(spoofed, "sk-warpgrid-secret"));
+}
+
 int main() {
     run_test("test_json_roundtrip_and_escaping", test_json_roundtrip_and_escaping);
     run_test("test_config_inkling2_parse", test_config_inkling2_parse);
@@ -363,6 +442,7 @@ int main() {
     run_test("test_tokenizer_bpe_roundtrip_synthetic", test_tokenizer_bpe_roundtrip_synthetic);
     run_test("test_telemetry_metrics_and_formats", test_telemetry_metrics_and_formats);
     run_test("test_telemetry_otlp_payload_and_loopback", test_telemetry_otlp_payload_and_loopback);
+    run_test("test_auth_request_line_and_api_key", test_auth_request_line_and_api_key);
     printf("Host tests: %d passed, %d failed\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;
 }

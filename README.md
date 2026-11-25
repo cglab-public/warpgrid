@@ -143,11 +143,13 @@ uv run --with numpy python3 scripts/quantize_q2.py \
 ```
 
 Endpoints (see [OBSERVABILITY.md](OBSERVABILITY.md) for Prometheus, Datadog, and OpenTelemetry setup):
-- `GET /health`
+- `GET /health` *(always unauthenticated for liveness probes)*
 - `GET /status` (live JSON snapshot: active/pending requests, per-slot KV occupancy, prefix-cache hit ratio, decode `tok/s`, DFlash 2 `mean_a`)
 - `GET /metrics` (Prometheus / Datadog OpenMetrics text format)
 - `GET /v1/models`
 - `POST /v1/chat/completions` (streaming SSE & non-streaming, tool calls, `reasoning_content`, `cached_tokens` usage stats)
+
+Optional authentication: pass `--api-key <key>` or set `WARPGRID_API_KEY=<key>` to require `Authorization: Bearer <key>` (or `X-API-Key: <key>`) on all endpoints except `GET /health`.
 
 ### 3. CLI Options
 
@@ -156,6 +158,7 @@ Endpoints (see [OBSERVABILITY.md](OBSERVABILITY.md) for Prometheus, Datadog, and
 | `--model <dir>` | *(required)* | Hugging Face model snapshot directory (NVFP4/MXFP8 or `Q2_G64`) |
 | `--served-model-name <name>` | `Inkling-2-Mini` | Advertised model ID |
 | `--port <int>` | `8888` | HTTP listen port |
+| `--api-key <key>` | *(off)* | Optional auth key (also read from `WARPGRID_API_KEY`); requires `Authorization: Bearer <key>` or `X-API-Key: <key>` |
 | `--max-slots <int>` | `8` | Max concurrent continuous-batching slots (`1..8`) |
 | `--max-seq-len <int>` | `32768` | Max context length per slot (`139264` for ~136K/slot) |
 | `--max-chunk <int>` | `512` | Max prefill chunk size (`4096` recommended) |
