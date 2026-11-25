@@ -228,7 +228,7 @@ struct DeepSeekV41Model::Impl {
         if (wb.experts > 1 && wb.cols > 0) {
             wb.expert_stride_bytes = (uint32_t)(ggml_row_nbytes(ti.type, wb.cols) * wb.rows);
         }
-        if (ti.type == GgmlType::F16 || ti.type == GgmlType::BF16) {
+        if (ti.type == GgmlType::F16 || ti.type == GgmlType::BF16 || ti.type == GgmlType::Q5_K) {
             size_t total_elems = (size_t)wb.cols * wb.rows * wb.experts;
             wb.buf = alloc_buf(total_elems * sizeof(float));
             dequant_row_fp32(ti.type, gf.tensor_data(name), static_cast<float*>(wb.buf.contents), total_elems);
@@ -409,6 +409,14 @@ void DeepSeekV41Model::load(const std::string& model_path, int max_seq, int max_
     size_t Qdim = (size_t)cfg.num_attention_heads * (size_t)cfg.head_dim;
     size_t KVdim = (size_t)cfg.num_key_value_heads * (size_t)cfg.head_dim;
     size_t Inter = (size_t)std::max(cfg.ffn_intermediate_size, cfg.expert_intermediate_size);
+    for (const auto& lw : impl_->layers) {
+        Inter = std::max<size_t>(Inter, lw.ffn_gate_dense.rows);
+        Inter = std::max<size_t>(Inter, lw.ffn_up_dense.rows);
+        Inter = std::max<size_t>(Inter, lw.ffn_gate_shexp.rows);
+        Inter = std::max<size_t>(Inter, lw.ffn_up_shexp.rows);
+        Inter = std::max<size_t>(Inter, lw.ffn_gate_exps.rows);
+        Inter = std::max<size_t>(Inter, lw.ffn_up_exps.rows);
+    }
 
     if (impl_->has_mhc) {
         impl_->b_streams_a = impl_->alloc_buf(Tmax * Mhc * D * sizeof(float));
@@ -588,6 +596,15 @@ void DeepSeekV41Model::forward_logits(const int32_t* h_tokens, int T, int start_
                 threadsPerThreadgroup:MTLSizeMake(std::min<uint32_t>(64u, (uint32_t)D), 1, 1)];
         } else {
             impl_->encode_add(enc, impl_->b_hidden, impl_->b_sub_out, (uint32_t)((size_t)T * D));
+            if (impl_->has_mhc) {
+                DsStreamCollapseParams scp{(uint32_t)T, (uint32_t)D, (uint32_t)std::max(1, cfg.hc_mult)};
+                [enc setComputePipelineState:impl_->pso("ds_mhc_expand_f32")];
+                [enc setBuffer:impl_->b_hidden offset:0 atIndex:0];
+                [enc setBuffer:impl_->b_streams_a offset:0 atIndex:1];
+                [enc setBytes:&scp length:sizeof(scp) atIndex:2];
+                [enc dispatchThreads:MTLSizeMake((uint32_t)D, (uint32_t)T, 1)
+                    threadsPerThreadgroup:MTLSizeMake(std::min<uint32_t>(64u, (uint32_t)D), 1, 1)];
+            }
         }
 
         impl_->encode_rmsnorm(enc, impl_->b_hidden, lw.ffn_norm, impl_->b_norm, (uint32_t)T, (uint32_t)D, cfg.rms_norm_eps);
@@ -698,6 +715,15 @@ void DeepSeekV41Model::forward_logits(const int32_t* h_tokens, int T, int start_
                 threadsPerThreadgroup:MTLSizeMake(std::min<uint32_t>(64u, (uint32_t)D), 1, 1)];
         } else {
             impl_->encode_add(enc, impl_->b_hidden, impl_->b_sub_out, (uint32_t)((size_t)T * D));
+            if (impl_->has_mhc) {
+                DsStreamCollapseParams scp{(uint32_t)T, (uint32_t)D, (uint32_t)std::max(1, cfg.hc_mult)};
+                [enc setComputePipelineState:impl_->pso("ds_mhc_expand_f32")];
+                [enc setBuffer:impl_->b_hidden offset:0 atIndex:0];
+                [enc setBuffer:impl_->b_streams_a offset:0 atIndex:1];
+                [enc setBytes:&scp length:sizeof(scp) atIndex:2];
+                [enc dispatchThreads:MTLSizeMake((uint32_t)D, (uint32_t)T, 1)
+                    threadsPerThreadgroup:MTLSizeMake(std::min<uint32_t>(64u, (uint32_t)D), 1, 1)];
+            }
         }
 
         [enc endEncoding];
