@@ -848,6 +848,11 @@ class OpenAIServer {
 
         if (!client_ok) {
             st->cancelled.store(true, std::memory_order_relaxed);
+            sched_cv_.notify_one();
+            {
+                std::unique_lock<std::mutex> lk(st->mu);
+                st->cv.wait(lk, [&]() { return st->finished || stop_worker_.load(std::memory_order_relaxed); });
+            }
             record_telemetry(true, "cancelled");
             return;
         }
