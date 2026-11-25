@@ -1173,16 +1173,26 @@ kernel void ds_mhc_collapse_f32(
     hidden[ulong(t) * p.D + d] = acc;
 }
 
+struct DsSwigluParams {
+    uint n;
+    float clamp_val;
+};
+
 kernel void ds_swiglu_f32(
     device const float* gate [[buffer(0)]],
     device const float* up [[buffer(1)]],
     device float* out [[buffer(2)]],
-    constant uint& n [[buffer(3)]],
+    constant DsSwigluParams& p [[buffer(3)]],
     uint gid [[thread_position_in_grid]]) {
-    if (gid >= n) return;
+    if (gid >= p.n) return;
     float g = gate[gid];
+    float u = up[gid];
+    if (p.clamp_val > 0.0f) {
+        g = clamp(g, -p.clamp_val, p.clamp_val);
+        u = clamp(u, -p.clamp_val, p.clamp_val);
+    }
     float silu = g / (1.0f + exp(-g));
-    out[gid] = silu * up[gid];
+    out[gid] = silu * u;
 }
 
 kernel void ds_add_f32(

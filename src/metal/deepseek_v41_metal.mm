@@ -361,12 +361,13 @@ struct DeepSeekV41Model::Impl {
         [enc dispatchThreadgroups:MTLSizeMake(T, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
     }
 
-    void encode_swiglu(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> gate, id<MTLBuffer> up, id<MTLBuffer> out, uint32_t n) {
+    void encode_swiglu(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> gate, id<MTLBuffer> up, id<MTLBuffer> out, uint32_t n, float clamp_val = 0.0f) {
+        struct { uint32_t n; float clamp_val; } sp{n, clamp_val};
         [enc setComputePipelineState:pso("ds_swiglu_f32")];
         [enc setBuffer:gate offset:0 atIndex:0];
         [enc setBuffer:up offset:0 atIndex:1];
         [enc setBuffer:out offset:0 atIndex:2];
-        [enc setBytes:&n length:sizeof(n) atIndex:3];
+        [enc setBytes:&sp length:sizeof(sp) atIndex:3];
         [enc dispatchThreadgroups:MTLSizeMake((n + 255u) / 256u, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     }
 
@@ -433,6 +434,9 @@ void DeepSeekV41Model::load(const std::string& model_path, int max_seq, int max_
         }
     }
     impl_->engram_in_main_gguf = gguf.has_tensor("per_layer_token_embd.weight");
+    if (!cfg.ple_layers.empty() && !engram.is_open() && !impl_->engram_in_main_gguf) {
+        throw std::runtime_error("Model declares Engram layers (ple.layers) but per_layer_token_embd.weight is missing; pass --engram <path>");
+    }
 
     uint64_t rec_ws = (uint64_t)impl_->dev.recommendedMaxWorkingSetSize;
     size_t kv_per_slot = cfg.kv_bytes_per_token() * (size_t)max_seq;
@@ -906,7 +910,7 @@ void DeepSeekV41Model::forward_logits(const int32_t* h_tokens, int T, int start_
 
         impl_->encode_gemv(enc, impl_->b_norm, lw.ffn_gate_shexp, impl_->b_ffn_gate, (uint32_t)T);
         impl_->encode_gemv(enc, impl_->b_norm, lw.ffn_up_shexp, impl_->b_ffn_up, (uint32_t)T);
-        impl_->encode_swiglu(enc, impl_->b_ffn_gate, impl_->b_ffn_up, impl_->b_ffn_act, (uint32_t)((size_t)T * lw.ffn_gate_shexp.rows));
+        impl_->encode_swiglu(enc, impl_->b_ffn_gate, impl_->b_ffn_up, impl_->b_ffn_act, (uint32_t)((size_t)T * lw.ffn_gate_shexp.rows), cfg.swiglu_clamp_shexp);
         impl_->encode_gemv(enc, impl_->b_ffn_act, lw.ffn_down_shexp, impl_->b_sub_out, (uint32_t)T);
 
         impl_->encode_gemv(enc, impl_->b_norm, lw.router, impl_->b_router_logits, (uint32_t)T);
@@ -939,7 +943,7 @@ void DeepSeekV41Model::forward_logits(const int32_t* h_tokens, int T, int start_
 
                 impl_->encode_gemv(enc, impl_->b_norm, lw.ffn_gate_exps, impl_->b_ffn_gate, 1u, x_off, g_off, 0);
                 impl_->encode_gemv(enc, impl_->b_norm, lw.ffn_up_exps, impl_->b_ffn_up, 1u, x_off, u_off, 0);
-                impl_->encode_swiglu(enc, impl_->b_ffn_gate, impl_->b_ffn_up, impl_->b_ffn_act, lw.ffn_gate_exps.rows);
+                impl_->encode_swiglu(enc, impl_->b_ffn_gate, impl_->b_ffn_up, impl_->b_ffn_act, lw.ffn_gate_exps.rows, cfg.swiglu_clamp_exp);
                 impl_->encode_gemv(enc, impl_->b_ffn_act, lw.ffn_down_exps, impl_->b_ffn_tmp, 1u, 0, d_off, 0);
 
                 struct { uint32_t n; uint32_t top_k; uint32_t r; uint32_t D; } sap{
