@@ -233,6 +233,15 @@ class OpenAIServer {
                     sched_cv_.wait(lk, [&]() { return stop_worker_ || !pending_.empty(); });
                     if (stop_worker_) break;
                 }
+                for (auto it = pending_.begin(); it != pending_.end(); ) {
+                    if ((*it)->cancelled.load(std::memory_order_relaxed)) {
+                        (*it)->mark_done();
+                        metrics_.on_dequeue();
+                        it = pending_.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
                 while (!pending_.empty() && (int)active.size() < max_slots && !has_active_leader()) {
                     int first_free = -1;
                     for (int s = 0; s < max_slots; ++s) {
@@ -305,6 +314,16 @@ class OpenAIServer {
             for (size_t idx = 0; idx < active.size(); ) {
                 auto& r = active[idx];
                 if (r->prefill_done) { ++idx; continue; }
+                if (r->cancelled.load(std::memory_order_relaxed)) {
+                    if (r->hit_snap_id >= 0) {
+                        prefix_cache.release_snapshot_pin(r->hit_snap_id);
+                        r->hit_snap_id = -1;
+                    }
+                    r->mark_done();
+                    release_slot(r->slot_id);
+                    active.erase(active.begin() + (ptrdiff_t)idx);
+                    continue;
+                }
                 int plen = (int)r->prompt_ids.size();
 
                 if (!r->prefill_initialized) {
@@ -722,12 +741,27 @@ class OpenAIServer {
         bool got_first = false;
         while (client_ok) {
             int32_t tid = -1;
+            bool woke = false;
             {
                 std::unique_lock<std::mutex> lk(st->mu);
-                st->cv.wait(lk, [&]() { return !st->tokens.empty() || st->finished; });
-                if (st->tokens.empty()) break;
-                tid = st->tokens.front();
-                st->tokens.pop_front();
+                woke = st->cv.wait_for(lk, std::chrono::milliseconds(kSseKeepaliveIntervalMs),
+                                       [&]() { return !st->tokens.empty() || st->finished; });
+                if (woke) {
+                    if (st->tokens.empty()) break;
+                    tid = st->tokens.front();
+                    st->tokens.pop_front();
+                }
+            }
+            if (!woke) {
+                if (is_socket_disconnected(fd)) {
+                    client_ok = false;
+                    break;
+                }
+                if (stream && !send_all(fd, kSseKeepaliveFrame)) {
+                    client_ok = false;
+                    break;
+                }
+                continue;
             }
             if (!got_first) {
                 got_first = true;

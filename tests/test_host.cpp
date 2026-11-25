@@ -527,6 +527,21 @@ static void test_clamp_max_tokens() {
     EXPECT_EQ(ink::clamp_max_tokens(32769, 16, 32768), 0);
 }
 
+static void test_sse_keepalive_and_disconnect() {
+    std::string_view frame(ink::kSseKeepaliveFrame);
+    EXPECT_TRUE(!frame.empty() && frame.front() == ':');
+    EXPECT_TRUE(frame.size() >= 2 && frame.substr(frame.size() - 2) == "\n\n");
+    EXPECT_TRUE(ink::kSseKeepaliveIntervalMs > 0 && ink::kSseKeepaliveIntervalMs <= 15000);
+    EXPECT_TRUE(ink::is_socket_disconnected(-1));
+
+    int fds[2] = {-1, -1};
+    EXPECT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+    EXPECT_TRUE(!ink::is_socket_disconnected(fds[0]));
+    ::close(fds[1]);
+    EXPECT_TRUE(ink::is_socket_disconnected(fds[0]));
+    ::close(fds[0]);
+}
+
 int main() {
     run_test("test_json_roundtrip_and_escaping", test_json_roundtrip_and_escaping);
     run_test("test_config_inkling2_parse", test_config_inkling2_parse);
@@ -538,6 +553,7 @@ int main() {
     run_test("test_auth_request_line_and_api_key", test_auth_request_line_and_api_key);
     run_test("test_radix_prefix_cache_cross_slot_and_eviction", test_radix_prefix_cache_cross_slot_and_eviction);
     run_test("test_clamp_max_tokens", test_clamp_max_tokens);
+    run_test("test_sse_keepalive_and_disconnect", test_sse_keepalive_and_disconnect);
     printf("Host tests: %d passed, %d failed\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;
 }

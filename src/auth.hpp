@@ -1,4 +1,5 @@
 #pragma once
+#include <poll.h>
 #include <algorithm>
 #include <cctype>
 #include <cstddef>
@@ -145,6 +146,19 @@ inline int clamp_max_tokens(int prompt_len, int requested_max_tokens, int max_se
     }
     int avail = max_seq_len - prompt_len;
     return std::clamp(requested_max_tokens, 1, avail);
+}
+
+inline constexpr const char* kSseKeepaliveFrame = ": keepalive\n\n";
+inline constexpr int kSseKeepaliveIntervalMs = 5000;
+
+inline bool is_socket_disconnected(int fd) {
+    if (fd < 0) return true;
+    struct pollfd pfd{};
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    int rc = ::poll(&pfd, 1, 0);
+    if (rc < 0) return false;
+    return (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0;
 }
 
 } // namespace ink
