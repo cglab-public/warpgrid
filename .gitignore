@@ -10,5 +10,6 @@ bench_hw/hw_probe_metal
 tests/test_host
 tests/test_metal_kernels
 tests/test_metal_gguf_kernels
+tests/bench_deepseek_metal
 .agenfk/
 .DS_Store

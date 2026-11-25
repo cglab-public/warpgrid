@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
+#include <unistd.h>
 #include <unordered_map>
 #include <vector>
 
@@ -22,6 +23,31 @@ struct GgufGemvParams {
     uint32_t M;
     uint32_t N;
     uint32_t K;
+};
+
+struct GgufGroupedGemvParams {
+    uint32_t T;
+    uint32_t G;
+    uint32_t N;
+    uint32_t K;
+    uint32_t group_stride_bytes;
+};
+
+struct GgufMoeParams {
+    uint32_t T;
+    uint32_t N;
+    uint32_t K;
+    uint32_t top_k;
+    uint32_t expert_stride_bytes;
+};
+
+struct GgufMoeSwigluParams {
+    uint32_t T;
+    uint32_t N;
+    uint32_t K;
+    uint32_t top_k;
+    uint32_t expert_stride_bytes;
+    float clamp_val;
 };
 
 struct DsRmsParams {
@@ -108,6 +134,7 @@ struct DsStreamCollapseParams {
 
 struct WeightBuf {
     id<MTLBuffer> buf = nil;
+    size_t base_offset = 0;
     GgmlType type = GgmlType::F32;
     uint32_t rows = 0;
     uint32_t cols = 0;
@@ -176,6 +203,7 @@ struct DeepSeekV41Model::Impl {
     WeightBuf lm_head;
     id<MTLBuffer> output_norm = nil;
     bool engram_in_main_gguf = false;
+    std::vector<id<MTLBuffer>> shard_bufs;
     std::vector<Ds41LayerWeights> layers;
     std::vector<Ds41LayerKv> kv_caches;
     std::vector<std::vector<int32_t>> slot_tok_history;
@@ -208,7 +236,7 @@ struct DeepSeekV41Model::Impl {
     id<MTLBuffer> b_idx_w = nil;
     id<MTLBuffer> b_idx_scores = nil;
 
-    id<MTLBuffer> b_engram_rows = nil;
+    std::vector<id<MTLBuffer>> b_engram_rows;
     id<MTLBuffer> b_engram_kv = nil;
 
     id<MTLBuffer> b_router_logits = nil;
@@ -219,6 +247,7 @@ struct DeepSeekV41Model::Impl {
     id<MTLBuffer> b_ffn_act = nil;
     id<MTLBuffer> b_ffn_tmp = nil;
     id<MTLBuffer> b_logits = nil;
+    id<MTLBuffer> b_argmax = nil;
     id<MTLBuffer> b_dummy_bias = nil;
 
     void init_metal() {
@@ -282,6 +311,25 @@ struct DeepSeekV41Model::Impl {
         return b;
     }
 
+    void init_shard_buffers(const GgufFile& gf) {
+        shard_bufs.assign(gf.num_shards(), nil);
+        long ps = sysconf(_SC_PAGESIZE);
+        size_t page_sz = ps > 0 ? (size_t)ps : 16384u;
+        uint64_t max_buf = (uint64_t)dev.maxBufferLength;
+        for (size_t s = 0; s < gf.num_shards(); ++s) {
+            const void* ptr = gf.shard_mapped(s);
+            size_t sz = gf.shard_size(s);
+            if (!ptr || sz == 0) continue;
+            size_t aligned_len = (sz + page_sz - 1u) & ~(page_sz - 1u);
+            if (max_buf > 0 && aligned_len > max_buf) continue;
+            id<MTLBuffer> b = [dev newBufferWithBytesNoCopy:const_cast<void*>(ptr)
+                                                     length:aligned_len
+                                                    options:MTLResourceStorageModeShared
+                                                deallocator:nil];
+            shard_bufs[s] = b;
+        }
+    }
+
     WeightBuf load_weight_required(const GgufFile& gf, const std::string& name, uint32_t force_groups = 0) {
         if (!gf.has_tensor(name)) {
             throw std::runtime_error("Missing required DeepSeek-V4.1 tensor: " + name);
@@ -299,16 +347,21 @@ struct DeepSeekV41Model::Impl {
         if (wb.groups > 1 && wb.cols > 0) {
             wb.group_stride_bytes = (uint32_t)(ggml_row_nbytes(ti.type, wb.cols) * wb.rows);
         }
-        if (ti.type == GgmlType::F16 || ti.type == GgmlType::BF16 || ti.type == GgmlType::Q5_K) {
+        if (ti.type == GgmlType::F16) {
             size_t total_elems = (size_t)wb.cols * wb.rows * wb.groups;
             wb.buf = alloc_buf(total_elems * sizeof(float));
+            wb.base_offset = 0;
             dequant_row_fp32(ti.type, gf.tensor_data(name), static_cast<float*>(wb.buf.contents), total_elems);
             wb.type = GgmlType::F32;
             if (wb.groups > 1) wb.group_stride_bytes = wb.cols * wb.rows * (uint32_t)sizeof(float);
+        } else if (ti.shard_index < shard_bufs.size() && shard_bufs[ti.shard_index] != nil) {
+            wb.buf = shard_bufs[ti.shard_index];
+            wb.base_offset = gf.shard_data_offset(ti.shard_index) + (size_t)ti.offset;
         } else {
             wb.buf = [dev newBufferWithBytes:gf.tensor_data(name)
                                       length:std::max<size_t>(16, ti.nbytes)
                                      options:MTLResourceStorageModeShared];
+            wb.base_offset = 0;
             if (!wb.buf) throw std::runtime_error("Metal buffer allocation failed for tensor: " + name);
         }
         return wb;
@@ -317,14 +370,54 @@ struct DeepSeekV41Model::Impl {
     static const char* gemv_kernel_for(GgmlType t) {
         switch (t) {
             case GgmlType::F32: return "gguf_gemv_f32";
+            case GgmlType::BF16: return "gguf_gemv_bf16";
             case GgmlType::Q8_0: return "gguf_gemv_q8_0";
             case GgmlType::IQ4_NL: return "gguf_gemv_iq4_nl";
             case GgmlType::MXFP4: return "gguf_gemv_mxfp4";
             case GgmlType::Q4_K: return "gguf_gemv_q4_k";
+            case GgmlType::Q5_K: return "gguf_gemv_q5_k";
             case GgmlType::Q6_K: return "gguf_gemv_q6_k";
             case GgmlType::Q2_K: return "gguf_gemv_q2_k";
+            case GgmlType::IQ2_XXS: return "gguf_gemv_iq2_xxs";
+            case GgmlType::IQ1_S: return "gguf_gemv_iq1_s";
             default:
                 throw std::runtime_error("Unsupported Metal GEMV GGUF quant type: " + std::to_string((uint32_t)t));
+        }
+    }
+
+    static const char* moe_indexed_kernel_for(GgmlType t) {
+        switch (t) {
+            case GgmlType::F32: return "gguf_moe_indexed_f32";
+            case GgmlType::BF16: return "gguf_moe_indexed_bf16";
+            case GgmlType::Q8_0: return "gguf_moe_indexed_q8_0";
+            case GgmlType::IQ4_NL: return "gguf_moe_indexed_iq4_nl";
+            case GgmlType::MXFP4: return "gguf_moe_indexed_mxfp4";
+            case GgmlType::Q4_K: return "gguf_moe_indexed_q4_k";
+            case GgmlType::Q5_K: return "gguf_moe_indexed_q5_k";
+            case GgmlType::Q6_K: return "gguf_moe_indexed_q6_k";
+            case GgmlType::Q2_K: return "gguf_moe_indexed_q2_k";
+            case GgmlType::IQ2_XXS: return "gguf_moe_indexed_iq2_xxs";
+            case GgmlType::IQ1_S: return "gguf_moe_indexed_iq1_s";
+            default:
+                throw std::runtime_error("Unsupported Metal MoE indexed GGUF quant type: " + std::to_string((uint32_t)t));
+        }
+    }
+
+    static const char* moe_down_accum_kernel_for(GgmlType t) {
+        switch (t) {
+            case GgmlType::F32: return "gguf_moe_down_accum_f32";
+            case GgmlType::BF16: return "gguf_moe_down_accum_bf16";
+            case GgmlType::Q8_0: return "gguf_moe_down_accum_q8_0";
+            case GgmlType::IQ4_NL: return "gguf_moe_down_accum_iq4_nl";
+            case GgmlType::MXFP4: return "gguf_moe_down_accum_mxfp4";
+            case GgmlType::Q4_K: return "gguf_moe_down_accum_q4_k";
+            case GgmlType::Q5_K: return "gguf_moe_down_accum_q5_k";
+            case GgmlType::Q6_K: return "gguf_moe_down_accum_q6_k";
+            case GgmlType::Q2_K: return "gguf_moe_down_accum_q2_k";
+            case GgmlType::IQ2_XXS: return "gguf_moe_down_accum_iq2_xxs";
+            case GgmlType::IQ1_S: return "gguf_moe_down_accum_iq1_s";
+            default:
+                throw std::runtime_error("Unsupported Metal MoE down-accum GGUF quant type: " + std::to_string((uint32_t)t));
         }
     }
 
@@ -332,33 +425,109 @@ struct DeepSeekV41Model::Impl {
                      uint32_t M, size_t x_offset = 0, size_t w_offset = 0, size_t y_offset = 0) {
         if (!w.valid()) throw std::runtime_error("Attempted Metal GEMV on missing weight buffer");
         GgufGemvParams p{M, w.rows, w.cols};
+        if (w.type == GgmlType::F32 && w.rows <= 64u && (w.cols & 3u) == 0u && ((w.base_offset + w_offset) & 15u) == 0u && (x_offset & 15u) == 0u) {
+            [enc setComputePipelineState:pso("gguf_gemv_f32_wide")];
+            [enc setBuffer:x offset:x_offset atIndex:0];
+            [enc setBuffer:w.buf offset:w.base_offset + w_offset atIndex:1];
+            [enc setBuffer:y offset:y_offset atIndex:2];
+            [enc setBytes:&p length:sizeof(p) atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake(w.rows, M, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            return;
+        }
+        if (w.type == GgmlType::Q6_K && (x_offset & 15u) == 0u) {
+            [enc setComputePipelineState:pso("gguf_gemv_q6_k_fast")];
+            [enc setBuffer:x offset:x_offset atIndex:0];
+            [enc setBuffer:w.buf offset:w.base_offset + w_offset atIndex:1];
+            [enc setBuffer:y offset:y_offset atIndex:2];
+            [enc setBytes:&p length:sizeof(p) atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake((w.rows + 3u) / 4u, M, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            return;
+        }
         [enc setComputePipelineState:pso(gemv_kernel_for(w.type))];
         [enc setBuffer:x offset:x_offset atIndex:0];
-        [enc setBuffer:w.buf offset:w_offset atIndex:1];
+        [enc setBuffer:w.buf offset:w.base_offset + w_offset atIndex:1];
         [enc setBuffer:y offset:y_offset atIndex:2];
         [enc setBytes:&p length:sizeof(p) atIndex:3];
         [enc dispatchThreadgroups:MTLSizeMake((w.rows + 3u) / 4u, M, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     }
 
+    void encode_moe_indexed(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> x, const WeightBuf& w,
+                            id<MTLBuffer> topk_ids, id<MTLBuffer> y, uint32_t T, uint32_t top_k) {
+        if (!w.valid()) throw std::runtime_error("Attempted Metal MoE indexed GEMV on missing weight buffer");
+        GgufMoeParams mp{T, w.rows, w.cols, top_k, w.group_stride_bytes};
+        [enc setComputePipelineState:pso(moe_indexed_kernel_for(w.type))];
+        [enc setBuffer:x offset:0 atIndex:0];
+        [enc setBuffer:w.buf offset:w.base_offset atIndex:1];
+        [enc setBuffer:topk_ids offset:0 atIndex:2];
+        [enc setBuffer:y offset:0 atIndex:3];
+        [enc setBytes:&mp length:sizeof(mp) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake((w.rows + 3u) / 4u, T * top_k, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    }
+
+    void encode_moe_down_accum(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> x, const WeightBuf& w,
+                               id<MTLBuffer> topk_ids, id<MTLBuffer> topk_w, id<MTLBuffer> y,
+                               uint32_t T, uint32_t top_k) {
+        if (!w.valid()) throw std::runtime_error("Attempted Metal MoE down-accum GEMV on missing weight buffer");
+        GgufMoeParams mp{T, w.rows, w.cols, top_k, w.group_stride_bytes};
+        if (w.type == GgmlType::IQ1_S || w.type == GgmlType::IQ2_XXS) {
+            const char* kname = (w.type == GgmlType::IQ1_S) ? "gguf_moe_down_accum_iq1_s_4r" : "gguf_moe_down_accum_iq2_xxs_4r";
+            [enc setComputePipelineState:pso(kname)];
+            [enc setBuffer:x offset:0 atIndex:0];
+            [enc setBuffer:w.buf offset:w.base_offset atIndex:1];
+            [enc setBuffer:topk_ids offset:0 atIndex:2];
+            [enc setBuffer:topk_w offset:0 atIndex:3];
+            [enc setBuffer:y offset:0 atIndex:4];
+            [enc setBytes:&mp length:sizeof(mp) atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake((w.rows + 7u) / 8u, T, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            return;
+        }
+        [enc setComputePipelineState:pso(moe_down_accum_kernel_for(w.type))];
+        [enc setBuffer:x offset:0 atIndex:0];
+        [enc setBuffer:w.buf offset:w.base_offset atIndex:1];
+        [enc setBuffer:topk_ids offset:0 atIndex:2];
+        [enc setBuffer:topk_w offset:0 atIndex:3];
+        [enc setBuffer:y offset:0 atIndex:4];
+        [enc setBytes:&mp length:sizeof(mp) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake((w.rows + 3u) / 4u, T, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    }
+
+    void encode_moe_gate_up_swiglu(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> x,
+                                   const WeightBuf& wg, const WeightBuf& wu,
+                                   id<MTLBuffer> topk_ids, id<MTLBuffer> y,
+                                   uint32_t T, uint32_t top_k, float clamp_val) {
+        GgufMoeSwigluParams sp{T, wg.rows, wg.cols, top_k, wg.group_stride_bytes, clamp_val};
+        const char* kname = (wg.type == GgmlType::IQ1_S) ? "gguf_moe_gate_up_swiglu_iq1_s" : "gguf_moe_gate_up_swiglu_iq2_xxs";
+        [enc setComputePipelineState:pso(kname)];
+        [enc setBuffer:x offset:0 atIndex:0];
+        [enc setBuffer:wg.buf offset:wg.base_offset atIndex:1];
+        [enc setBuffer:wu.buf offset:wu.base_offset atIndex:2];
+        [enc setBuffer:topk_ids offset:0 atIndex:3];
+        [enc setBuffer:y offset:0 atIndex:4];
+        [enc setBytes:&sp length:sizeof(sp) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake((wg.rows + 7u) / 8u, T * top_k, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    }
+
     void encode_rmsnorm(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> x, id<MTLBuffer> w, id<MTLBuffer> y,
                         uint32_t T, uint32_t D, float eps, size_t x_offset = 0, size_t y_offset = 0) {
         DsRmsParams p{T, D, eps};
+        uint32_t tptg = (D >= 1024u) ? 256u : 32u;
         [enc setComputePipelineState:pso("ds_rmsnorm_f32")];
         [enc setBuffer:x offset:x_offset atIndex:0];
         [enc setBuffer:w offset:0 atIndex:1];
         [enc setBuffer:y offset:y_offset atIndex:2];
         [enc setBytes:&p length:sizeof(p) atIndex:3];
-        [enc dispatchThreadgroups:MTLSizeMake(T, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        [enc dispatchThreadgroups:MTLSizeMake(T, 1, 1) threadsPerThreadgroup:MTLSizeMake(tptg, 1, 1)];
     }
 
     void encode_rmsnorm_unweighted(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> x, id<MTLBuffer> y,
                                    uint32_t T, uint32_t D, float eps) {
         DsRmsParams p{T, D, eps};
+        uint32_t tptg = (D >= 1024u) ? 256u : 32u;
         [enc setComputePipelineState:pso("ds_rmsnorm_unweighted_f32")];
         [enc setBuffer:x offset:0 atIndex:0];
         [enc setBuffer:y offset:0 atIndex:1];
         [enc setBytes:&p length:sizeof(p) atIndex:2];
-        [enc dispatchThreadgroups:MTLSizeMake(T, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        [enc dispatchThreadgroups:MTLSizeMake(T, 1, 1) threadsPerThreadgroup:MTLSizeMake(tptg, 1, 1)];
     }
 
     void encode_swiglu(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> gate, id<MTLBuffer> up, id<MTLBuffer> out, uint32_t n, float clamp_val = 0.0f) {
@@ -425,6 +594,7 @@ void DeepSeekV41Model::load_tokenizer(Tokenizer& tok) const {
 void DeepSeekV41Model::load(const std::string& model_path, int max_seq, int max_chunk, int n_slots) {
     impl_->init_metal();
     gguf.open(model_path, false);
+    impl_->init_shard_buffers(gguf);
     cfg = DeepSeekConfig::from_gguf(gguf);
 
     if (!engram_path.empty()) {
@@ -578,17 +748,23 @@ void DeepSeekV41Model::load(const std::string& model_path, int max_seq, int max_
     impl_->b_idx_scores = impl_->alloc_buf(Tmax * (size_t)(max_seq_len + 1) * sizeof(float));
 
     size_t ple_dim = (size_t)std::max(1, cfg.ple_n_heads * cfg.ple_head_dim);
-    impl_->b_engram_rows = impl_->alloc_buf(Tmax * ple_dim * sizeof(float));
+    size_t n_ple = std::max<size_t>(1, cfg.ple_layers.size());
+    impl_->b_engram_rows.resize(n_ple);
+    for (size_t i = 0; i < n_ple; ++i) {
+        impl_->b_engram_rows[i] = impl_->alloc_buf(Tmax * ple_dim * sizeof(float));
+    }
     impl_->b_engram_kv = impl_->alloc_buf(Tmax * (hc + 1) * D * sizeof(float));
 
+    size_t top_k_sz = (size_t)std::max(1, cfg.num_experts_per_tok);
     impl_->b_router_logits = impl_->alloc_buf(Tmax * (size_t)std::max(1, cfg.n_routed_experts) * sizeof(float));
-    impl_->b_topk_ids = impl_->alloc_buf(Tmax * (size_t)std::max(1, cfg.num_experts_per_tok) * sizeof(int32_t));
-    impl_->b_topk_w = impl_->alloc_buf(Tmax * (size_t)std::max(1, cfg.num_experts_per_tok) * sizeof(float));
-    impl_->b_ffn_gate = impl_->alloc_buf(Tmax * Inter * sizeof(float));
-    impl_->b_ffn_up = impl_->alloc_buf(Tmax * Inter * sizeof(float));
-    impl_->b_ffn_act = impl_->alloc_buf(Tmax * Inter * sizeof(float));
+    impl_->b_topk_ids = impl_->alloc_buf(Tmax * top_k_sz * sizeof(int32_t));
+    impl_->b_topk_w = impl_->alloc_buf(Tmax * top_k_sz * sizeof(float));
+    impl_->b_ffn_gate = impl_->alloc_buf(Tmax * top_k_sz * Inter * sizeof(float));
+    impl_->b_ffn_up = impl_->alloc_buf(Tmax * top_k_sz * Inter * sizeof(float));
+    impl_->b_ffn_act = impl_->alloc_buf(Tmax * top_k_sz * Inter * sizeof(float));
     impl_->b_ffn_tmp = impl_->alloc_buf(Tmax * D * sizeof(float));
     impl_->b_logits = impl_->alloc_buf((size_t)cfg.vocab_size * sizeof(float));
+    impl_->b_argmax = impl_->alloc_buf(sizeof(int32_t));
     impl_->b_dummy_bias = impl_->alloc_buf((size_t)std::max(1, cfg.n_routed_experts) * sizeof(float));
 
     fprintf(stderr, "[warpgrid] Loaded DeepSeek-V4.1 (%s): %d layers, D=%d, H=%d, hc=%d, E=%d (top-%d), slots=%d, max_seq=%d, engram=%s\n",
@@ -614,6 +790,12 @@ void DeepSeekV41Model::reset_cache(int slot_id) {
 }
 
 void DeepSeekV41Model::forward_logits(const int32_t* h_tokens, int T, int start_pos, std::vector<float>& h_logits, int slot_id) {
+    forward_and_greedy(h_tokens, T, start_pos, slot_id);
+    h_logits.resize((size_t)cfg.vocab_size);
+    memcpy(h_logits.data(), impl_->b_logits.contents, (size_t)cfg.vocab_size * sizeof(float));
+}
+
+int32_t DeepSeekV41Model::forward_and_greedy(const int32_t* h_tokens, int T, int start_pos, int slot_id) {
     if (T <= 0 || T > max_batch_tokens) throw std::runtime_error("Invalid token batch size T");
     if (slot_id < 0 || slot_id >= max_slots) throw std::runtime_error("Invalid slot_id");
     if (start_pos < 0 || start_pos + T > max_seq_len) throw std::runtime_error("Sequence length exceeds max_seq_len");
@@ -634,19 +816,37 @@ void DeepSeekV41Model::forward_logits(const int32_t* h_tokens, int T, int start_
         dequant_row_fp32(emb_ti.type, base + tid * row_stride, hidden_ptr + (size_t)t * D, D);
     }
 
+    if ((engram.is_open() || impl_->engram_in_main_gguf) && cfg.ple_n_heads > 0 && cfg.ple_head_dim > 0) {
+        std::vector<int32_t> row_ids((size_t)cfg.ple_n_heads, 0);
+        for (size_t e_idx = 0; e_idx < cfg.ple_layers.size(); ++e_idx) {
+            float* erows_ptr = static_cast<float*>(impl_->b_engram_rows[e_idx].contents);
+            for (int t = 0; t < T; ++t) {
+                cfg.engram_hash_token((int)e_idx, hist, start_pos + t, row_ids.data());
+                for (int h = 0; h < cfg.ple_n_heads; ++h) {
+                    float* dst = erows_ptr + ((size_t)t * (size_t)cfg.ple_n_heads + (size_t)h) * (size_t)cfg.ple_head_dim;
+                    if (engram.is_open()) {
+                        engram.lookup_row("per_layer_token_embd.weight", (uint64_t)row_ids[(size_t)h], dst, (size_t)cfg.ple_head_dim);
+                    } else {
+                        const auto& pti = gguf.tensor("per_layer_token_embd.weight");
+                        size_t pstride = ggml_row_nbytes(pti.type, pti.dims[0]);
+                        const uint8_t* pbase = gguf.tensor_data("per_layer_token_embd.weight");
+                        dequant_row_fp32(pti.type, pbase + (size_t)row_ids[(size_t)h] * pstride, dst, (size_t)cfg.ple_head_dim);
+                    }
+                }
+            }
+        }
+    }
+
+    id<MTLCommandBuffer> cb = [impl_->queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
     {
-        id<MTLCommandBuffer> cb0 = [impl_->queue commandBuffer];
-        id<MTLComputeCommandEncoder> e0 = [cb0 computeCommandEncoder];
         DsStreamCollapseParams scp{(uint32_t)T, (uint32_t)D, hc};
-        [e0 setComputePipelineState:impl_->pso("ds_mhc_expand_f32")];
-        [e0 setBuffer:impl_->b_hidden offset:0 atIndex:0];
-        [e0 setBuffer:impl_->b_streams_a offset:0 atIndex:1];
-        [e0 setBytes:&scp length:sizeof(scp) atIndex:2];
-        [e0 dispatchThreads:MTLSizeMake((uint32_t)D, (uint32_t)T, 1)
+        [enc setComputePipelineState:impl_->pso("ds_mhc_expand_f32")];
+        [enc setBuffer:impl_->b_hidden offset:0 atIndex:0];
+        [enc setBuffer:impl_->b_streams_a offset:0 atIndex:1];
+        [enc setBytes:&scp length:sizeof(scp) atIndex:2];
+        [enc dispatchThreads:MTLSizeMake((uint32_t)D, (uint32_t)T, 1)
             threadsPerThreadgroup:MTLSizeMake(std::min<uint32_t>(64u, (uint32_t)D), 1, 1)];
-        [e0 endEncoding];
-        [cb0 commit];
-        [cb0 waitUntilCompleted];
     }
 
     id<MTLBuffer> pre_attn = impl_->b_hc_pre_a;
@@ -664,39 +864,15 @@ void DeepSeekV41Model::forward_logits(const int32_t* h_tokens, int T, int start_
 
         int e_idx = cfg.engram_index(l);
         if (e_idx >= 0 && (engram.is_open() || impl_->engram_in_main_gguf) && cfg.ple_n_heads > 0 && cfg.ple_head_dim > 0) {
-            float* erows_ptr = static_cast<float*>(impl_->b_engram_rows.contents);
-            std::vector<int32_t> row_ids((size_t)cfg.ple_n_heads, 0);
-            for (int t = 0; t < T; ++t) {
-                cfg.engram_hash_token(e_idx, hist, start_pos + t, row_ids.data());
-                for (int h = 0; h < cfg.ple_n_heads; ++h) {
-                    float* dst = erows_ptr + ((size_t)t * (size_t)cfg.ple_n_heads + (size_t)h) * (size_t)cfg.ple_head_dim;
-                    if (engram.is_open()) {
-                        engram.lookup_row("per_layer_token_embd.weight", (uint64_t)row_ids[(size_t)h], dst, (size_t)cfg.ple_head_dim);
-                    } else {
-                        const auto& pti = gguf.tensor("per_layer_token_embd.weight");
-                        size_t pstride = ggml_row_nbytes(pti.type, pti.dims[0]);
-                        const uint8_t* pbase = gguf.tensor_data("per_layer_token_embd.weight");
-                        dequant_row_fp32(pti.type, pbase + (size_t)row_ids[(size_t)h] * pstride, dst, (size_t)cfg.ple_head_dim);
-                    }
-                }
-            }
-            id<MTLCommandBuffer> cbe = [impl_->queue commandBuffer];
-            id<MTLComputeCommandEncoder> ence = [cbe computeCommandEncoder];
-            impl_->encode_gemv(ence, impl_->b_engram_rows, lw.engram_kv, impl_->b_engram_kv, (uint32_t)T);
+            impl_->encode_gemv(enc, impl_->b_engram_rows[(size_t)e_idx], lw.engram_kv, impl_->b_engram_kv, (uint32_t)T);
             DsEngramApplyParams eap{(uint32_t)T, (uint32_t)D, hc, cfg.rms_norm_eps};
-            [ence setComputePipelineState:impl_->pso("ds_engram_apply_f32")];
-            [ence setBuffer:impl_->b_streams_a offset:0 atIndex:0];
-            [ence setBuffer:impl_->b_engram_kv offset:0 atIndex:1];
-            [ence setBuffer:lw.engram_gate offset:0 atIndex:2];
-            [ence setBytes:&eap length:sizeof(eap) atIndex:3];
-            [ence dispatchThreadgroups:MTLSizeMake(hc, (uint32_t)T, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-            [ence endEncoding];
-            [cbe commit];
-            [cbe waitUntilCompleted];
+            [enc setComputePipelineState:impl_->pso("ds_engram_apply_f32")];
+            [enc setBuffer:impl_->b_streams_a offset:0 atIndex:0];
+            [enc setBuffer:impl_->b_engram_kv offset:0 atIndex:1];
+            [enc setBuffer:lw.engram_gate offset:0 atIndex:2];
+            [enc setBytes:&eap length:sizeof(eap) atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake(hc, (uint32_t)T, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         }
-
-        id<MTLCommandBuffer> cb = [impl_->queue commandBuffer];
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
 
         impl_->encode_hc_mixes(enc, impl_->b_streams_a, lw.hc_attn_fn, lw.hc_attn_scale, lw.hc_attn_base,
                                pre_attn, impl_->b_hc_post, impl_->b_hc_comb,
@@ -887,12 +1063,22 @@ void DeepSeekV41Model::forward_logits(const int32_t* h_tokens, int T, int start_
         }
 
         uint32_t o_groups = lw.wo_a.groups;
-        for (int t = 0; t < T; ++t) {
-            for (uint32_t g = 0; g < o_groups; ++g) {
-                size_t x_off = ((size_t)t * o_groups + g) * lw.wo_a.cols * sizeof(float);
-                size_t w_off = (size_t)g * lw.wo_a.group_stride_bytes;
-                size_t y_off = ((size_t)t * o_groups + g) * lw.wo_a.rows * sizeof(float);
-                impl_->encode_gemv(enc, impl_->b_attn_out, lw.wo_a, impl_->b_oa, 1u, x_off, w_off, y_off);
+        if (lw.wo_a.type == GgmlType::Q6_K && (lw.wo_a.cols & 255u) == 0u) {
+            GgufGroupedGemvParams gp{(uint32_t)T, o_groups, lw.wo_a.rows, lw.wo_a.cols, lw.wo_a.group_stride_bytes};
+            [enc setComputePipelineState:impl_->pso("gguf_grouped_gemv_q6_k_fast")];
+            [enc setBuffer:impl_->b_attn_out offset:0 atIndex:0];
+            [enc setBuffer:lw.wo_a.buf offset:lw.wo_a.base_offset atIndex:1];
+            [enc setBuffer:impl_->b_oa offset:0 atIndex:2];
+            [enc setBytes:&gp length:sizeof(gp) atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake((lw.wo_a.rows + 3u) / 4u, (uint32_t)T * o_groups, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        } else {
+            for (int t = 0; t < T; ++t) {
+                for (uint32_t g = 0; g < o_groups; ++g) {
+                    size_t x_off = ((size_t)t * o_groups + g) * lw.wo_a.cols * sizeof(float);
+                    size_t w_off = (size_t)g * lw.wo_a.group_stride_bytes;
+                    size_t y_off = ((size_t)t * o_groups + g) * lw.wo_a.rows * sizeof(float);
+                    impl_->encode_gemv(enc, impl_->b_attn_out, lw.wo_a, impl_->b_oa, 1u, x_off, w_off, y_off);
+                }
             }
         }
         impl_->encode_gemv(enc, impl_->b_oa, lw.wo_b, impl_->b_sub_out, (uint32_t)T);
@@ -925,76 +1111,46 @@ void DeepSeekV41Model::forward_logits(const int32_t* h_tokens, int T, int start_
         [enc setBuffer:impl_->b_topk_w offset:0 atIndex:3];
         [enc setBytes:&rp length:sizeof(rp) atIndex:4];
         [enc dispatchThreadgroups:MTLSizeMake((uint32_t)T, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-        [enc endEncoding];
-        [cb commit];
-        [cb waitUntilCompleted];
 
-        const int32_t* h_ids = static_cast<const int32_t*>(impl_->b_topk_ids.contents);
-        cb = [impl_->queue commandBuffer];
-        enc = [cb computeCommandEncoder];
-        for (int t = 0; t < T; ++t) {
-            size_t x_off = (size_t)t * D * sizeof(float);
-            for (int r = 0; r < cfg.num_experts_per_tok; ++r) {
-                int e = h_ids[t * cfg.num_experts_per_tok + r];
-                if (e < 0 || e >= (int)lw.ffn_gate_exps.groups) continue;
-                size_t g_off = (size_t)e * lw.ffn_gate_exps.group_stride_bytes;
-                size_t u_off = (size_t)e * lw.ffn_up_exps.group_stride_bytes;
-                size_t d_off = (size_t)e * lw.ffn_down_exps.group_stride_bytes;
-
-                impl_->encode_gemv(enc, impl_->b_norm, lw.ffn_gate_exps, impl_->b_ffn_gate, 1u, x_off, g_off, 0);
-                impl_->encode_gemv(enc, impl_->b_norm, lw.ffn_up_exps, impl_->b_ffn_up, 1u, x_off, u_off, 0);
-                impl_->encode_swiglu(enc, impl_->b_ffn_gate, impl_->b_ffn_up, impl_->b_ffn_act, lw.ffn_gate_exps.rows, cfg.swiglu_clamp_exp);
-                impl_->encode_gemv(enc, impl_->b_ffn_act, lw.ffn_down_exps, impl_->b_ffn_tmp, 1u, 0, d_off, 0);
-
-                struct { uint32_t n; uint32_t top_k; uint32_t r; uint32_t D; } sap{
-                    (uint32_t)D, (uint32_t)cfg.num_experts_per_tok, (uint32_t)r, (uint32_t)D
-                };
-                [enc setComputePipelineState:impl_->pso("ds_moe_scaled_add_f32")];
-                [enc setBuffer:impl_->b_sub_out offset:x_off atIndex:0];
-                [enc setBuffer:impl_->b_ffn_tmp offset:0 atIndex:1];
-                [enc setBuffer:impl_->b_topk_w offset:(size_t)t * (size_t)cfg.num_experts_per_tok * sizeof(float) atIndex:2];
-                [enc setBytes:&sap length:sizeof(sap) atIndex:3];
-                [enc dispatchThreadgroups:MTLSizeMake(((uint32_t)D + 255u) / 256u, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        uint32_t top_k_u = (uint32_t)cfg.num_experts_per_tok;
+        if (top_k_u > 0 && lw.ffn_gate_exps.groups > 0) {
+            if (lw.ffn_gate_exps.type == lw.ffn_up_exps.type &&
+                (lw.ffn_gate_exps.type == GgmlType::IQ1_S || lw.ffn_gate_exps.type == GgmlType::IQ2_XXS) &&
+                lw.ffn_gate_exps.group_stride_bytes == lw.ffn_up_exps.group_stride_bytes) {
+                impl_->encode_moe_gate_up_swiglu(enc, impl_->b_norm, lw.ffn_gate_exps, lw.ffn_up_exps,
+                                                 impl_->b_topk_ids, impl_->b_ffn_act,
+                                                 (uint32_t)T, top_k_u, cfg.swiglu_clamp_exp);
+            } else {
+                impl_->encode_moe_indexed(enc, impl_->b_norm, lw.ffn_gate_exps, impl_->b_topk_ids, impl_->b_ffn_gate, (uint32_t)T, top_k_u);
+                impl_->encode_moe_indexed(enc, impl_->b_norm, lw.ffn_up_exps, impl_->b_topk_ids, impl_->b_ffn_up, (uint32_t)T, top_k_u);
+                impl_->encode_swiglu(enc, impl_->b_ffn_gate, impl_->b_ffn_up, impl_->b_ffn_act,
+                                     (uint32_t)((size_t)T * top_k_u * lw.ffn_gate_exps.rows), cfg.swiglu_clamp_exp);
             }
+            impl_->encode_moe_down_accum(enc, impl_->b_ffn_act, lw.ffn_down_exps, impl_->b_topk_ids, impl_->b_topk_w,
+                                         impl_->b_sub_out, (uint32_t)T, top_k_u);
         }
 
         impl_->encode_hc_post(enc, impl_->b_sub_out, impl_->b_streams_a, impl_->b_hc_post, impl_->b_hc_comb,
                               impl_->b_streams_b, (uint32_t)T, (uint32_t)D, hc);
         std::swap(impl_->b_streams_a, impl_->b_streams_b);
-
-        [enc endEncoding];
-        [cb commit];
-        [cb waitUntilCompleted];
     }
 
-    id<MTLCommandBuffer> cb = [impl_->queue commandBuffer];
-    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
     if (cfg.num_hidden_layers > 0) {
         impl_->encode_hc_pre(enc, impl_->b_streams_a, pre_ffn, impl_->b_hidden, (uint32_t)T, (uint32_t)D, hc);
     }
     impl_->encode_rmsnorm(enc, impl_->b_hidden, impl_->output_norm, impl_->b_norm, (uint32_t)T, (uint32_t)D, cfg.rms_norm_eps);
     size_t last_off = (size_t)(T - 1) * D * sizeof(float);
     impl_->encode_gemv(enc, impl_->b_norm, impl_->lm_head, impl_->b_logits, 1u, last_off, 0, 0);
+    uint32_t v_sz = (uint32_t)cfg.vocab_size;
+    [enc setComputePipelineState:impl_->pso("ds_argmax_f32")];
+    [enc setBuffer:impl_->b_logits offset:0 atIndex:0];
+    [enc setBuffer:impl_->b_argmax offset:0 atIndex:1];
+    [enc setBytes:&v_sz length:sizeof(v_sz) atIndex:2];
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     [enc endEncoding];
     [cb commit];
     [cb waitUntilCompleted];
-
-    h_logits.resize((size_t)cfg.vocab_size);
-    memcpy(h_logits.data(), impl_->b_logits.contents, (size_t)cfg.vocab_size * sizeof(float));
-}
-
-int32_t DeepSeekV41Model::forward_and_greedy(const int32_t* h_tokens, int T, int start_pos, int slot_id) {
-    std::vector<float> logits;
-    forward_logits(h_tokens, T, start_pos, logits, slot_id);
-    int32_t best = 0;
-    float bv = logits.empty() ? 0.0f : logits[0];
-    for (size_t i = 1; i < logits.size(); ++i) {
-        if (logits[i] > bv) {
-            bv = logits[i];
-            best = (int32_t)i;
-        }
-    }
-    return best;
+    return *static_cast<const int32_t*>(impl_->b_argmax.contents);
 }
 
 void DeepSeekV41Model::forward_batch_decode_greedy(

@@ -552,6 +552,18 @@ public:
 
     size_t num_shards() const { return shards_.size(); }
 
+    const void* shard_mapped(size_t idx) const {
+        return idx < shards_.size() ? shards_[idx].mapped : nullptr;
+    }
+
+    size_t shard_size(size_t idx) const {
+        return idx < shards_.size() ? shards_[idx].file_size : 0;
+    }
+
+    size_t shard_data_offset(size_t idx) const {
+        return idx < shards_.size() ? shards_[idx].data_offset : 0;
+    }
+
     bool has_kv(const std::string& key) const { return kv_.count(key) > 0; }
 
     const GgufValue& kv(const std::string& key) const {

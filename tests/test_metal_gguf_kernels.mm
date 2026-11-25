@@ -5,6 +5,7 @@
 #else
 #include "../src/metal/kernels_gguf_source_embed.hpp"
 #endif
+#include "../src/gguf_iq_tables.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -752,6 +753,327 @@ static void test_ds_csa_hca_causal_attention() {
     }
 }
 
+static void test_gguf_gemv_bf16() {
+    const uint32_t M = 2, N = 8, K = 64;
+    std::vector<float> X((size_t)M * K);
+    std::vector<uint16_t> W((size_t)N * K);
+    std::vector<float> Wf((size_t)N * K);
+    for (size_t i = 0; i < X.size(); ++i) X[i] = std::sin((float)(i + 1) * 0.13f);
+    for (size_t i = 0; i < W.size(); ++i) {
+        float v = std::cos((float)(i + 3) * 0.07f);
+        uint32_t u = 0;
+        memcpy(&u, &v, 4);
+        W[i] = (uint16_t)(u >> 16);
+        uint32_t u2 = (uint32_t)W[i] << 16;
+        memcpy(&Wf[i], &u2, 4);
+    }
+    id<MTLComputePipelineState> pso = g_ctx.pso("gguf_gemv_bf16");
+    EXPECT_TRUE(pso != nil);
+    id<MTLBuffer> bx = [g_ctx.dev newBufferWithBytes:X.data() length:X.size() * sizeof(float) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> bw = [g_ctx.dev newBufferWithBytes:W.data() length:W.size() * sizeof(uint16_t) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> by = [g_ctx.dev newBufferWithLength:(size_t)M * N * sizeof(float) options:MTLResourceStorageModeShared];
+    GgufGemvParams p{M, N, K};
+    id<MTLCommandBuffer> cb = [g_ctx.q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:bx offset:0 atIndex:0];
+    [enc setBuffer:bw offset:0 atIndex:1];
+    [enc setBuffer:by offset:0 atIndex:2];
+    [enc setBytes:&p length:sizeof(p) atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake((N + 3u) / 4u, M, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    [enc endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    const float* Y = static_cast<const float*>(by.contents);
+    for (uint32_t m = 0; m < M; ++m) {
+        for (uint32_t n = 0; n < N; ++n) {
+            float ref = 0.0f;
+            for (uint32_t k = 0; k < K; ++k) ref += X[m * K + k] * Wf[n * K + k];
+            EXPECT_TRUE(std::abs(Y[m * N + n] - ref) < 1e-4f);
+        }
+    }
+}
+
+static void get_scale_min_k4_host(int j, const uint8_t* q, uint8_t& d, uint8_t& m) {
+    if (j < 4) {
+        d = q[j] & 63;
+        m = q[j + 4] & 63;
+    } else {
+        d = (q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4);
+        m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+    }
+}
+
+static void test_gguf_gemv_q5_k() {
+    const uint32_t M = 2, N = 5, K = 256;
+    const size_t blk_bytes = 176;
+    std::vector<float> X((size_t)M * K);
+    std::vector<uint8_t> W((size_t)N * blk_bytes);
+    for (size_t i = 0; i < X.size(); ++i) X[i] = std::sin((float)(i + 1) * 0.09f);
+    for (uint32_t n = 0; n < N; ++n) {
+        uint8_t* b = W.data() + (size_t)n * blk_bytes;
+        uint16_t d16 = f32_to_f16_bits(0.05f * (float)(n + 1));
+        uint16_t m16 = f32_to_f16_bits(0.02f * (float)(n + 1));
+        memcpy(b + 0, &d16, 2);
+        memcpy(b + 2, &m16, 2);
+        for (int i = 0; i < 12; ++i) b[4 + i] = (uint8_t)((n * 17 + i * 11 + 5) & 0xFF);
+        for (int i = 0; i < 32; ++i) b[16 + i] = (uint8_t)((n * 23 + i * 7 + 3) & 0xFF);
+        for (int i = 0; i < 128; ++i) b[48 + i] = (uint8_t)((n * 31 + i * 13 + 1) & 0xFF);
+    }
+    id<MTLComputePipelineState> pso = g_ctx.pso("gguf_gemv_q5_k");
+    EXPECT_TRUE(pso != nil);
+    id<MTLBuffer> bx = [g_ctx.dev newBufferWithBytes:X.data() length:X.size() * sizeof(float) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> bw = [g_ctx.dev newBufferWithBytes:W.data() length:W.size() options:MTLResourceStorageModeShared];
+    id<MTLBuffer> by = [g_ctx.dev newBufferWithLength:(size_t)M * N * sizeof(float) options:MTLResourceStorageModeShared];
+    GgufGemvParams p{M, N, K};
+    id<MTLCommandBuffer> cb = [g_ctx.q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:bx offset:0 atIndex:0];
+    [enc setBuffer:bw offset:0 atIndex:1];
+    [enc setBuffer:by offset:0 atIndex:2];
+    [enc setBytes:&p length:sizeof(p) atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake((N + 3u) / 4u, M, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    [enc endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    const float* Y = static_cast<const float*>(by.contents);
+    for (uint32_t m = 0; m < M; ++m) {
+        for (uint32_t n = 0; n < N; ++n) {
+            const uint8_t* b = W.data() + (size_t)n * blk_bytes;
+            uint16_t d16 = 0, m16 = 0;
+            memcpy(&d16, b, 2);
+            memcpy(&m16, b + 2, 2);
+            float d = f16_bits_to_f32(d16);
+            float dmin = f16_bits_to_f32(m16);
+            const uint8_t* scales = b + 4;
+            const uint8_t* qh = b + 16;
+            const uint8_t* ql = b + 48;
+            float ref = 0.0f;
+            uint8_t u1 = 1, u2 = 2;
+            int is = 0;
+            for (int j = 0; j < 256; j += 64) {
+                uint8_t sc0 = 0, mm0 = 0, sc1 = 0, mm1 = 0;
+                get_scale_min_k4_host(is + 0, scales, sc0, mm0);
+                get_scale_min_k4_host(is + 1, scales, sc1, mm1);
+                float d1 = d * sc0, min1 = dmin * mm0;
+                float d2 = d * sc1, min2 = dmin * mm1;
+                for (int l = 0; l < 32; ++l) {
+                    float w1 = d1 * (float)((ql[l] & 0x0F) + ((qh[l] & u1) ? 16 : 0)) - min1;
+                    float w2 = d2 * (float)((ql[l] >> 4) + ((qh[l] & u2) ? 16 : 0)) - min2;
+                    ref += X[m * K + j + l] * w1 + X[m * K + j + 32 + l] * w2;
+                }
+                ql += 32;
+                is += 2;
+                u1 <<= 2;
+                u2 <<= 2;
+            }
+            EXPECT_TRUE(std::abs(Y[m * N + n] - ref) < 1e-3f);
+        }
+    }
+}
+
+static void dequant_iq2_xxs_block_ref(const uint8_t* blk, float* out) {
+    uint16_t d16 = 0;
+    memcpy(&d16, blk, 2);
+    float d = f16_bits_to_f32(d16);
+    const uint16_t* qs = reinterpret_cast<const uint16_t*>(blk + 2);
+    for (int ib32 = 0; ib32 < 8; ++ib32) {
+        uint32_t aux32[2];
+        memcpy(aux32, qs + 4 * ib32, 8);
+        const uint8_t* aux8 = reinterpret_cast<const uint8_t*>(aux32);
+        float db = d * (0.5f + (float)(aux32[1] >> 28)) * 0.25f;
+        for (int l = 0; l < 4; ++l) {
+            const uint8_t* grid = reinterpret_cast<const uint8_t*>(&ink::kIq2xxsGrid[aux8[l]]);
+            uint8_t signs = ink::kSignsIq2xs[(aux32[1] >> (7 * l)) & 127u];
+            for (int j = 0; j < 8; ++j) {
+                out[ib32 * 32 + l * 8 + j] = db * (float)grid[j] * ((signs & ink::kMaskIq2xs[j]) ? -1.0f : 1.0f);
+            }
+        }
+    }
+}
+
+static void dequant_iq1_s_block_ref(const uint8_t* blk, float* out) {
+    uint16_t d16 = 0;
+    memcpy(&d16, blk, 2);
+    float d = f16_bits_to_f32(d16);
+    const uint8_t* qs = blk + 2;
+    const uint16_t* qh = reinterpret_cast<const uint16_t*>(blk + 34);
+    for (int ib = 0; ib < 8; ++ib) {
+        float dl = d * (float)(2 * ((qh[ib] >> 12) & 7) + 1);
+        float ml = dl * ((qh[ib] & 0x8000u) ? (-1.0f - ink::kIq1sDelta) : (-1.0f + ink::kIq1sDelta));
+        for (int l = 0; l < 4; ++l) {
+            uint32_t idx = (uint32_t)qs[ib * 4 + l] | (((uint32_t)((qh[ib] >> (3 * l)) & 7u)) << 8);
+            uint32_t packed = ink::kIq1sGridGpu[idx];
+            const uint8_t* gp = reinterpret_cast<const uint8_t*>(&packed);
+            for (int j = 0; j < 4; ++j) {
+                out[ib * 32 + l * 8 + j] = dl * (float)(gp[j] & 0x0Fu) + ml;
+                out[ib * 32 + l * 8 + 4 + j] = dl * (float)(gp[j] >> 4) + ml;
+            }
+        }
+    }
+}
+
+static void test_gguf_gemv_iq2_xxs() {
+    const uint32_t M = 2, N = 6, K = 256;
+    const size_t blk_bytes = 66;
+    std::vector<float> X((size_t)M * K);
+    std::vector<uint8_t> W((size_t)N * blk_bytes);
+    for (size_t i = 0; i < X.size(); ++i) X[i] = std::cos((float)(i + 2) * 0.11f);
+    for (uint32_t n = 0; n < N; ++n) {
+        uint8_t* b = W.data() + (size_t)n * blk_bytes;
+        uint16_t d16 = f32_to_f16_bits(0.125f * (float)(n + 1));
+        memcpy(b, &d16, 2);
+        for (size_t i = 2; i < blk_bytes; ++i) b[i] = (uint8_t)((n * 41 + i * 19 + 7) & 0xFF);
+    }
+    id<MTLComputePipelineState> pso = g_ctx.pso("gguf_gemv_iq2_xxs");
+    EXPECT_TRUE(pso != nil);
+    id<MTLBuffer> bx = [g_ctx.dev newBufferWithBytes:X.data() length:X.size() * sizeof(float) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> bw = [g_ctx.dev newBufferWithBytes:W.data() length:W.size() options:MTLResourceStorageModeShared];
+    id<MTLBuffer> by = [g_ctx.dev newBufferWithLength:(size_t)M * N * sizeof(float) options:MTLResourceStorageModeShared];
+    GgufGemvParams p{M, N, K};
+    id<MTLCommandBuffer> cb = [g_ctx.q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:bx offset:0 atIndex:0];
+    [enc setBuffer:bw offset:0 atIndex:1];
+    [enc setBuffer:by offset:0 atIndex:2];
+    [enc setBytes:&p length:sizeof(p) atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake((N + 3u) / 4u, M, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    [enc endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    const float* Y = static_cast<const float*>(by.contents);
+    std::vector<float> row(K);
+    for (uint32_t n = 0; n < N; ++n) {
+        dequant_iq2_xxs_block_ref(W.data() + (size_t)n * blk_bytes, row.data());
+        for (uint32_t m = 0; m < M; ++m) {
+            float ref = 0.0f;
+            for (uint32_t k = 0; k < K; ++k) ref += X[m * K + k] * row[k];
+            EXPECT_TRUE(std::abs(Y[m * N + n] - ref) < 1e-3f);
+        }
+    }
+}
+
+static void test_gguf_gemv_iq1_s() {
+    const uint32_t M = 2, N = 6, K = 256;
+    const size_t blk_bytes = 50;
+    std::vector<float> X((size_t)M * K);
+    std::vector<uint8_t> W((size_t)N * blk_bytes);
+    for (size_t i = 0; i < X.size(); ++i) X[i] = std::sin((float)(i + 5) * 0.07f);
+    for (uint32_t n = 0; n < N; ++n) {
+        uint8_t* b = W.data() + (size_t)n * blk_bytes;
+        uint16_t d16 = f32_to_f16_bits(0.1f * (float)(n + 1));
+        memcpy(b, &d16, 2);
+        for (size_t i = 2; i < blk_bytes; ++i) b[i] = (uint8_t)((n * 53 + i * 29 + 11) & 0xFF);
+    }
+    id<MTLComputePipelineState> pso = g_ctx.pso("gguf_gemv_iq1_s");
+    EXPECT_TRUE(pso != nil);
+    id<MTLBuffer> bx = [g_ctx.dev newBufferWithBytes:X.data() length:X.size() * sizeof(float) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> bw = [g_ctx.dev newBufferWithBytes:W.data() length:W.size() options:MTLResourceStorageModeShared];
+    id<MTLBuffer> by = [g_ctx.dev newBufferWithLength:(size_t)M * N * sizeof(float) options:MTLResourceStorageModeShared];
+    GgufGemvParams p{M, N, K};
+    id<MTLCommandBuffer> cb = [g_ctx.q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:bx offset:0 atIndex:0];
+    [enc setBuffer:bw offset:0 atIndex:1];
+    [enc setBuffer:by offset:0 atIndex:2];
+    [enc setBytes:&p length:sizeof(p) atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake((N + 3u) / 4u, M, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    [enc endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    const float* Y = static_cast<const float*>(by.contents);
+    std::vector<float> row(K);
+    for (uint32_t n = 0; n < N; ++n) {
+        dequant_iq1_s_block_ref(W.data() + (size_t)n * blk_bytes, row.data());
+        for (uint32_t m = 0; m < M; ++m) {
+            float ref = 0.0f;
+            for (uint32_t k = 0; k < K; ++k) ref += X[m * K + k] * row[k];
+            EXPECT_TRUE(std::abs(Y[m * N + n] - ref) < 1e-3f);
+        }
+    }
+}
+
+static void test_gguf_moe_indexed_iq1_s() {
+    const uint32_t T = 2, E = 4, N = 6, K = 256, TOPK = 2;
+    const size_t blk_bytes = 50;
+    const uint32_t stride = N * blk_bytes;
+    std::vector<float> X((size_t)T * K);
+    std::vector<uint8_t> W((size_t)E * stride);
+    std::vector<int32_t> topk_ids = {2, 0, 3, 1};
+    std::vector<float> topk_w = {0.7f, 0.3f, 0.4f, 0.6f};
+    for (size_t i = 0; i < X.size(); ++i) X[i] = std::sin((float)(i + 1) * 0.05f);
+    for (uint32_t e = 0; e < E; ++e) {
+        for (uint32_t n = 0; n < N; ++n) {
+            uint8_t* b = W.data() + (size_t)e * stride + (size_t)n * blk_bytes;
+            uint16_t d16 = f32_to_f16_bits(0.08f * (float)(e + 1));
+            memcpy(b, &d16, 2);
+            for (size_t i = 2; i < blk_bytes; ++i) b[i] = (uint8_t)((e * 67 + n * 19 + i * 13 + 5) & 0xFF);
+        }
+    }
+    id<MTLComputePipelineState> pso_idx = g_ctx.pso("gguf_moe_indexed_iq1_s");
+    id<MTLComputePipelineState> pso_acc = g_ctx.pso("gguf_moe_down_accum_iq1_s");
+    EXPECT_TRUE(pso_idx != nil);
+    EXPECT_TRUE(pso_acc != nil);
+    id<MTLBuffer> bx = [g_ctx.dev newBufferWithBytes:X.data() length:X.size() * sizeof(float) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> bw = [g_ctx.dev newBufferWithBytes:W.data() length:W.size() options:MTLResourceStorageModeShared];
+    id<MTLBuffer> bids = [g_ctx.dev newBufferWithBytes:topk_ids.data() length:topk_ids.size() * sizeof(int32_t) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> btw = [g_ctx.dev newBufferWithBytes:topk_w.data() length:topk_w.size() * sizeof(float) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> by_idx = [g_ctx.dev newBufferWithLength:(size_t)T * TOPK * N * sizeof(float) options:MTLResourceStorageModeShared];
+    std::vector<float> base_y((size_t)T * N, 1.25f);
+    id<MTLBuffer> by_acc = [g_ctx.dev newBufferWithBytes:base_y.data() length:base_y.size() * sizeof(float) options:MTLResourceStorageModeShared];
+    std::vector<float> X_per((size_t)T * TOPK * K);
+    for (uint32_t t = 0; t < T; ++t) {
+        for (uint32_t r = 0; r < TOPK; ++r) {
+            memcpy(&X_per[(t * TOPK + r) * K], &X[t * K], K * sizeof(float));
+        }
+    }
+    id<MTLBuffer> bx_per = [g_ctx.dev newBufferWithBytes:X_per.data() length:X_per.size() * sizeof(float) options:MTLResourceStorageModeShared];
+
+    GgufMoeParams mp{T, N, K, TOPK, stride};
+    id<MTLCommandBuffer> cb = [g_ctx.q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:pso_idx];
+    [enc setBuffer:bx offset:0 atIndex:0];
+    [enc setBuffer:bw offset:0 atIndex:1];
+    [enc setBuffer:bids offset:0 atIndex:2];
+    [enc setBuffer:by_idx offset:0 atIndex:3];
+    [enc setBytes:&mp length:sizeof(mp) atIndex:4];
+    [enc dispatchThreadgroups:MTLSizeMake((N + 3u) / 4u, T * TOPK, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+    [enc setComputePipelineState:pso_acc];
+    [enc setBuffer:bx_per offset:0 atIndex:0];
+    [enc setBuffer:bw offset:0 atIndex:1];
+    [enc setBuffer:bids offset:0 atIndex:2];
+    [enc setBuffer:btw offset:0 atIndex:3];
+    [enc setBuffer:by_acc offset:0 atIndex:4];
+    [enc setBytes:&mp length:sizeof(mp) atIndex:5];
+    [enc dispatchThreadgroups:MTLSizeMake((N + 3u) / 4u, T, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    [enc endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+
+    const float* Y_idx = static_cast<const float*>(by_idx.contents);
+    const float* Y_acc = static_cast<const float*>(by_acc.contents);
+    std::vector<float> row(K);
+    for (uint32_t t = 0; t < T; ++t) {
+        for (uint32_t n = 0; n < N; ++n) {
+            float ref_acc = 1.25f;
+            for (uint32_t r = 0; r < TOPK; ++r) {
+                int e = topk_ids[t * TOPK + r];
+                dequant_iq1_s_block_ref(W.data() + (size_t)e * stride + (size_t)n * blk_bytes, row.data());
+                float dot = 0.0f;
+                for (uint32_t k = 0; k < K; ++k) dot += X[t * K + k] * row[k];
+                EXPECT_TRUE(std::abs(Y_idx[(t * TOPK + r) * N + n] - dot) < 1e-3f);
+                ref_acc += topk_w[t * TOPK + r] * dot;
+            }
+            EXPECT_TRUE(std::abs(Y_acc[t * N + n] - ref_acc) < 1e-3f);
+        }
+    }
+}
+
 int main() {
     @autoreleasepool {
         if (!g_ctx.init()) {
@@ -765,7 +1087,12 @@ int main() {
         run_test("test_gguf_gemv_q4_k", test_gguf_gemv_q4_k);
         run_test("test_gguf_gemv_q6_k", test_gguf_gemv_q6_k);
         run_test("test_gguf_gemv_q2_k", test_gguf_gemv_q2_k);
+        run_test("test_gguf_gemv_bf16", test_gguf_gemv_bf16);
+        run_test("test_gguf_gemv_q5_k", test_gguf_gemv_q5_k);
+        run_test("test_gguf_gemv_iq2_xxs", test_gguf_gemv_iq2_xxs);
+        run_test("test_gguf_gemv_iq1_s", test_gguf_gemv_iq1_s);
         run_test("test_gguf_moe_topk6_accumulate", test_gguf_moe_topk6_accumulate);
+        run_test("test_gguf_moe_indexed_iq1_s", test_gguf_moe_indexed_iq1_s);
         run_test("test_ds_mhc_sinkhorn_doubly_stochastic", test_ds_mhc_sinkhorn_doubly_stochastic);
         run_test("test_ds_router_topk6_sigmoid_bias", test_ds_router_topk6_sigmoid_bias);
         run_test("test_ds_csa_hca_causal_attention", test_ds_csa_hca_causal_attention);
