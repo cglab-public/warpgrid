@@ -37,6 +37,8 @@ public:
         int B, int32_t* h_out_tokens) override;
 
     void forward_logits(const int32_t* h_tokens, int T, int start_pos, std::vector<float>& h_logits, int slot_id = 0) override;
+    void enable_imatrix_capture(bool enable) override;
+    void save_imatrix(const std::string& path) const override;
 
 private:
     std::unique_ptr<Impl> impl_;

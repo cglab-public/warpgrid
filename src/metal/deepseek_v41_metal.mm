@@ -333,6 +333,15 @@ void DeepSeekV41Model::load(const std::string& model_path, int max_seq, int max_
     if (!gguf.has_tensor("token_embd.weight")) {
         throw std::runtime_error("Missing required GGUF tensor: token_embd.weight");
     }
+    {
+        auto et = gguf.tensor("token_embd.weight").type;
+        bool ok_emb = (et == GgmlType::F32 || et == GgmlType::F16 || et == GgmlType::BF16 ||
+                       et == GgmlType::Q8_0 || et == GgmlType::IQ4_NL || et == GgmlType::MXFP4 ||
+                       et == GgmlType::Q4_K || et == GgmlType::Q5_K || et == GgmlType::Q6_K || et == GgmlType::Q2_K);
+        if (!ok_emb) {
+            throw std::runtime_error("Unsupported token_embd.weight GGUF type: " + std::to_string((uint32_t)et));
+        }
+    }
     impl_->output_norm = impl_->load_f32_1d(gguf, "output_norm.weight", (size_t)cfg.hidden_size, 1.0f);
     if (gguf.has_tensor("output.weight")) {
         impl_->lm_head = impl_->load_weight(gguf, "output.weight");
@@ -497,6 +506,15 @@ void DeepSeekV41Model::forward_logits(const int32_t* h_tokens, int T, int start_
                     uint64_t ridx = engram_hash_row(hist.data() + (abs_pos - ng_len + 1), ng_len, (uint64_t)(l + 1), erows);
                     engram.lookup_row(ename, ridx, erow.data(), D);
                     for (size_t d = 0; d < D; ++d) hidden_ptr[(size_t)t * D + d] += erow[d];
+                    if (impl_->has_mhc) {
+                        float* sp = static_cast<float*>(impl_->b_streams_a.contents);
+                        size_t Mhc = (size_t)std::max(1, cfg.hc_mult);
+                        for (size_t r = 0; r < Mhc; ++r) {
+                            for (size_t d = 0; d < D; ++d) {
+                                sp[((size_t)t * Mhc + r) * D + d] += erow[d];
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -729,6 +747,17 @@ void DeepSeekV41Model::forward_batch_decode_greedy(
     for (int b = 0; b < B; ++b) {
         h_out_tokens[b] = forward_and_greedy(&h_tokens[b], 1, h_positions[b], h_slots[b]);
     }
+}
+
+void DeepSeekV41Model::enable_imatrix_capture(bool enable) {
+    if (enable) {
+        throw std::runtime_error("--dump-imatrix is not supported for DeepSeek GGUF models");
+    }
+}
+
+void DeepSeekV41Model::save_imatrix(const std::string& path) const {
+    (void)path;
+    throw std::runtime_error("--dump-imatrix is not supported for DeepSeek GGUF models");
 }
 
 }

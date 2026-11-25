@@ -94,6 +94,97 @@ inline void dequant_row_fp32(GgmlType type, const uint8_t* src, float* dst, size
         }
         return;
     }
+    if (type == GgmlType::MXFP4) {
+        static constexpr float kE2M1[16] = {
+            0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
+           -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
+        };
+        size_t nb = n / 32;
+        for (size_t b = 0; b < nb; ++b) {
+            const uint8_t* blk = src + b * 17;
+            uint8_t e = blk[0];
+            float sc = 5.877471754111438e-39f;
+            if (e != 0) {
+                uint32_t bits = (uint32_t)e << 23;
+                std::memcpy(&sc, &bits, 4);
+            }
+            const uint8_t* qs = blk + 1;
+            for (int i = 0; i < 16; ++i) {
+                dst[b * 32 + i] = sc * kE2M1[qs[i] & 0x0Fu];
+                dst[b * 32 + 16 + i] = sc * kE2M1[qs[i] >> 4];
+            }
+        }
+        return;
+    }
+    if (type == GgmlType::Q4_K) {
+        size_t nb = n / 256;
+        for (size_t b = 0; b < nb; ++b) {
+            const uint8_t* blk = src + b * 144;
+            uint16_t d_bits = 0, dmin_bits = 0;
+            std::memcpy(&d_bits, blk, 2);
+            std::memcpy(&dmin_bits, blk + 2, 2);
+            float d = ggml_fp16_to_fp32(d_bits);
+            float dmin = ggml_fp16_to_fp32(dmin_bits);
+            const uint8_t* scales = blk + 4;
+            const uint8_t* qs = blk + 16;
+            float* y = dst + b * 256;
+            auto get_sm = [&](int j, uint8_t& sc_out, uint8_t& m_out) {
+                if (j < 4) {
+                    sc_out = scales[j] & 63u;
+                    m_out = scales[j + 4] & 63u;
+                } else {
+                    sc_out = (scales[j + 4] & 0x0Fu) | ((scales[j - 4] >> 6) << 4);
+                    m_out = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
+                }
+            };
+            int is = 0;
+            for (int j = 0; j < 256; j += 64) {
+                uint8_t sc0 = 0, m0 = 0, sc1 = 0, m1 = 0;
+                get_sm(is + 0, sc0, m0);
+                get_sm(is + 1, sc1, m1);
+                float d1 = d * (float)sc0, min1 = dmin * (float)m0;
+                float d2 = d * (float)sc1, min2 = dmin * (float)m1;
+                for (int l = 0; l < 32; ++l) {
+                    y[j + l] = d1 * (float)(qs[l] & 0x0Fu) - min1;
+                    y[j + 32 + l] = d2 * (float)(qs[l] >> 4) - min2;
+                }
+                qs += 32;
+                is += 2;
+            }
+        }
+        return;
+    }
+    if (type == GgmlType::Q2_K) {
+        size_t nb = n / 256;
+        for (size_t b = 0; b < nb; ++b) {
+            const uint8_t* blk = src + b * 84;
+            const uint8_t* scales = blk;
+            const uint8_t* q = blk + 16;
+            uint16_t d_bits = 0, dmin_bits = 0;
+            std::memcpy(&d_bits, blk + 80, 2);
+            std::memcpy(&dmin_bits, blk + 82, 2);
+            float d = ggml_fp16_to_fp32(d_bits);
+            float dmin = ggml_fp16_to_fp32(dmin_bits);
+            float* y = dst + b * 256;
+            int is = 0;
+            for (int n128 = 0; n128 < 256; n128 += 128) {
+                int shift = 0;
+                for (int j = 0; j < 4; ++j) {
+                    uint8_t sc = scales[is++];
+                    float dl = d * (float)(sc & 0x0Fu);
+                    float ml = dmin * (float)(sc >> 4);
+                    for (int l = 0; l < 16; ++l) *y++ = dl * (float)((q[l] >> shift) & 3u) - ml;
+                    sc = scales[is++];
+                    dl = d * (float)(sc & 0x0Fu);
+                    ml = dmin * (float)(sc >> 4);
+                    for (int l = 0; l < 16; ++l) *y++ = dl * (float)((q[l + 16] >> shift) & 3u) - ml;
+                    shift += 2;
+                }
+                q += 32;
+            }
+        }
+        return;
+    }
     if (type == GgmlType::Q6_K) {
         size_t nb = n / 256;
         for (size_t b = 0; b < nb; ++b) {
