@@ -204,6 +204,8 @@ struct GgufValue {
             case GgufValType::INT32:
             case GgufValType::INT64:
                 return i64 >= 0 ? (uint64_t)i64 : def;
+            case GgufValType::BOOL:
+                return b ? 1 : 0;
             default:
                 return def;
         }
@@ -367,6 +369,7 @@ class GgufFile {
     static std::vector<std::string> discover_shards(const std::string& path) {
         namespace fs = std::filesystem;
         std::error_code ec;
+        static const std::regex shard_re(R"(^(.*)-(\d{5})-of-(\d{5})\.gguf$)");
         if (fs::is_directory(path, ec)) {
             std::vector<std::string> files;
             for (const auto& entry : fs::directory_iterator(path, ec)) {
@@ -378,10 +381,32 @@ class GgufFile {
             }
             std::sort(files.begin(), files.end());
             if (files.empty()) throw std::runtime_error("No .gguf files found in directory: " + path);
+            if (files.size() == 1) {
+                std::smatch m;
+                if (std::regex_match(files[0], m, shard_re) && std::stoi(m[3].str()) > 1) {
+                    throw std::runtime_error("Incomplete GGUF shard set in directory: " + path);
+                }
+                return files;
+            }
+            std::smatch first_m;
+            if (!std::regex_match(files[0], first_m, shard_re)) {
+                throw std::runtime_error("Ambiguous directory with multiple non-shard .gguf files: " + path);
+            }
+            std::string prefix = first_m[1].str();
+            int total = std::stoi(first_m[3].str());
+            if (total <= 1 || (int)files.size() != total) {
+                throw std::runtime_error("Incomplete or ambiguous GGUF shard set in directory: " + path);
+            }
+            for (int i = 1; i <= total; ++i) {
+                char buf[32];
+                std::snprintf(buf, sizeof(buf), "-%05d-of-%05d.gguf", i, total);
+                if (files[(size_t)(i - 1)] != prefix + buf) {
+                    throw std::runtime_error("Mismatched or missing GGUF shard in directory: " + path);
+                }
+            }
             return files;
         }
 
-        static const std::regex shard_re(R"(^(.*)-(\d{5})-of-(\d{5})\.gguf$)");
         std::smatch m;
         if (std::regex_match(path, m, shard_re)) {
             std::string prefix = m[1].str();
@@ -487,6 +512,9 @@ class GgufFile {
         for (auto& ti : shard_tensors) {
             if (ti.offset > data_avail || ti.nbytes > data_avail - (size_t)ti.offset) {
                 throw std::runtime_error("Tensor data out of bounds in GGUF: " + ti.name);
+            }
+            if (tensors_.count(ti.name) > 0) {
+                throw std::runtime_error("Duplicate tensor name in GGUF shard set: " + ti.name);
             }
             tensors_[ti.name] = std::move(ti);
         }
