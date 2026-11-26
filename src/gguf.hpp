@@ -564,6 +564,11 @@ public:
         return idx < shards_.size() ? shards_[idx].data_offset : 0;
     }
 
+    const std::string& shard_path(size_t idx) const {
+        static const std::string kEmpty;
+        return idx < shards_.size() ? shards_[idx].path : kEmpty;
+    }
+
     bool has_kv(const std::string& key) const { return kv_.count(key) > 0; }
 
     const GgufValue& kv(const std::string& key) const {

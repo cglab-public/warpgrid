@@ -7,10 +7,13 @@
 #include "kernels_gguf_source_embed.hpp"
 #endif
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <mach/mach.h>
 #include <stdexcept>
 #include <unistd.h>
@@ -138,13 +141,15 @@ struct WeightBuf {
     id<MTLBuffer> buf = nil;
     size_t base_offset = 0;
     const uint8_t* raw_data = nullptr;
+    int nocache_fd = -1;
+    uint64_t file_offset = 0;
     GgmlType type = GgmlType::F32;
     uint32_t rows = 0;
     uint32_t cols = 0;
     uint32_t groups = 1;
     uint32_t group_stride_bytes = 0;
     bool valid() const { return buf != nil; }
-    bool is_streamed() const { return buf == nil && raw_data != nullptr; }
+    bool is_streamed() const { return buf == nil && (raw_data != nullptr || nocache_fd >= 0); }
 };
 
 struct Ds41LayerWeights {
@@ -196,6 +201,139 @@ struct Ds41LayerKv {
     id<MTLBuffer> topk_sel = nil;
 };
 
+static bool pread_all(int fd, void* dst, size_t len, off_t off) {
+    uint8_t* p = static_cast<uint8_t*>(dst);
+    size_t done = 0;
+    while (done < len) {
+        ssize_t n = ::pread(fd, p + done, len - done, off + (off_t)done);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (n == 0) return false;
+        done += (size_t)n;
+    }
+    return true;
+}
+
+struct ExpLruCache {
+    struct Entry {
+        int32_t layer = -1;
+        int32_t expert = -1;
+        int32_t prev = -1;
+        int32_t next = -1;
+        uint64_t pin_gen = 0;
+    };
+
+    int num_layers = 0;
+    int num_experts = 0;
+    int num_slots = 0;
+    size_t gu_stride = 0;
+    size_t d_stride = 0;
+    id<MTLBuffer> buf_g = nil;
+    id<MTLBuffer> buf_u = nil;
+    id<MTLBuffer> buf_d = nil;
+    std::vector<int32_t> lut;
+    std::vector<Entry> entries;
+    int32_t head = -1;
+    int32_t tail = -1;
+    uint64_t cur_gen = 0;
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+
+    bool enabled() const { return num_slots > 0 && buf_g != nil && buf_u != nil && buf_d != nil; }
+
+    bool init(id<MTLDevice> dev, int L, int E, size_t max_gu, size_t max_d, uint64_t budget_bytes) {
+        if (L <= 0 || E <= 0 || max_gu == 0 || max_d == 0 || budget_bytes == 0) return false;
+        size_t slot_bytes = max_gu * 2u + max_d;
+        uint64_t max_slots_budget = budget_bytes / slot_bytes;
+        uint64_t max_buf = (uint64_t)dev.maxBufferLength;
+        if (max_buf > 0) {
+            uint64_t max_slots_buf = max_buf / std::max(max_gu, max_d);
+            if (max_slots_buf < max_slots_budget) max_slots_budget = max_slots_buf;
+        }
+        uint64_t total_exps = (uint64_t)L * (uint64_t)E;
+        int slots = (int)std::min<uint64_t>(max_slots_budget, total_exps);
+        if (slots < 64) return false;
+        id<MTLBuffer> bg = [dev newBufferWithLength:(size_t)slots * max_gu options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bu = [dev newBufferWithLength:(size_t)slots * max_gu options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bd = [dev newBufferWithLength:(size_t)slots * max_d options:MTLResourceStorageModeShared];
+        if (!bg || !bu || !bd) return false;
+        num_layers = L;
+        num_experts = E;
+        num_slots = slots;
+        gu_stride = max_gu;
+        d_stride = max_d;
+        buf_g = bg;
+        buf_u = bu;
+        buf_d = bd;
+        lut.assign((size_t)L * (size_t)E, -1);
+        entries.resize((size_t)slots);
+        for (int i = 0; i < slots; ++i) {
+            entries[(size_t)i].prev = i - 1;
+            entries[(size_t)i].next = (i + 1 < slots) ? (i + 1) : -1;
+        }
+        head = 0;
+        tail = slots - 1;
+        return true;
+    }
+
+    void touch_mru(int32_t s) {
+        if (s == head) return;
+        auto& e = entries[(size_t)s];
+        if (e.prev >= 0) entries[(size_t)e.prev].next = e.next;
+        if (e.next >= 0) entries[(size_t)e.next].prev = e.prev;
+        if (s == tail) tail = e.prev;
+        e.prev = -1;
+        e.next = head;
+        if (head >= 0) entries[(size_t)head].prev = s;
+        head = s;
+        if (tail < 0) tail = s;
+    }
+
+    void pin_and_resolve(int layer, const int32_t* uniq_ids, size_t U,
+                         std::vector<int32_t>& out_slots,
+                         std::vector<std::pair<int32_t, int32_t>>& out_misses) {
+        ++cur_gen;
+        out_slots.assign(U, -1);
+        out_misses.clear();
+        size_t base = (size_t)layer * (size_t)num_experts;
+        for (size_t u = 0; u < U; ++u) {
+            int32_t eid = uniq_ids[u];
+            int32_t s = lut[base + (size_t)eid];
+            if (s >= 0) {
+                entries[(size_t)s].pin_gen = cur_gen;
+                touch_mru(s);
+                out_slots[u] = s;
+                hits++;
+            }
+        }
+        int32_t scan = tail;
+        for (size_t u = 0; u < U; ++u) {
+            if (out_slots[u] >= 0) continue;
+            while (scan >= 0 && entries[(size_t)scan].pin_gen == cur_gen) {
+                scan = entries[(size_t)scan].prev;
+            }
+            if (scan < 0) throw std::runtime_error("ExpLruCache exhausted pinned slots");
+            int32_t s = scan;
+            scan = entries[(size_t)s].prev;
+            auto& e = entries[(size_t)s];
+            if (e.layer >= 0 && e.expert >= 0) {
+                lut[(size_t)e.layer * (size_t)num_experts + (size_t)e.expert] = -1;
+            }
+            int32_t eid = uniq_ids[u];
+            e.layer = layer;
+            e.expert = eid;
+            e.pin_gen = cur_gen;
+            lut[base + (size_t)eid] = s;
+            touch_mru(s);
+            out_slots[u] = s;
+            out_misses.push_back({s, eid});
+            misses++;
+        }
+    }
+};
+
 }
 
 struct DeepSeekV41Model::Impl {
@@ -220,6 +358,14 @@ struct DeepSeekV41Model::Impl {
     size_t moe_stage_cap_gate = 0;
     size_t moe_stage_cap_up = 0;
     size_t moe_stage_cap_down = 0;
+    std::vector<int> nocache_fds;
+    ExpLruCache exp_cache;
+
+    ~Impl() {
+        for (int fd : nocache_fds) {
+            if (fd >= 0) ::close(fd);
+        }
+    }
 
     id<MTLBuffer> b_streams_a = nil;
     id<MTLBuffer> b_streams_b = nil;
@@ -397,7 +543,12 @@ struct DeepSeekV41Model::Impl {
         if (wb.groups > 1 && wb.cols > 0) {
             wb.group_stride_bytes = (uint32_t)(ggml_row_nbytes(ti.type, wb.cols) * wb.rows);
         }
-        wb.raw_data = gf.tensor_data(name);
+        if (ti.shard_index < nocache_fds.size() && nocache_fds[ti.shard_index] >= 0) {
+            wb.nocache_fd = nocache_fds[ti.shard_index];
+            wb.file_offset = (uint64_t)gf.shard_data_offset(ti.shard_index) + ti.offset;
+        } else {
+            wb.raw_data = gf.tensor_data(name);
+        }
         return wb;
     }
 
@@ -753,7 +904,7 @@ void DeepSeekV41Model::load(const std::string& model_path, int max_seq, int max_
     size_t kv_layer_bytes = (size_t)max_slots * (size_t)max_seq_len * (size_t)cfg.head_dim * sizeof(float);
     uint32_t topk_cap = (uint32_t)std::max(1, cfg.index_topk);
 
-    uint64_t moe_budget_bytes = (rec_ws > 0) ? (rec_ws * 32u) / 100u : UINT64_MAX;
+    uint64_t moe_budget_bytes = (rec_ws > 0) ? (rec_ws * 45u) / 100u : UINT64_MAX;
     {
         vm_statistics64_data_t vm_stat{};
         mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
@@ -761,7 +912,7 @@ void DeepSeekV41Model::load(const std::string& model_path, int max_seq, int max_
             long ps = sysconf(_SC_PAGESIZE);
             uint64_t page_sz = ps > 0 ? (uint64_t)ps : 16384ull;
             uint64_t avail_bytes = ((uint64_t)vm_stat.free_count + (uint64_t)vm_stat.inactive_count + (uint64_t)vm_stat.purgeable_count) * page_sz;
-            uint64_t safe_avail = (avail_bytes * 45u) / 100u;
+            uint64_t safe_avail = (avail_bytes * 60u) / 100u;
             if (safe_avail < moe_budget_bytes) moe_budget_bytes = safe_avail;
         }
     }
@@ -769,6 +920,48 @@ void DeepSeekV41Model::load(const std::string& model_path, int max_seq, int max_
         double gb = std::atof(env_gb);
         if (gb >= 0.0) moe_budget_bytes = (uint64_t)(gb * 1024.0 * 1024.0 * 1024.0);
     }
+
+    uint64_t total_moe_bytes = 0;
+    size_t max_gu_stride = 0;
+    size_t max_d_stride = 0;
+    bool any_f16_exp = false;
+    for (int l = 0; l < cfg.num_hidden_layers; ++l) {
+        std::string p = "blk." + std::to_string(l) + ".";
+        for (const char* suf : {"ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"}) {
+            std::string nm = p + suf;
+            if (!gguf.has_tensor(nm)) continue;
+            const auto& t = gguf.tensor(nm);
+            total_moe_bytes += t.nbytes;
+            if (t.type == GgmlType::F16) any_f16_exp = true;
+            uint32_t cols = t.dims.size() >= 1 ? (uint32_t)t.dims[0] : 0;
+            uint32_t rows = t.dims.size() >= 2 ? (uint32_t)t.dims[1] : 1;
+            uint32_t grps = t.dims.size() >= 3 ? (uint32_t)t.dims[2] : 1;
+            if (grps > 1 && cols > 0) {
+                size_t st = ggml_row_nbytes(t.type, cols) * rows;
+                if (suf[4] == 'd') max_d_stride = std::max(max_d_stride, st);
+                else max_gu_stride = std::max(max_gu_stride, st);
+            }
+        }
+    }
+    bool use_exp_cache = false;
+    if (!any_f16_exp && total_moe_bytes > moe_budget_bytes && max_gu_stride > 0 && max_d_stride > 0) {
+        use_exp_cache = impl_->exp_cache.init(
+            impl_->dev, cfg.num_hidden_layers, cfg.n_routed_experts,
+            max_gu_stride, max_d_stride, moe_budget_bytes);
+        if (use_exp_cache) {
+            impl_->nocache_fds.assign(gguf.num_shards(), -1);
+            for (size_t s = 0; s < gguf.num_shards(); ++s) {
+                const std::string& sp = gguf.shard_path(s);
+                if (sp.empty()) continue;
+                int fd = ::open(sp.c_str(), O_RDONLY);
+                if (fd >= 0) {
+                    ::fcntl(fd, F_NOCACHE, 1);
+                    impl_->nocache_fds[s] = fd;
+                }
+            }
+        }
+    }
+
     uint64_t resident_moe_bytes = 0;
     int resident_moe_layers = 0;
 
@@ -840,7 +1033,7 @@ void DeepSeekV41Model::load(const std::string& model_path, int max_seq, int max_
             layer_moe_bytes += t.nbytes;
             has_f16_exp = has_f16_exp || (t.type == GgmlType::F16);
         }
-        bool stream_layer = !has_f16_exp && (resident_moe_bytes + layer_moe_bytes > moe_budget_bytes);
+        bool stream_layer = use_exp_cache || (!has_f16_exp && (resident_moe_bytes + layer_moe_bytes > moe_budget_bytes));
         if (stream_layer) {
             impl_->stream_moe_experts = true;
         } else {
@@ -923,12 +1116,24 @@ void DeepSeekV41Model::load(const std::string& model_path, int max_seq, int max_
         num_snapshots = 1;
     }
 
-    fprintf(stderr, "[warpgrid] Loaded DeepSeek-V4.1 (%s): %d layers, D=%d, H=%d, hc=%d, E=%d (top-%d), slots=%d, max_seq=%d, engram=%s, moe_res=%d/%d, prefix_cache=%s\n",
-            cfg.arch.c_str(), cfg.num_hidden_layers, cfg.hidden_size, cfg.num_attention_heads,
-            cfg.hc_mult, cfg.n_routed_experts, cfg.num_experts_per_tok, max_slots, max_seq_len,
-            (engram.is_open() || impl_->engram_in_main_gguf) ? "ON" : "OFF",
-            resident_moe_layers, cfg.num_hidden_layers,
-            num_snapshots > 0 ? "ON" : "OFF");
+    if (impl_->exp_cache.enabled()) {
+        double cache_gib = (double)impl_->exp_cache.num_slots *
+                           (double)(impl_->exp_cache.gu_stride * 2u + impl_->exp_cache.d_stride) /
+                           (1024.0 * 1024.0 * 1024.0);
+        fprintf(stderr, "[warpgrid] Loaded DeepSeek-V4.1 (%s): %d layers, D=%d, H=%d, hc=%d, E=%d (top-%d), slots=%d, max_seq=%d, engram=%s, exp_cache=%d/%d (%.1fGiB F_NOCACHE), prefix_cache=%s\n",
+                cfg.arch.c_str(), cfg.num_hidden_layers, cfg.hidden_size, cfg.num_attention_heads,
+                cfg.hc_mult, cfg.n_routed_experts, cfg.num_experts_per_tok, max_slots, max_seq_len,
+                (engram.is_open() || impl_->engram_in_main_gguf) ? "ON" : "OFF",
+                impl_->exp_cache.num_slots, cfg.num_hidden_layers * cfg.n_routed_experts, cache_gib,
+                num_snapshots > 0 ? "ON" : "OFF");
+    } else {
+        fprintf(stderr, "[warpgrid] Loaded DeepSeek-V4.1 (%s): %d layers, D=%d, H=%d, hc=%d, E=%d (top-%d), slots=%d, max_seq=%d, engram=%s, moe_res=%d/%d, prefix_cache=%s\n",
+                cfg.arch.c_str(), cfg.num_hidden_layers, cfg.hidden_size, cfg.num_attention_heads,
+                cfg.hc_mult, cfg.n_routed_experts, cfg.num_experts_per_tok, max_slots, max_seq_len,
+                (engram.is_open() || impl_->engram_in_main_gguf) ? "ON" : "OFF",
+                resident_moe_layers, cfg.num_hidden_layers,
+                num_snapshots > 0 ? "ON" : "OFF");
+    }
 }
 
 void DeepSeekV41Model::reset_cache(int slot_id) {
@@ -1307,6 +1512,76 @@ int32_t DeepSeekV41Model::forward_and_greedy(const int32_t* h_tokens, int T, int
                 const uint8_t* src_g = lw.ffn_gate_exps.raw_data;
                 const uint8_t* src_u = lw.ffn_up_exps.raw_data;
                 const uint8_t* src_d = lw.ffn_down_exps.raw_data;
+                int fd_g = lw.ffn_gate_exps.nocache_fd;
+                int fd_u = lw.ffn_up_exps.nocache_fd;
+                int fd_d = lw.ffn_down_exps.nocache_fd;
+                uint64_t off_g = lw.ffn_gate_exps.file_offset;
+                uint64_t off_u = lw.ffn_up_exps.file_offset;
+                uint64_t off_d = lw.ffn_down_exps.file_offset;
+
+                if (impl_->exp_cache.enabled() && U <= (size_t)impl_->exp_cache.num_slots) {
+                    std::vector<int32_t> slot_for_u;
+                    std::vector<std::pair<int32_t, int32_t>> miss_list;
+                    impl_->exp_cache.pin_and_resolve(l, uniq_ids.data(), U, slot_for_u, miss_list);
+                    for (uint32_t i = 0; i < n_sel; ++i) {
+                        st_ids[i] = slot_for_u[(size_t)full_loc[i]];
+                    }
+                    if (!miss_list.empty()) {
+                        uint8_t* dst_g = static_cast<uint8_t*>(impl_->exp_cache.buf_g.contents);
+                        uint8_t* dst_u = static_cast<uint8_t*>(impl_->exp_cache.buf_u.contents);
+                        uint8_t* dst_d = static_cast<uint8_t*>(impl_->exp_cache.buf_d.contents);
+                        size_t c_gu = impl_->exp_cache.gu_stride;
+                        size_t c_d = impl_->exp_cache.d_stride;
+                        const auto* misses = miss_list.data();
+                        std::atomic<bool> io_err{false};
+                        std::atomic<bool>* io_err_p = &io_err;
+                        dispatch_apply(miss_list.size(), dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t m) {
+                            size_t slot = (size_t)misses[m].first;
+                            size_t eid = (size_t)misses[m].second;
+                            bool ok = true;
+                            if (fd_g >= 0) ok = ok && pread_all(fd_g, dst_g + slot * c_gu, g_stride, (off_t)(off_g + eid * g_stride));
+                            else memcpy(dst_g + slot * c_gu, src_g + eid * g_stride, g_stride);
+                            if (fd_u >= 0) ok = ok && pread_all(fd_u, dst_u + slot * c_gu, u_stride, (off_t)(off_u + eid * u_stride));
+                            else memcpy(dst_u + slot * c_gu, src_u + eid * u_stride, u_stride);
+                            if (fd_d >= 0) ok = ok && pread_all(fd_d, dst_d + slot * c_d, d_stride, (off_t)(off_d + eid * d_stride));
+                            else memcpy(dst_d + slot * c_d, src_d + eid * d_stride, d_stride);
+                            if (!ok) io_err_p->store(true, std::memory_order_relaxed);
+                        });
+                        if (io_err.load(std::memory_order_relaxed)) {
+                            throw std::runtime_error("pread failed on GGUF shard");
+                        }
+                    }
+                    gate_w.buf = impl_->exp_cache.buf_g;
+                    gate_w.base_offset = 0;
+                    gate_w.groups = (uint32_t)impl_->exp_cache.num_slots;
+                    gate_w.group_stride_bytes = (uint32_t)impl_->exp_cache.gu_stride;
+                    up_w.buf = impl_->exp_cache.buf_u;
+                    up_w.base_offset = 0;
+                    up_w.groups = (uint32_t)impl_->exp_cache.num_slots;
+                    up_w.group_stride_bytes = (uint32_t)impl_->exp_cache.gu_stride;
+                    down_w.buf = impl_->exp_cache.buf_d;
+                    down_w.base_offset = 0;
+                    down_w.groups = (uint32_t)impl_->exp_cache.num_slots;
+                    down_w.group_stride_bytes = (uint32_t)impl_->exp_cache.d_stride;
+                    ids_buf = impl_->b_stage_topk_ids;
+
+                    cb = [impl_->queue commandBuffer];
+                    enc = [cb computeCommandEncoder];
+                    if (gate_w.type == up_w.type &&
+                        (gate_w.type == GgmlType::IQ1_S || gate_w.type == GgmlType::IQ2_XXS) &&
+                        gate_w.group_stride_bytes == up_w.group_stride_bytes) {
+                        impl_->encode_moe_gate_up_swiglu(enc, impl_->b_norm, gate_w, up_w,
+                                                         ids_buf, impl_->b_ffn_act,
+                                                         (uint32_t)T, top_k_u, cfg.swiglu_clamp_exp);
+                    } else {
+                        impl_->encode_moe_indexed(enc, impl_->b_norm, gate_w, ids_buf, impl_->b_ffn_gate, (uint32_t)T, top_k_u);
+                        impl_->encode_moe_indexed(enc, impl_->b_norm, up_w, ids_buf, impl_->b_ffn_up, (uint32_t)T, top_k_u);
+                        impl_->encode_swiglu(enc, impl_->b_ffn_gate, impl_->b_ffn_up, impl_->b_ffn_act,
+                                             (uint32_t)((size_t)T * top_k_u * gate_w.rows), cfg.swiglu_clamp_exp);
+                    }
+                    impl_->encode_moe_down_accum(enc, impl_->b_ffn_act, down_w, ids_buf, impl_->b_topk_w,
+                                                 impl_->b_sub_out, (uint32_t)T, top_k_u);
+                } else {
                 constexpr size_t kMaxStageChunk = 16u;
                 size_t cap_u = std::min<size_t>(U, kMaxStageChunk);
                 impl_->ensure_moe_stage(cap_u * g_stride, cap_u * u_stride, cap_u * d_stride);
@@ -1324,12 +1599,22 @@ int32_t DeepSeekV41Model::forward_and_greedy(const int32_t* h_tokens, int T, int
                                         ? (loc - (int32_t)base_u)
                                         : -1;
                     }
+                    std::atomic<bool> io_err{false};
+                    std::atomic<bool>* io_err_p = &io_err;
                     dispatch_apply(chunk_u, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t u) {
                         size_t eid = (size_t)uids[base_u + u];
-                        memcpy(dst_g + u * g_stride, src_g + eid * g_stride, g_stride);
-                        memcpy(dst_u + u * u_stride, src_u + eid * u_stride, u_stride);
-                        memcpy(dst_d + u * d_stride, src_d + eid * d_stride, d_stride);
+                        bool ok = true;
+                        if (fd_g >= 0) ok = ok && pread_all(fd_g, dst_g + u * g_stride, g_stride, (off_t)(off_g + eid * g_stride));
+                        else memcpy(dst_g + u * g_stride, src_g + eid * g_stride, g_stride);
+                        if (fd_u >= 0) ok = ok && pread_all(fd_u, dst_u + u * u_stride, u_stride, (off_t)(off_u + eid * u_stride));
+                        else memcpy(dst_u + u * u_stride, src_u + eid * u_stride, u_stride);
+                        if (fd_d >= 0) ok = ok && pread_all(fd_d, dst_d + u * d_stride, d_stride, (off_t)(off_d + eid * d_stride));
+                        else memcpy(dst_d + u * d_stride, src_d + eid * d_stride, d_stride);
+                        if (!ok) io_err_p->store(true, std::memory_order_relaxed);
                     });
+                    if (io_err.load(std::memory_order_relaxed)) {
+                        throw std::runtime_error("pread failed on GGUF shard");
+                    }
 
                     gate_w.buf = impl_->b_moe_stage_gate;
                     gate_w.base_offset = 0;
@@ -1363,6 +1648,7 @@ int32_t DeepSeekV41Model::forward_and_greedy(const int32_t* h_tokens, int T, int
                         [cb commit];
                         [cb waitUntilCompleted];
                     }
+                }
                 }
             } else {
                 if (gate_w.type == up_w.type &&
