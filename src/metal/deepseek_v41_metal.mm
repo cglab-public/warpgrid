@@ -9,7 +9,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <mach/mach.h>
 #include <stdexcept>
 #include <unistd.h>
 #include <unordered_map>
@@ -135,12 +137,14 @@ struct DsStreamCollapseParams {
 struct WeightBuf {
     id<MTLBuffer> buf = nil;
     size_t base_offset = 0;
+    const uint8_t* raw_data = nullptr;
     GgmlType type = GgmlType::F32;
     uint32_t rows = 0;
     uint32_t cols = 0;
     uint32_t groups = 1;
     uint32_t group_stride_bytes = 0;
     bool valid() const { return buf != nil; }
+    bool is_streamed() const { return buf == nil && raw_data != nullptr; }
 };
 
 struct Ds41LayerWeights {
@@ -203,10 +207,19 @@ struct DeepSeekV41Model::Impl {
     WeightBuf lm_head;
     id<MTLBuffer> output_norm = nil;
     bool engram_in_main_gguf = false;
+    bool stream_moe_experts = false;
     std::vector<id<MTLBuffer>> shard_bufs;
     std::vector<Ds41LayerWeights> layers;
     std::vector<Ds41LayerKv> kv_caches;
     std::vector<std::vector<int32_t>> slot_tok_history;
+
+    id<MTLBuffer> b_moe_stage_gate = nil;
+    id<MTLBuffer> b_moe_stage_up = nil;
+    id<MTLBuffer> b_moe_stage_down = nil;
+    id<MTLBuffer> b_stage_topk_ids = nil;
+    size_t moe_stage_cap_gate = 0;
+    size_t moe_stage_cap_up = 0;
+    size_t moe_stage_cap_down = 0;
 
     id<MTLBuffer> b_streams_a = nil;
     id<MTLBuffer> b_streams_b = nil;
@@ -312,22 +325,8 @@ struct DeepSeekV41Model::Impl {
     }
 
     void init_shard_buffers(const GgufFile& gf) {
-        shard_bufs.assign(gf.num_shards(), nil);
-        long ps = sysconf(_SC_PAGESIZE);
-        size_t page_sz = ps > 0 ? (size_t)ps : 16384u;
-        uint64_t max_buf = (uint64_t)dev.maxBufferLength;
-        for (size_t s = 0; s < gf.num_shards(); ++s) {
-            const void* ptr = gf.shard_mapped(s);
-            size_t sz = gf.shard_size(s);
-            if (!ptr || sz == 0) continue;
-            size_t aligned_len = (sz + page_sz - 1u) & ~(page_sz - 1u);
-            if (max_buf > 0 && aligned_len > max_buf) continue;
-            id<MTLBuffer> b = [dev newBufferWithBytesNoCopy:const_cast<void*>(ptr)
-                                                     length:aligned_len
-                                                    options:MTLResourceStorageModeShared
-                                                deallocator:nil];
-            shard_bufs[s] = b;
-        }
+        shard_bufs.clear();
+        (void)gf;
     }
 
     WeightBuf load_weight_required(const GgufFile& gf, const std::string& name, uint32_t force_groups = 0) {
@@ -354,17 +353,67 @@ struct DeepSeekV41Model::Impl {
             dequant_row_fp32(ti.type, gf.tensor_data(name), static_cast<float*>(wb.buf.contents), total_elems);
             wb.type = GgmlType::F32;
             if (wb.groups > 1) wb.group_stride_bytes = wb.cols * wb.rows * (uint32_t)sizeof(float);
-        } else if (ti.shard_index < shard_bufs.size() && shard_bufs[ti.shard_index] != nil) {
-            wb.buf = shard_bufs[ti.shard_index];
-            wb.base_offset = gf.shard_data_offset(ti.shard_index) + (size_t)ti.offset;
         } else {
-            wb.buf = [dev newBufferWithBytes:gf.tensor_data(name)
-                                      length:std::max<size_t>(16, ti.nbytes)
-                                     options:MTLResourceStorageModeShared];
-            wb.base_offset = 0;
-            if (!wb.buf) throw std::runtime_error("Metal buffer allocation failed for tensor: " + name);
+            long ps = sysconf(_SC_PAGESIZE);
+            size_t page_sz = ps > 0 ? (size_t)ps : 16384u;
+            uintptr_t ptr_addr = reinterpret_cast<uintptr_t>(gf.tensor_data(name));
+            uintptr_t page_base = ptr_addr & ~(uintptr_t)(page_sz - 1u);
+            size_t intra = (size_t)(ptr_addr - page_base);
+            size_t aligned_len = (intra + std::max<size_t>(16, ti.nbytes) + page_sz - 1u) & ~(page_sz - 1u);
+            uint64_t max_buf = (uint64_t)dev.maxBufferLength;
+            id<MTLBuffer> nocopy = nil;
+            if (max_buf == 0 || aligned_len <= max_buf) {
+                nocopy = [dev newBufferWithBytesNoCopy:reinterpret_cast<void*>(page_base)
+                                                length:aligned_len
+                                               options:MTLResourceStorageModeShared
+                                           deallocator:nil];
+            }
+            if (nocopy != nil) {
+                wb.buf = nocopy;
+                wb.base_offset = intra;
+            } else {
+                wb.buf = [dev newBufferWithBytes:gf.tensor_data(name)
+                                          length:std::max<size_t>(16, ti.nbytes)
+                                         options:MTLResourceStorageModeShared];
+                wb.base_offset = 0;
+                if (!wb.buf) throw std::runtime_error("Metal buffer allocation failed for tensor: " + name);
+            }
         }
         return wb;
+    }
+
+    WeightBuf load_weight_streamable(const GgufFile& gf, const std::string& name, bool stream) {
+        if (!stream) return load_weight_required(gf, name);
+        if (!gf.has_tensor(name)) {
+            throw std::runtime_error("Missing required DeepSeek-V4.1 tensor: " + name);
+        }
+        const auto& ti = gf.tensor(name);
+        if (ti.type == GgmlType::F16) return load_weight_required(gf, name);
+        WeightBuf wb;
+        wb.type = ti.type;
+        wb.cols = ti.dims.size() >= 1 ? (uint32_t)ti.dims[0] : 0;
+        wb.rows = ti.dims.size() >= 2 ? (uint32_t)ti.dims[1] : 1;
+        wb.groups = ti.dims.size() >= 3 ? (uint32_t)ti.dims[2] : 1;
+        if (wb.groups > 1 && wb.cols > 0) {
+            wb.group_stride_bytes = (uint32_t)(ggml_row_nbytes(ti.type, wb.cols) * wb.rows);
+        }
+        wb.raw_data = gf.tensor_data(name);
+        return wb;
+    }
+
+    void ensure_moe_stage(size_t g_bytes, size_t u_bytes, size_t d_bytes) {
+        if (g_bytes > moe_stage_cap_gate) {
+            b_moe_stage_gate = alloc_buf(g_bytes);
+            moe_stage_cap_gate = g_bytes;
+        }
+        if (u_bytes > moe_stage_cap_up) {
+            b_moe_stage_up = alloc_buf(u_bytes);
+            moe_stage_cap_up = u_bytes;
+        }
+        if (d_bytes > moe_stage_cap_down) {
+            b_moe_stage_down = alloc_buf(d_bytes);
+            moe_stage_cap_down = d_bytes;
+        }
     }
 
     static const char* gemv_kernel_for(GgmlType t) {
@@ -436,6 +485,33 @@ struct DeepSeekV41Model::Impl {
         }
         if (w.type == GgmlType::Q6_K && (x_offset & 15u) == 0u) {
             [enc setComputePipelineState:pso("gguf_gemv_q6_k_fast")];
+            [enc setBuffer:x offset:x_offset atIndex:0];
+            [enc setBuffer:w.buf offset:w.base_offset + w_offset atIndex:1];
+            [enc setBuffer:y offset:y_offset atIndex:2];
+            [enc setBytes:&p length:sizeof(p) atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake((w.rows + 3u) / 4u, M, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            return;
+        }
+        if (w.type == GgmlType::Q8_0 && (x_offset & 15u) == 0u) {
+            [enc setComputePipelineState:pso("gguf_gemv_q8_0_fast")];
+            [enc setBuffer:x offset:x_offset atIndex:0];
+            [enc setBuffer:w.buf offset:w.base_offset + w_offset atIndex:1];
+            [enc setBuffer:y offset:y_offset atIndex:2];
+            [enc setBytes:&p length:sizeof(p) atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake((w.rows + 3u) / 4u, M, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            return;
+        }
+        if (w.type == GgmlType::Q5_K) {
+            [enc setComputePipelineState:pso("gguf_gemv_q5_k_fast")];
+            [enc setBuffer:x offset:x_offset atIndex:0];
+            [enc setBuffer:w.buf offset:w.base_offset + w_offset atIndex:1];
+            [enc setBuffer:y offset:y_offset atIndex:2];
+            [enc setBytes:&p length:sizeof(p) atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake((w.rows + 3u) / 4u, M, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            return;
+        }
+        if (w.type == GgmlType::BF16 && (w.cols & 3u) == 0u && ((w.base_offset + w_offset) & 7u) == 0u && (x_offset & 15u) == 0u) {
+            [enc setComputePipelineState:pso("gguf_gemv_bf16_fast")];
             [enc setBuffer:x offset:x_offset atIndex:0];
             [enc setBuffer:w.buf offset:w.base_offset + w_offset atIndex:1];
             [enc setBuffer:y offset:y_offset atIndex:2];
@@ -604,6 +680,14 @@ void DeepSeekV41Model::load(const std::string& model_path, int max_seq, int max_
         }
     }
     impl_->engram_in_main_gguf = gguf.has_tensor("per_layer_token_embd.weight");
+    if (impl_->engram_in_main_gguf) {
+        size_t es = gguf.tensor("per_layer_token_embd.weight").shard_index;
+        const void* ep = gguf.shard_mapped(es);
+        size_t esz = gguf.shard_size(es);
+        if (ep && esz > 0) {
+            ::madvise(const_cast<void*>(ep), esz, MADV_RANDOM);
+        }
+    }
     if (!cfg.ple_layers.empty() && !engram.is_open() && !impl_->engram_in_main_gguf) {
         throw std::runtime_error("Model declares Engram layers (ple.layers) but per_layer_token_embd.weight is missing; pass --engram <path>");
     }
@@ -645,6 +729,25 @@ void DeepSeekV41Model::load(const std::string& model_path, int max_seq, int max_
 
     size_t kv_layer_bytes = (size_t)max_slots * (size_t)max_seq_len * (size_t)cfg.head_dim * sizeof(float);
     uint32_t topk_cap = (uint32_t)std::max(1, cfg.index_topk);
+
+    uint64_t moe_budget_bytes = (rec_ws > 0) ? (rec_ws * 32u) / 100u : UINT64_MAX;
+    {
+        vm_statistics64_data_t vm_stat{};
+        mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+        if (host_statistics64(mach_host_self(), HOST_VM_INFO64, reinterpret_cast<host_info64_t>(&vm_stat), &count) == KERN_SUCCESS) {
+            long ps = sysconf(_SC_PAGESIZE);
+            uint64_t page_sz = ps > 0 ? (uint64_t)ps : 16384ull;
+            uint64_t avail_bytes = ((uint64_t)vm_stat.free_count + (uint64_t)vm_stat.inactive_count + (uint64_t)vm_stat.purgeable_count) * page_sz;
+            uint64_t safe_avail = (avail_bytes * 45u) / 100u;
+            if (safe_avail < moe_budget_bytes) moe_budget_bytes = safe_avail;
+        }
+    }
+    if (const char* env_gb = std::getenv("WARPGRID_DS_MOE_BUDGET_GB")) {
+        double gb = std::atof(env_gb);
+        if (gb >= 0.0) moe_budget_bytes = (uint64_t)(gb * 1024.0 * 1024.0 * 1024.0);
+    }
+    uint64_t resident_moe_bytes = 0;
+    int resident_moe_layers = 0;
 
     for (int l = 0; l < cfg.num_hidden_layers; ++l) {
         std::string p = "blk." + std::to_string(l) + ".";
@@ -697,9 +800,20 @@ void DeepSeekV41Model::load(const std::string& model_path, int max_seq, int max_
         lw.ffn_norm = impl_->load_f32_required(gguf, p + "ffn_norm.weight");
         lw.router = impl_->load_weight_required(gguf, p + "ffn_gate_inp.weight");
         lw.router_bias = impl_->load_f32_required(gguf, p + "exp_probs_b.bias");
-        lw.ffn_gate_exps = impl_->load_weight_required(gguf, p + "ffn_gate_exps.weight");
-        lw.ffn_up_exps = impl_->load_weight_required(gguf, p + "ffn_up_exps.weight");
-        lw.ffn_down_exps = impl_->load_weight_required(gguf, p + "ffn_down_exps.weight");
+        uint64_t layer_moe_bytes = 0;
+        if (gguf.has_tensor(p + "ffn_gate_exps.weight")) layer_moe_bytes += gguf.tensor(p + "ffn_gate_exps.weight").nbytes;
+        if (gguf.has_tensor(p + "ffn_up_exps.weight")) layer_moe_bytes += gguf.tensor(p + "ffn_up_exps.weight").nbytes;
+        if (gguf.has_tensor(p + "ffn_down_exps.weight")) layer_moe_bytes += gguf.tensor(p + "ffn_down_exps.weight").nbytes;
+        bool stream_layer = (resident_moe_bytes + layer_moe_bytes > moe_budget_bytes);
+        if (stream_layer) {
+            impl_->stream_moe_experts = true;
+        } else {
+            resident_moe_bytes += layer_moe_bytes;
+            resident_moe_layers++;
+        }
+        lw.ffn_gate_exps = impl_->load_weight_streamable(gguf, p + "ffn_gate_exps.weight", stream_layer);
+        lw.ffn_up_exps = impl_->load_weight_streamable(gguf, p + "ffn_up_exps.weight", stream_layer);
+        lw.ffn_down_exps = impl_->load_weight_streamable(gguf, p + "ffn_down_exps.weight", stream_layer);
         lw.ffn_gate_shexp = impl_->load_weight_required(gguf, p + "ffn_gate_shexp.weight");
         lw.ffn_up_shexp = impl_->load_weight_required(gguf, p + "ffn_up_shexp.weight");
         lw.ffn_down_shexp = impl_->load_weight_required(gguf, p + "ffn_down_shexp.weight");
@@ -758,6 +872,7 @@ void DeepSeekV41Model::load(const std::string& model_path, int max_seq, int max_
     size_t top_k_sz = (size_t)std::max(1, cfg.num_experts_per_tok);
     impl_->b_router_logits = impl_->alloc_buf(Tmax * (size_t)std::max(1, cfg.n_routed_experts) * sizeof(float));
     impl_->b_topk_ids = impl_->alloc_buf(Tmax * top_k_sz * sizeof(int32_t));
+    impl_->b_stage_topk_ids = impl_->alloc_buf(Tmax * top_k_sz * sizeof(int32_t));
     impl_->b_topk_w = impl_->alloc_buf(Tmax * top_k_sz * sizeof(float));
     impl_->b_ffn_gate = impl_->alloc_buf(Tmax * top_k_sz * Inter * sizeof(float));
     impl_->b_ffn_up = impl_->alloc_buf(Tmax * top_k_sz * Inter * sizeof(float));
@@ -767,10 +882,11 @@ void DeepSeekV41Model::load(const std::string& model_path, int max_seq, int max_
     impl_->b_argmax = impl_->alloc_buf(sizeof(int32_t));
     impl_->b_dummy_bias = impl_->alloc_buf((size_t)std::max(1, cfg.n_routed_experts) * sizeof(float));
 
-    fprintf(stderr, "[warpgrid] Loaded DeepSeek-V4.1 (%s): %d layers, D=%d, H=%d, hc=%d, E=%d (top-%d), slots=%d, max_seq=%d, engram=%s\n",
+    fprintf(stderr, "[warpgrid] Loaded DeepSeek-V4.1 (%s): %d layers, D=%d, H=%d, hc=%d, E=%d (top-%d), slots=%d, max_seq=%d, engram=%s, moe_res=%d/%d\n",
             cfg.arch.c_str(), cfg.num_hidden_layers, cfg.hidden_size, cfg.num_attention_heads,
             cfg.hc_mult, cfg.n_routed_experts, cfg.num_experts_per_tok, max_slots, max_seq_len,
-            (engram.is_open() || impl_->engram_in_main_gguf) ? "ON" : "OFF");
+            (engram.is_open() || impl_->engram_in_main_gguf) ? "ON" : "OFF",
+            resident_moe_layers, cfg.num_hidden_layers);
 }
 
 void DeepSeekV41Model::reset_cache(int slot_id) {
@@ -796,6 +912,7 @@ void DeepSeekV41Model::forward_logits(const int32_t* h_tokens, int T, int start_
 }
 
 int32_t DeepSeekV41Model::forward_and_greedy(const int32_t* h_tokens, int T, int start_pos, int slot_id) {
+    @autoreleasepool {
     if (T <= 0 || T > max_batch_tokens) throw std::runtime_error("Invalid token batch size T");
     if (slot_id < 0 || slot_id >= max_slots) throw std::runtime_error("Invalid slot_id");
     if (start_pos < 0 || start_pos + T > max_seq_len) throw std::runtime_error("Sequence length exceeds max_seq_len");
@@ -1018,7 +1135,7 @@ int32_t DeepSeekV41Model::forward_and_greedy(const int32_t* h_tokens, int T, int
             [enc setBuffer:impl_->b_idx_scores offset:0 atIndex:3];
             [enc setBuffer:kv.topk_sel offset:0 atIndex:4];
             [enc setBytes:&ip length:sizeof(ip) atIndex:5];
-            [enc dispatchThreadgroups:MTLSizeMake((uint32_t)T, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            [enc dispatchThreadgroups:MTLSizeMake((uint32_t)T, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         }
 
         if (ratio > 0 && total_comp_blocks > 0 && cfg.kv_src[(size_t)l] >= 0 && cfg.topk_src[(size_t)l] >= 0) {
@@ -1114,25 +1231,124 @@ int32_t DeepSeekV41Model::forward_and_greedy(const int32_t* h_tokens, int T, int
 
         uint32_t top_k_u = (uint32_t)cfg.num_experts_per_tok;
         if (top_k_u > 0 && lw.ffn_gate_exps.groups > 0) {
-            if (lw.ffn_gate_exps.type == lw.ffn_up_exps.type &&
-                (lw.ffn_gate_exps.type == GgmlType::IQ1_S || lw.ffn_gate_exps.type == GgmlType::IQ2_XXS) &&
-                lw.ffn_gate_exps.group_stride_bytes == lw.ffn_up_exps.group_stride_bytes) {
-                impl_->encode_moe_gate_up_swiglu(enc, impl_->b_norm, lw.ffn_gate_exps, lw.ffn_up_exps,
-                                                 impl_->b_topk_ids, impl_->b_ffn_act,
-                                                 (uint32_t)T, top_k_u, cfg.swiglu_clamp_exp);
+            WeightBuf gate_w = lw.ffn_gate_exps;
+            WeightBuf up_w = lw.ffn_up_exps;
+            WeightBuf down_w = lw.ffn_down_exps;
+            id<MTLBuffer> ids_buf = impl_->b_topk_ids;
+            if (lw.ffn_gate_exps.is_streamed()) {
+                [enc endEncoding];
+                [cb commit];
+                [cb waitUntilCompleted];
+
+                const int32_t* raw_ids = static_cast<const int32_t*>(impl_->b_topk_ids.contents);
+                int32_t* st_ids = static_cast<int32_t*>(impl_->b_stage_topk_ids.contents);
+                uint32_t n_sel = (uint32_t)T * top_k_u;
+                std::vector<int32_t> remap((size_t)std::max(1, cfg.n_routed_experts), -1);
+                std::vector<int32_t> uniq_ids;
+                std::vector<int32_t> full_loc(n_sel, 0);
+                uniq_ids.reserve(std::min<size_t>(n_sel, (size_t)cfg.n_routed_experts));
+                for (uint32_t i = 0; i < n_sel; ++i) {
+                    int32_t eid = raw_ids[i];
+                    if (eid < 0 || eid >= cfg.n_routed_experts) eid = 0;
+                    int32_t loc = remap[(size_t)eid];
+                    if (loc < 0) {
+                        loc = (int32_t)uniq_ids.size();
+                        remap[(size_t)eid] = loc;
+                        uniq_ids.push_back(eid);
+                    }
+                    full_loc[i] = loc;
+                }
+                size_t U = uniq_ids.size();
+                size_t g_stride = lw.ffn_gate_exps.group_stride_bytes;
+                size_t u_stride = lw.ffn_up_exps.group_stride_bytes;
+                size_t d_stride = lw.ffn_down_exps.group_stride_bytes;
+                constexpr size_t kMaxStageChunk = 16u;
+                size_t cap_u = std::min<size_t>(U, kMaxStageChunk);
+                impl_->ensure_moe_stage(cap_u * g_stride, cap_u * u_stride, cap_u * d_stride);
+
+                uint8_t* dst_g = static_cast<uint8_t*>(impl_->b_moe_stage_gate.contents);
+                uint8_t* dst_u = static_cast<uint8_t*>(impl_->b_moe_stage_up.contents);
+                uint8_t* dst_d = static_cast<uint8_t*>(impl_->b_moe_stage_down.contents);
+                const uint8_t* src_g = lw.ffn_gate_exps.raw_data;
+                const uint8_t* src_u = lw.ffn_up_exps.raw_data;
+                const uint8_t* src_d = lw.ffn_down_exps.raw_data;
+                const int32_t* uids = uniq_ids.data();
+
+                for (size_t base_u = 0; base_u < U; base_u += kMaxStageChunk) {
+                    size_t chunk_u = std::min<size_t>(kMaxStageChunk, U - base_u);
+                    for (uint32_t i = 0; i < n_sel; ++i) {
+                        int32_t loc = full_loc[i];
+                        st_ids[i] = (loc >= (int32_t)base_u && loc < (int32_t)(base_u + chunk_u))
+                                        ? (loc - (int32_t)base_u)
+                                        : -1;
+                    }
+                    dispatch_apply(chunk_u, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t u) {
+                        size_t eid = (size_t)uids[base_u + u];
+                        memcpy(dst_g + u * g_stride, src_g + eid * g_stride, g_stride);
+                        memcpy(dst_u + u * u_stride, src_u + eid * u_stride, u_stride);
+                        memcpy(dst_d + u * d_stride, src_d + eid * d_stride, d_stride);
+                    });
+
+                    gate_w.buf = impl_->b_moe_stage_gate;
+                    gate_w.base_offset = 0;
+                    gate_w.groups = (uint32_t)chunk_u;
+                    up_w.buf = impl_->b_moe_stage_up;
+                    up_w.base_offset = 0;
+                    up_w.groups = (uint32_t)chunk_u;
+                    down_w.buf = impl_->b_moe_stage_down;
+                    down_w.base_offset = 0;
+                    down_w.groups = (uint32_t)chunk_u;
+                    ids_buf = impl_->b_stage_topk_ids;
+
+                    cb = [impl_->queue commandBuffer];
+                    enc = [cb computeCommandEncoder];
+                    if (gate_w.type == up_w.type &&
+                        (gate_w.type == GgmlType::IQ1_S || gate_w.type == GgmlType::IQ2_XXS) &&
+                        gate_w.group_stride_bytes == up_w.group_stride_bytes) {
+                        impl_->encode_moe_gate_up_swiglu(enc, impl_->b_norm, gate_w, up_w,
+                                                         ids_buf, impl_->b_ffn_act,
+                                                         (uint32_t)T, top_k_u, cfg.swiglu_clamp_exp);
+                    } else {
+                        impl_->encode_moe_indexed(enc, impl_->b_norm, gate_w, ids_buf, impl_->b_ffn_gate, (uint32_t)T, top_k_u);
+                        impl_->encode_moe_indexed(enc, impl_->b_norm, up_w, ids_buf, impl_->b_ffn_up, (uint32_t)T, top_k_u);
+                        impl_->encode_swiglu(enc, impl_->b_ffn_gate, impl_->b_ffn_up, impl_->b_ffn_act,
+                                             (uint32_t)((size_t)T * top_k_u * gate_w.rows), cfg.swiglu_clamp_exp);
+                    }
+                    impl_->encode_moe_down_accum(enc, impl_->b_ffn_act, down_w, ids_buf, impl_->b_topk_w,
+                                                 impl_->b_sub_out, (uint32_t)T, top_k_u);
+                    if (base_u + chunk_u < U) {
+                        [enc endEncoding];
+                        [cb commit];
+                        [cb waitUntilCompleted];
+                    }
+                }
             } else {
-                impl_->encode_moe_indexed(enc, impl_->b_norm, lw.ffn_gate_exps, impl_->b_topk_ids, impl_->b_ffn_gate, (uint32_t)T, top_k_u);
-                impl_->encode_moe_indexed(enc, impl_->b_norm, lw.ffn_up_exps, impl_->b_topk_ids, impl_->b_ffn_up, (uint32_t)T, top_k_u);
-                impl_->encode_swiglu(enc, impl_->b_ffn_gate, impl_->b_ffn_up, impl_->b_ffn_act,
-                                     (uint32_t)((size_t)T * top_k_u * lw.ffn_gate_exps.rows), cfg.swiglu_clamp_exp);
+                if (gate_w.type == up_w.type &&
+                    (gate_w.type == GgmlType::IQ1_S || gate_w.type == GgmlType::IQ2_XXS) &&
+                    gate_w.group_stride_bytes == up_w.group_stride_bytes) {
+                    impl_->encode_moe_gate_up_swiglu(enc, impl_->b_norm, gate_w, up_w,
+                                                     ids_buf, impl_->b_ffn_act,
+                                                     (uint32_t)T, top_k_u, cfg.swiglu_clamp_exp);
+                } else {
+                    impl_->encode_moe_indexed(enc, impl_->b_norm, gate_w, ids_buf, impl_->b_ffn_gate, (uint32_t)T, top_k_u);
+                    impl_->encode_moe_indexed(enc, impl_->b_norm, up_w, ids_buf, impl_->b_ffn_up, (uint32_t)T, top_k_u);
+                    impl_->encode_swiglu(enc, impl_->b_ffn_gate, impl_->b_ffn_up, impl_->b_ffn_act,
+                                         (uint32_t)((size_t)T * top_k_u * gate_w.rows), cfg.swiglu_clamp_exp);
+                }
+                impl_->encode_moe_down_accum(enc, impl_->b_ffn_act, down_w, ids_buf, impl_->b_topk_w,
+                                             impl_->b_sub_out, (uint32_t)T, top_k_u);
             }
-            impl_->encode_moe_down_accum(enc, impl_->b_ffn_act, lw.ffn_down_exps, impl_->b_topk_ids, impl_->b_topk_w,
-                                         impl_->b_sub_out, (uint32_t)T, top_k_u);
         }
 
         impl_->encode_hc_post(enc, impl_->b_sub_out, impl_->b_streams_a, impl_->b_hc_post, impl_->b_hc_comb,
                               impl_->b_streams_b, (uint32_t)T, (uint32_t)D, hc);
         std::swap(impl_->b_streams_a, impl_->b_streams_b);
+        if (lw.ffn_gate_exps.is_streamed() || ((l + 1) % 8 == 0)) {
+            [enc endEncoding];
+            [cb commit];
+            cb = [impl_->queue commandBuffer];
+            enc = [cb computeCommandEncoder];
+        }
     }
 
     if (cfg.num_hidden_layers > 0) {
@@ -1151,6 +1367,7 @@ int32_t DeepSeekV41Model::forward_and_greedy(const int32_t* h_tokens, int T, int
     [cb commit];
     [cb waitUntilCompleted];
     return *static_cast<const int32_t*>(impl_->b_argmax.contents);
+    }
 }
 
 void DeepSeekV41Model::forward_batch_decode_greedy(

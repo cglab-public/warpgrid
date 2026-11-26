@@ -19,4 +19,14 @@ Harness: `tests/bench_deepseek_metal --layers 4 --experts 16 --samples 7 --steps
 ## Summary
 - **Total speedup vs e00 baseline:** `7.323 ms -> 3.758 ms` (**1.95x faster**, `+94.8%` tok/s, `13.66 -> 26.61 tok/s` projected 40L; zero-copy `mmap` load in `~40 ms`, `0.30 GiB` RSS).
 - **Exact parity:** 42/42 unit tests pass (`test_host` 15/15, `test_metal_kernels` 12/12 Inkling untouched, `test_metal_gguf_kernels` 15/15), `greedy_deterministic: true`, `argmax_parity: true`.
-- **Real checkpoint note:** `unsloth/DeepSeek-V4.1-Flash-1017-GGUF:UD-IQ1_S` (217 GiB) is downloading to `/Users/daniel/models/DeepSeek-V4.1-Flash-1017-UD-IQ1_S`; once complete, re-run `./warpgrid --model /Users/daniel/models/DeepSeek-V4.1-Flash-1017-UD-IQ1_S/UD-IQ1_S --max-seq 32768` for live 748B serving and 32K needle-in-a-haystack verification.
+- **Real checkpoint note (COMPLETE — 217 GiB `unsloth/DeepSeek-V4.1-Flash-1017-GGUF:UD-IQ1_S`):** Downloaded all 5 shards to `/Users/daniel/models/DeepSeek-V4.1-Flash-1017-UD-IQ1_S/UD-IQ1_S` and completed live 748B serving, hill-climbing, `llama-cli` parity verification, and 50% (16K) / 100% (32K) needle-in-a-haystack stability gates via `scripts/bench_deepseek_live.py`.
+
+## Live 748B Hill-Climb Ledger (`UD-IQ1_S`, 217 GiB, `--max-seq 32768 --max-slots 1`)
+| ID | Change | Startup | Warm Decode Peak | 16K / 30K Decode | Peak RSS | Output Hash / Parity | Decision |
+|---|---|---:|---:|---:|---:|---|---|
+| live-e00 | Per-tensor `newBufferWithBytesNoCopy:` + on-demand top-6 `moe_stream=ON` (fixes 114 GiB IOGPU wiring stall) | 1.01 s | 8.66 tok/s (6.57 med e2e) | — | 74.11 GiB | `92e9647ad973216b` (`323` parity vs `llama-cli`) | BASELINE |
+| live-e01 | Budget-aware hybrid MoE residency (`moe_res=23/40` direct GPU, tail streamed) | 1.01 s | 11.48 tok/s (7.15 med e2e) | — | 37.39 GiB | `92e9647ad973216b` (exact) | **KEEP** |
+| live-e02 | Vectorized 2-row-per-SIMD `gguf_gemv_{q8_0,q5_k,bf16}_fast` Metal kernels | 1.02 s | 12.29 tok/s (`+7.1%` P5, `+19.9%` P6) | — | 37.23 GiB | `92e9647ad973216b` (exact) | **KEEP** |
+| live-e03 | 1-pass online FlashAttention (`float4` register-cached Q/acc) for `ds_mqa_sink_{,comp_}attn_f32` + 256-thread indexer | 1.01 s | 12.56 tok/s | 0.44 / 0.40 tok/s (2048-barrier bottleneck) | 36.78 GiB | `92e9647ad973216b` (exact) | **KEEP** |
+| live-e04 | Binary-search threshold top-K in `ds_indexer_score_topk_f32` (24 iterations, 0 device barriers) | 1.01 s | 12.92 tok/s | 0.42 tok/s (staging leak at T=64) | 25.25 GiB | `92e9647ad973216b` (exact) | **KEEP** |
+| live-e05 | Live `host_statistics64` OOM-safe MoE budget (`moe_res=13/40`) + `@autoreleasepool` on worker thread + fixed `<=16`-expert (`124 MiB` max) chunked staging | 1.02 s | 11.39 tok/s (zero leak, swap -1.3 GiB) | **8.81 tok/s @ 16.4K** (`21.0x`), **7.54 tok/s @ 30.2K** (`18.9x`), `44.1 tok/s` prefill | 64.35 GiB (`<107.52 GiB`) | `92e9647ad973216b`, **16K & 30K needle PASS (`WARPGRID-NEEDLE-74819`)** | **KEEP** |

@@ -961,13 +961,48 @@ kernel void ds_mqa_sink_attn_f32(
     device const float* qp = Q + (ulong(t) * p.n_heads + h) * p.head_dim;
     device float* op = O + (ulong(t) * p.n_heads + h) * p.head_dim;
 
+    if (p.head_dim == 512u) {
+        device const float4* q4 = reinterpret_cast<device const float4*>(qp);
+        float4 qv0 = q4[tid];
+        float4 qv1 = q4[tid + 32u];
+        float4 qv2 = q4[tid + 64u];
+        float4 qv3 = q4[tid + 96u];
+        float4 acc0 = float4(0.0f), acc1 = float4(0.0f), acc2 = float4(0.0f), acc3 = float4(0.0f);
+        float m_max = sinks[h];
+        float l_sum = 1.0f;
+        for (uint s = win_start; s < seq_end; ++s) {
+            device const float4* kv4 = reinterpret_cast<device const float4*>(KV_cache + ulong(s) * 512ul);
+            float4 k0 = kv4[tid];
+            float4 k1 = kv4[tid + 32u];
+            float4 k2 = kv4[tid + 64u];
+            float4 k3 = kv4[tid + 96u];
+            float sc = simd_sum(dot(qv0, k0) + dot(qv1, k1) + dot(qv2, k2) + dot(qv3, k3)) * p.scale;
+            float m_new = max(m_max, sc);
+            float alpha = exp(m_max - m_new);
+            float w = exp(sc - m_new);
+            l_sum = fma(l_sum, alpha, w);
+            acc0 = fma(acc0, alpha, w * k0);
+            acc1 = fma(acc1, alpha, w * k1);
+            acc2 = fma(acc2, alpha, w * k2);
+            acc3 = fma(acc3, alpha, w * k3);
+            m_max = m_new;
+        }
+        float inv_l = 1.0f / max(l_sum, 1e-20f);
+        device float4* o4 = reinterpret_cast<device float4*>(op);
+        o4[tid] = acc0 * inv_l;
+        o4[tid + 32u] = acc1 * inv_l;
+        o4[tid + 64u] = acc2 * inv_l;
+        o4[tid + 96u] = acc3 * inv_l;
+        return;
+    }
+
     float sink_val = sinks[h];
     float m_max = sink_val;
     for (uint s = win_start; s < seq_end; ++s) {
         device const float* kvp = KV_cache + ulong(s) * p.head_dim;
-        float dot = 0.0f;
-        for (uint d = tid; d < p.head_dim; d += 32u) dot += qp[d] * kvp[d];
-        float sc = simd_sum(dot) * p.scale;
+        float dsum = 0.0f;
+        for (uint d = tid; d < p.head_dim; d += 32u) dsum += qp[d] * kvp[d];
+        float sc = simd_sum(dsum) * p.scale;
         m_max = max(m_max, sc);
     }
 
@@ -975,9 +1010,9 @@ kernel void ds_mqa_sink_attn_f32(
     for (uint d = tid; d < p.head_dim; d += 32u) op[d] = 0.0f;
     for (uint s = win_start; s < seq_end; ++s) {
         device const float* kvp = KV_cache + ulong(s) * p.head_dim;
-        float dot = 0.0f;
-        for (uint d = tid; d < p.head_dim; d += 32u) dot += qp[d] * kvp[d];
-        float w = exp(simd_sum(dot) * p.scale - m_max);
+        float dsum = 0.0f;
+        for (uint d = tid; d < p.head_dim; d += 32u) dsum += qp[d] * kvp[d];
+        float w = exp(simd_sum(dsum) * p.scale - m_max);
         l_sum += w;
         for (uint d = tid; d < p.head_dim; d += 32u) op[d] += w * kvp[d];
     }
@@ -1266,8 +1301,9 @@ kernel void ds_indexer_score_topk_f32(
     device int* out_topk [[buffer(4)]],
     constant DsIndexerParams& p [[buffer(5)]],
     uint tgid [[threadgroup_position_in_grid]],
-    uint tid [[thread_index_in_threadgroup]]) {
-    if (tgid >= p.T || tid != 0u) return;
+    uint tid [[thread_index_in_threadgroup]],
+    uint tptg [[threads_per_threadgroup]]) {
+    if (tgid >= p.T) return;
     uint t = tgid;
     uint pos = p.start_pos + t;
     uint win_start = (p.sliding_window > 0u && pos + 1u > p.sliding_window) ? (pos + 1u - p.sliding_window) : 0u;
@@ -1279,33 +1315,118 @@ kernel void ds_indexer_score_topk_f32(
     device float* sc = scores_buf + ulong(t) * p.max_comp;
     device int* dst = out_topk + ulong(t) * K;
 
-    for (uint c = 0; c < max_vis; ++c) {
+    if (max_vis <= K) {
+        for (uint k = tid; k < K; k += tptg) {
+            dst[k] = (k < max_vis) ? int(k) : -1;
+        }
+        return;
+    }
+
+    for (uint c = tid; c < max_vis; c += tptg) {
         device const float* ikc = ik_cache + ulong(c) * p.idx_dim;
         float total = 0.0f;
-        for (uint h = 0; h < p.n_idx_head; ++h) {
-            device const float* iqh = iqt + ulong(h) * p.idx_dim;
-            float dot = 0.0f;
-            for (uint d = 0; d < p.idx_dim; ++d) dot += iqh[d] * ikc[d];
-            if (dot > 0.0f) total += dot * (iwt[h] * p.iw_scale);
+        if ((p.idx_dim & 3u) == 0u) {
+            uint d4 = p.idx_dim >> 2;
+            device const float4* ik4 = reinterpret_cast<device const float4*>(ikc);
+            for (uint h = 0; h < p.n_idx_head; ++h) {
+                device const float4* iq4 = reinterpret_cast<device const float4*>(iqt + ulong(h) * p.idx_dim);
+                float4 dsum = float4(0.0f);
+                for (uint d = 0; d < d4; ++d) dsum = fma(iq4[d], ik4[d], dsum);
+                float dv = dsum.x + dsum.y + dsum.z + dsum.w;
+                if (dv > 0.0f) total = fma(dv, iwt[h] * p.iw_scale, total);
+            }
+        } else {
+            for (uint h = 0; h < p.n_idx_head; ++h) {
+                device const float* iqh = iqt + ulong(h) * p.idx_dim;
+                float dv = 0.0f;
+                for (uint d = 0; d < p.idx_dim; ++d) dv += iqh[d] * ikc[d];
+                if (dv > 0.0f) total += dv * (iwt[h] * p.iw_scale);
+            }
         }
         sc[c] = total;
     }
+    threadgroup_barrier(mem_flags::mem_device);
 
-    for (uint k = 0; k < K; ++k) {
-        if (k >= max_vis) {
-            dst[k] = -1;
-            continue;
+    threadgroup float sg_f[8];
+    threadgroup uint sg_u[8];
+    threadgroup float b_lo;
+    threadgroup float b_hi;
+    threadgroup atomic_uint w_cnt;
+    uint sg = tid >> 5;
+    uint lane = tid & 31u;
+    uint n_sg = (tptg + 31u) >> 5;
+
+    float lmin = 1e30f;
+    float lmax = -1e30f;
+    for (uint c = tid; c < max_vis; c += tptg) {
+        float v = sc[c];
+        lmin = min(lmin, v);
+        lmax = max(lmax, v);
+    }
+    float smin = simd_min(lmin);
+    float smax = simd_max(lmax);
+    if (lane == 0u) sg_f[sg] = smin;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {
+        float gmin = 1e30f;
+        for (uint s = 0; s < n_sg; ++s) gmin = min(gmin, sg_f[s]);
+        b_lo = gmin;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0u) sg_f[sg] = smax;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {
+        float gmax = -1e30f;
+        for (uint s = 0; s < n_sg; ++s) gmax = max(gmax, sg_f[s]);
+        b_hi = gmax;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint it = 0; it < 24u; ++it) {
+        float mid = 0.5f * (b_lo + b_hi);
+        uint cnt = 0u;
+        for (uint c = tid; c < max_vis; c += tptg) {
+            if (sc[c] > mid) cnt += 1u;
         }
-        int best_c = -1;
-        float best_v = -1e30f;
-        for (uint c = 0; c < max_vis; ++c) {
-            if (sc[c] > best_v) {
-                best_v = sc[c];
-                best_c = int(c);
+        uint scnt = simd_sum(cnt);
+        if (lane == 0u) sg_u[sg] = scnt;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0u) {
+            uint tot = 0u;
+            for (uint s = 0; s < n_sg; ++s) tot += sg_u[s];
+            if (tot >= K) {
+                b_lo = mid;
+            } else {
+                b_hi = mid;
             }
         }
-        dst[k] = best_c;
-        if (best_c >= 0) sc[uint(best_c)] = -1e30f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float thresh = b_lo;
+    if (tid == 0u) atomic_store_explicit(&w_cnt, 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint c = tid; c < max_vis; c += tptg) {
+        if (sc[c] > thresh) {
+            uint idx = atomic_fetch_add_explicit(&w_cnt, 1u, memory_order_relaxed);
+            if (idx < K) dst[idx] = int(c);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint c = tid; c < max_vis; c += tptg) {
+        if (sc[c] == thresh) {
+            uint cur = atomic_load_explicit(&w_cnt, memory_order_relaxed);
+            if (cur < K) {
+                uint idx = atomic_fetch_add_explicit(&w_cnt, 1u, memory_order_relaxed);
+                if (idx < K) dst[idx] = int(c);
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint filled = atomic_load_explicit(&w_cnt, memory_order_relaxed);
+    for (uint k = filled + tid; k < K; k += tptg) {
+        dst[k] = -1;
     }
 }
 
@@ -1328,30 +1449,84 @@ kernel void ds_mqa_sink_comp_attn_f32(
     device float* op = O + (ulong(t) * p.n_heads + h) * p.head_dim;
     device const int* sel = comp_topk + ulong(t) * p.n_comp_sel;
 
+    if (p.head_dim == 512u) {
+        device const float4* q4 = reinterpret_cast<device const float4*>(qp);
+        float4 qv0 = q4[tid];
+        float4 qv1 = q4[tid + 32u];
+        float4 qv2 = q4[tid + 64u];
+        float4 qv3 = q4[tid + 96u];
+        float4 acc0 = float4(0.0f), acc1 = float4(0.0f), acc2 = float4(0.0f), acc3 = float4(0.0f);
+        float m_max = sinks[h];
+        float l_sum = 1.0f;
+        for (uint s = win_start; s < seq_end; ++s) {
+            device const float4* kv4 = reinterpret_cast<device const float4*>(KV_cache + ulong(s) * 512ul);
+            float4 k0 = kv4[tid];
+            float4 k1 = kv4[tid + 32u];
+            float4 k2 = kv4[tid + 64u];
+            float4 k3 = kv4[tid + 96u];
+            float sc = simd_sum(dot(qv0, k0) + dot(qv1, k1) + dot(qv2, k2) + dot(qv3, k3)) * p.scale;
+            float m_new = max(m_max, sc);
+            float alpha = exp(m_max - m_new);
+            float w = exp(sc - m_new);
+            l_sum = fma(l_sum, alpha, w);
+            acc0 = fma(acc0, alpha, w * k0);
+            acc1 = fma(acc1, alpha, w * k1);
+            acc2 = fma(acc2, alpha, w * k2);
+            acc3 = fma(acc3, alpha, w * k3);
+            m_max = m_new;
+        }
+        for (uint k = 0; k < p.n_comp_sel; ++k) {
+            int c = sel[k];
+            if (c < 0) continue;
+            device const float4* kv4 = reinterpret_cast<device const float4*>(comp_kv_cache + ulong(uint(c)) * 512ul);
+            float4 k0 = kv4[tid];
+            float4 k1 = kv4[tid + 32u];
+            float4 k2 = kv4[tid + 64u];
+            float4 k3 = kv4[tid + 96u];
+            float sc = simd_sum(dot(qv0, k0) + dot(qv1, k1) + dot(qv2, k2) + dot(qv3, k3)) * p.scale;
+            float m_new = max(m_max, sc);
+            float alpha = exp(m_max - m_new);
+            float w = exp(sc - m_new);
+            l_sum = fma(l_sum, alpha, w);
+            acc0 = fma(acc0, alpha, w * k0);
+            acc1 = fma(acc1, alpha, w * k1);
+            acc2 = fma(acc2, alpha, w * k2);
+            acc3 = fma(acc3, alpha, w * k3);
+            m_max = m_new;
+        }
+        float inv_l = 1.0f / max(l_sum, 1e-20f);
+        device float4* o4 = reinterpret_cast<device float4*>(op);
+        o4[tid] = acc0 * inv_l;
+        o4[tid + 32u] = acc1 * inv_l;
+        o4[tid + 64u] = acc2 * inv_l;
+        o4[tid + 96u] = acc3 * inv_l;
+        return;
+    }
+
     float sink_val = sinks[h];
     float m_max = sink_val;
     for (uint s = win_start; s < seq_end; ++s) {
         device const float* kvp = KV_cache + ulong(s) * p.head_dim;
-        float dot = 0.0f;
-        for (uint d = tid; d < p.head_dim; d += 32u) dot += qp[d] * kvp[d];
-        m_max = max(m_max, simd_sum(dot) * p.scale);
+        float dsum = 0.0f;
+        for (uint d = tid; d < p.head_dim; d += 32u) dsum += qp[d] * kvp[d];
+        m_max = max(m_max, simd_sum(dsum) * p.scale);
     }
     for (uint k = 0; k < p.n_comp_sel; ++k) {
         int c = sel[k];
         if (c < 0) continue;
         device const float* kvp = comp_kv_cache + ulong(uint(c)) * p.head_dim;
-        float dot = 0.0f;
-        for (uint d = tid; d < p.head_dim; d += 32u) dot += qp[d] * kvp[d];
-        m_max = max(m_max, simd_sum(dot) * p.scale);
+        float dsum = 0.0f;
+        for (uint d = tid; d < p.head_dim; d += 32u) dsum += qp[d] * kvp[d];
+        m_max = max(m_max, simd_sum(dsum) * p.scale);
     }
 
     float l_sum = exp(sink_val - m_max);
     for (uint d = tid; d < p.head_dim; d += 32u) op[d] = 0.0f;
     for (uint s = win_start; s < seq_end; ++s) {
         device const float* kvp = KV_cache + ulong(s) * p.head_dim;
-        float dot = 0.0f;
-        for (uint d = tid; d < p.head_dim; d += 32u) dot += qp[d] * kvp[d];
-        float w = exp(simd_sum(dot) * p.scale - m_max);
+        float dsum = 0.0f;
+        for (uint d = tid; d < p.head_dim; d += 32u) dsum += qp[d] * kvp[d];
+        float w = exp(simd_sum(dsum) * p.scale - m_max);
         l_sum += w;
         for (uint d = tid; d < p.head_dim; d += 32u) op[d] += w * kvp[d];
     }
@@ -1359,9 +1534,9 @@ kernel void ds_mqa_sink_comp_attn_f32(
         int c = sel[k];
         if (c < 0) continue;
         device const float* kvp = comp_kv_cache + ulong(uint(c)) * p.head_dim;
-        float dot = 0.0f;
-        for (uint d = tid; d < p.head_dim; d += 32u) dot += qp[d] * kvp[d];
-        float w = exp(simd_sum(dot) * p.scale - m_max);
+        float dsum = 0.0f;
+        for (uint d = tid; d < p.head_dim; d += 32u) dsum += qp[d] * kvp[d];
+        float w = exp(simd_sum(dsum) * p.scale - m_max);
         l_sum += w;
         for (uint d = tid; d < p.head_dim; d += 32u) op[d] += w * kvp[d];
     }
@@ -2855,5 +3030,183 @@ kernel void gguf_moe_down_accum_iq2_xxs_4r(
     for (uint r = 0; r < cnt; ++r) {
         float s = simd_sum(tot[r]);
         if (lane == 0u) Y[ulong(t) * p.N + n0 + r] += s;
+    }
+}
+
+kernel void gguf_gemv_q8_0_fast(
+    device const float* X [[buffer(0)]],
+    device const uchar* W [[buffer(1)]],
+    device float* Y [[buffer(2)]],
+    constant GgufGemvParams& p [[buffer(3)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    uint m = tgid.y;
+    uint sg = tid >> 5;
+    uint lane = tid & 31u;
+    uint n0 = tgid.x * 4u + sg * 2u;
+    if (m >= p.M || n0 >= p.N) return;
+    uint nb = p.K >> 5;
+    ulong row_bytes = ulong(nb) * 34ul;
+    bool has_r1 = (n0 + 1u < p.N);
+    device const float* x_row = X + ulong(m) * p.K;
+    device const uchar* w0 = W + ulong(n0) * row_bytes;
+    device const uchar* w1 = has_r1 ? (w0 + row_bytes) : w0;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    for (uint b = lane; b < nb; b += 32u) {
+        device const float4* xp4 = reinterpret_cast<device const float4*>(x_row + (b << 5));
+        float4 v0 = xp4[0], v1 = xp4[1], v2 = xp4[2], v3 = xp4[3];
+        float4 v4 = xp4[4], v5 = xp4[5], v6 = xp4[6], v7 = xp4[7];
+        ulong boff = ulong(b) * 34ul;
+        {
+            device const uchar* blk = w0 + boff;
+            float d = gguf_load_f16(blk);
+            device const char* q = reinterpret_cast<device const char*>(blk + 2u);
+            float s = dot(v0, float4(q[0], q[1], q[2], q[3]))
+                    + dot(v1, float4(q[4], q[5], q[6], q[7]))
+                    + dot(v2, float4(q[8], q[9], q[10], q[11]))
+                    + dot(v3, float4(q[12], q[13], q[14], q[15]))
+                    + dot(v4, float4(q[16], q[17], q[18], q[19]))
+                    + dot(v5, float4(q[20], q[21], q[22], q[23]))
+                    + dot(v6, float4(q[24], q[25], q[26], q[27]))
+                    + dot(v7, float4(q[28], q[29], q[30], q[31]));
+            acc0 = fma(d, s, acc0);
+        }
+        if (has_r1) {
+            device const uchar* blk = w1 + boff;
+            float d = gguf_load_f16(blk);
+            device const char* q = reinterpret_cast<device const char*>(blk + 2u);
+            float s = dot(v0, float4(q[0], q[1], q[2], q[3]))
+                    + dot(v1, float4(q[4], q[5], q[6], q[7]))
+                    + dot(v2, float4(q[8], q[9], q[10], q[11]))
+                    + dot(v3, float4(q[12], q[13], q[14], q[15]))
+                    + dot(v4, float4(q[16], q[17], q[18], q[19]))
+                    + dot(v5, float4(q[20], q[21], q[22], q[23]))
+                    + dot(v6, float4(q[24], q[25], q[26], q[27]))
+                    + dot(v7, float4(q[28], q[29], q[30], q[31]));
+            acc1 = fma(d, s, acc1);
+        }
+    }
+    float out0 = simd_sum(acc0);
+    float out1 = simd_sum(acc1);
+    if (lane == 0u) {
+        ulong yb = ulong(m) * p.N;
+        Y[yb + n0] = out0;
+        if (has_r1) Y[yb + n0 + 1u] = out1;
+    }
+}
+
+kernel void gguf_gemv_q5_k_fast(
+    device const float* X [[buffer(0)]],
+    device const uchar* W [[buffer(1)]],
+    device float* Y [[buffer(2)]],
+    constant GgufGemvParams& p [[buffer(3)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    uint m = tgid.y;
+    uint sg = tid >> 5;
+    uint lane = tid & 31u;
+    uint n0 = tgid.x * 4u + sg * 2u;
+    if (m >= p.M || n0 >= p.N) return;
+    uint nb = p.K >> 8;
+    ulong row_bytes = ulong(nb) * 176ul;
+    bool has_r1 = (n0 + 1u < p.N);
+    device const float* x_row = X + ulong(m) * p.K;
+    device const uchar* w0 = W + ulong(n0) * row_bytes;
+    device const uchar* w1 = has_r1 ? (w0 + row_bytes) : w0;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    for (uint b = 0; b < nb; ++b) {
+        device const float* xp = x_row + (b << 8);
+        ulong boff = ulong(b) * 176ul;
+        device const uchar* blk0 = w0 + boff;
+        float d0 = gguf_load_f16(blk0);
+        float dm0 = gguf_load_f16(blk0 + 2u);
+        device const uchar* sc0_p = blk0 + 4u;
+        uchar h0 = blk0[16u + lane];
+        device const uchar* qs0 = blk0 + 48u;
+
+        device const uchar* blk1 = w1 + boff;
+        float d1_b = has_r1 ? gguf_load_f16(blk1) : 0.0f;
+        float dm1_b = has_r1 ? gguf_load_f16(blk1 + 2u) : 0.0f;
+        device const uchar* sc1_p = blk1 + 4u;
+        uchar h1 = has_r1 ? blk1[16u + lane] : 0u;
+        device const uchar* qs1 = blk1 + 48u;
+
+        uchar u1 = 1u;
+        uchar u2 = 2u;
+        for (uint sb = 0; sb < 4u; ++sb) {
+            float xl = xp[sb * 64u + lane];
+            float xh = xp[sb * 64u + 32u + lane];
+            {
+                uchar s0 = 0, m0 = 0, s1 = 0, m1 = 0;
+                gguf_get_scale_min_k4(sb * 2u, sc0_p, s0, m0);
+                gguf_get_scale_min_k4(sb * 2u + 1u, sc0_p, s1, m1);
+                uchar q = qs0[sb * 32u + lane];
+                float wlo = d0 * float(s0) * float((q & 0x0Fu) + ((h0 & u1) ? 16u : 0u)) - dm0 * float(m0);
+                float whi = d0 * float(s1) * float((q >> 4) + ((h0 & u2) ? 16u : 0u)) - dm0 * float(m1);
+                acc0 = fma(xl, wlo, fma(xh, whi, acc0));
+            }
+            if (has_r1) {
+                uchar s0 = 0, m0 = 0, s1 = 0, m1 = 0;
+                gguf_get_scale_min_k4(sb * 2u, sc1_p, s0, m0);
+                gguf_get_scale_min_k4(sb * 2u + 1u, sc1_p, s1, m1);
+                uchar q = qs1[sb * 32u + lane];
+                float wlo = d1_b * float(s0) * float((q & 0x0Fu) + ((h1 & u1) ? 16u : 0u)) - dm1_b * float(m0);
+                float whi = d1_b * float(s1) * float((q >> 4) + ((h1 & u2) ? 16u : 0u)) - dm1_b * float(m1);
+                acc1 = fma(xl, wlo, fma(xh, whi, acc1));
+            }
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+    }
+    float out0 = simd_sum(acc0);
+    float out1 = simd_sum(acc1);
+    if (lane == 0u) {
+        ulong yb = ulong(m) * p.N;
+        Y[yb + n0] = out0;
+        if (has_r1) Y[yb + n0 + 1u] = out1;
+    }
+}
+
+kernel void gguf_gemv_bf16_fast(
+    device const float* X [[buffer(0)]],
+    device const uchar* W [[buffer(1)]],
+    device float* Y [[buffer(2)]],
+    constant GgufGemvParams& p [[buffer(3)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    uint m = tgid.y;
+    uint sg = tid >> 5;
+    uint lane = tid & 31u;
+    uint n0 = tgid.x * 4u + sg * 2u;
+    if (m >= p.M || n0 >= p.N) return;
+    uint k4 = p.K >> 2;
+    ulong row_bytes = ulong(p.K) * 2ul;
+    bool has_r1 = (n0 + 1u < p.N);
+    device const float4* xp4 = reinterpret_cast<device const float4*>(X + ulong(m) * p.K);
+    device const ushort4* w0 = reinterpret_cast<device const ushort4*>(W + ulong(n0) * row_bytes);
+    device const ushort4* w1 = has_r1 ? reinterpret_cast<device const ushort4*>(W + ulong(n0 + 1u) * row_bytes) : w0;
+    float4 acc0 = float4(0.0f);
+    float4 acc1 = float4(0.0f);
+    for (uint k = lane; k < k4; k += 32u) {
+        float4 xv = xp4[k];
+        ushort4 q0 = w0[k];
+        float4 f0 = float4(as_type<float>(uint(q0.x) << 16), as_type<float>(uint(q0.y) << 16),
+                           as_type<float>(uint(q0.z) << 16), as_type<float>(uint(q0.w) << 16));
+        acc0 = fma(xv, f0, acc0);
+        if (has_r1) {
+            ushort4 q1 = w1[k];
+            float4 f1 = float4(as_type<float>(uint(q1.x) << 16), as_type<float>(uint(q1.y) << 16),
+                               as_type<float>(uint(q1.z) << 16), as_type<float>(uint(q1.w) << 16));
+            acc1 = fma(xv, f1, acc1);
+        }
+    }
+    float out0 = simd_sum(acc0.x + acc0.y + acc0.z + acc0.w);
+    float out1 = simd_sum(acc1.x + acc1.y + acc1.z + acc1.w);
+    if (lane == 0u) {
+        ulong yb = ulong(m) * p.N;
+        Y[yb + n0] = out0;
+        if (has_r1) Y[yb + n0 + 1u] = out1;
     }
 }
