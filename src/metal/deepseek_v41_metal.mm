@@ -243,6 +243,24 @@ struct ExpLruCache {
 
     bool enabled() const { return num_slots > 0 && buf_g != nil && buf_u != nil && buf_d != nil; }
 
+    void reset() {
+        num_layers = 0;
+        num_experts = 0;
+        num_slots = 0;
+        gu_stride = 0;
+        d_stride = 0;
+        buf_g = nil;
+        buf_u = nil;
+        buf_d = nil;
+        lut.clear();
+        entries.clear();
+        head = -1;
+        tail = -1;
+        cur_gen = 0;
+        hits = 0;
+        misses = 0;
+    }
+
     bool init(id<MTLDevice> dev, int L, int E, size_t max_gu, size_t max_d, uint64_t budget_bytes) {
         if (L <= 0 || E <= 0 || max_gu == 0 || max_d == 0 || budget_bytes == 0) return false;
         size_t slot_bytes = max_gu * 2u + max_d;
@@ -361,10 +379,15 @@ struct DeepSeekV41Model::Impl {
     std::vector<int> nocache_fds;
     ExpLruCache exp_cache;
 
-    ~Impl() {
+    void close_nocache_fds() {
         for (int fd : nocache_fds) {
             if (fd >= 0) ::close(fd);
         }
+        nocache_fds.clear();
+    }
+
+    ~Impl() {
+        close_nocache_fds();
     }
 
     id<MTLBuffer> b_streams_a = nil;
@@ -943,6 +966,8 @@ void DeepSeekV41Model::load(const std::string& model_path, int max_seq, int max_
             }
         }
     }
+    impl_->exp_cache.reset();
+    impl_->close_nocache_fds();
     bool use_exp_cache = false;
     if (!any_f16_exp && total_moe_bytes > moe_budget_bytes && max_gu_stride > 0 && max_d_stride > 0) {
         use_exp_cache = impl_->exp_cache.init(
