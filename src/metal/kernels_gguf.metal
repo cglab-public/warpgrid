@@ -4142,3 +4142,214 @@ kernel void ds_dspark_conf_f32(
         out_conf[b] = 1.0f / (1.0f + exp(-s_sum[0]));
     }
 }
+
+inline float4 gguf_unpack_q8_4(ushort u0, ushort u1) {
+    char2 c0 = as_type<char2>(u0);
+    char2 c1 = as_type<char2>(u1);
+    return float4(c0.x, c0.y, c1.x, c1.y);
+}
+
+kernel void gguf_grouped_gemv_q8_0_multi(
+    device const float* X [[buffer(0)]],
+    device const uchar* W [[buffer(1)]],
+    device float* Y [[buffer(2)]],
+    constant GgufGroupedGemvParams& p [[buffer(3)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    uint g = tgid.y;
+    uint sg = tid >> 5;
+    uint lane = tid & 31u;
+    uint n = tgid.x * 2u + sg;
+    if (g >= p.G || n >= p.N || p.T == 0u || p.T > 6u) return;
+    uint nb = p.K >> 5;
+    ulong row_bytes = ulong(nb) * 34ul;
+    device const uchar* w0 = W + ulong(g) * ulong(p.group_stride_bytes) + ulong(n) * row_bytes;
+    float acc[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint b = lane; b < nb; b += 32u) {
+        device const uchar* blk = w0 + ulong(b) * 34ul;
+        float d = gguf_load_f16(blk);
+        device const ushort* q16 = reinterpret_cast<device const ushort*>(blk + 2u);
+        float4 q0 = gguf_unpack_q8_4(q16[0], q16[1]);
+        float4 q1 = gguf_unpack_q8_4(q16[2], q16[3]);
+        float4 q2 = gguf_unpack_q8_4(q16[4], q16[5]);
+        float4 q3 = gguf_unpack_q8_4(q16[6], q16[7]);
+        float4 q4 = gguf_unpack_q8_4(q16[8], q16[9]);
+        float4 q5 = gguf_unpack_q8_4(q16[10], q16[11]);
+        float4 q6 = gguf_unpack_q8_4(q16[12], q16[13]);
+        float4 q7 = gguf_unpack_q8_4(q16[14], q16[15]);
+        for (uint t = 0u; t < p.T; ++t) {
+            device const float4* xp4 = reinterpret_cast<device const float4*>(X + ulong(t * p.G + g) * p.K + (b << 5));
+            float s = dot(xp4[0], q0) + dot(xp4[1], q1) + dot(xp4[2], q2) + dot(xp4[3], q3)
+                    + dot(xp4[4], q4) + dot(xp4[5], q5) + dot(xp4[6], q6) + dot(xp4[7], q7);
+            acc[t] = fma(d, s, acc[t]);
+        }
+    }
+    for (uint t = 0u; t < p.T; ++t) {
+        float out = simd_sum(acc[t]);
+        if (lane == 0u) Y[ulong(t * p.G + g) * p.N + n] = out;
+    }
+}
+
+kernel void gguf_gemv_q8_0_multi_2r(
+    device const float* X [[buffer(0)]],
+    device const uchar* W [[buffer(1)]],
+    device float* Y [[buffer(2)]],
+    constant GgufGemvParams& p [[buffer(3)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    uint sg = tid >> 5;
+    uint lane = tid & 31u;
+    uint n0 = tgid * 4u + sg * 2u;
+    if (n0 >= p.N || p.M == 0u || p.M > 6u) return;
+    uint nb = p.K >> 5;
+    ulong row_bytes = ulong(nb) * 34ul;
+    bool has_r1 = (n0 + 1u < p.N);
+    device const uchar* w0 = W + ulong(n0) * row_bytes;
+    device const uchar* w1 = has_r1 ? (w0 + row_bytes) : w0;
+    float acc0[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float acc1[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint b = lane; b < nb; b += 32u) {
+        ulong boff = ulong(b) * 34ul;
+        device const uchar* blk0 = w0 + boff;
+        float d0 = gguf_load_f16(blk0);
+        device const ushort* q0p = reinterpret_cast<device const ushort*>(blk0 + 2u);
+        ushort u0[16];
+        for (uint k = 0u; k < 16u; ++k) u0[k] = q0p[k];
+        float d1 = 0.0f;
+        ushort u1[16];
+        if (has_r1) {
+            device const uchar* blk1 = w1 + boff;
+            d1 = gguf_load_f16(blk1);
+            device const ushort* q1p = reinterpret_cast<device const ushort*>(blk1 + 2u);
+            for (uint k = 0u; k < 16u; ++k) u1[k] = q1p[k];
+        }
+        for (uint m = 0u; m < p.M; ++m) {
+            device const float4* xp4 = reinterpret_cast<device const float4*>(X + ulong(m) * p.K + (b << 5));
+            float s0 = 0.0f;
+            float s1 = 0.0f;
+            for (uint k = 0u; k < 8u; ++k) {
+                float4 xv = xp4[k];
+                s0 += dot(xv, gguf_unpack_q8_4(u0[k * 2u], u0[k * 2u + 1u]));
+                if (has_r1) {
+                    s1 += dot(xv, gguf_unpack_q8_4(u1[k * 2u], u1[k * 2u + 1u]));
+                }
+            }
+            acc0[m] = fma(d0, s0, acc0[m]);
+            if (has_r1) acc1[m] = fma(d1, s1, acc1[m]);
+        }
+    }
+    for (uint m = 0u; m < p.M; ++m) {
+        float o0 = simd_sum(acc0[m]);
+        float o1 = has_r1 ? simd_sum(acc1[m]) : 0.0f;
+        if (lane == 0u) {
+            Y[ulong(m) * p.N + n0] = o0;
+            if (has_r1) Y[ulong(m) * p.N + n0 + 1u] = o1;
+        }
+    }
+}
+
+kernel void ds_markov_bias_argmax_bf16_p1(
+    device const float* base_logits [[buffer(0)]],
+    device const ushort* W1 [[buffer(1)]],
+    device const ushort* W2 [[buffer(2)]],
+    device const int* prev_tok_buf [[buffer(3)]],
+    device float* partial_vals [[buffer(4)]],
+    device int* partial_idxs [[buffer(5)]],
+    constant DsMarkovBiasParams& p [[buffer(6)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float s_w1[256];
+    int prev = prev_tok_buf[0];
+    uint pt = (prev >= 0 && uint(prev) < p.V) ? uint(prev) : 0u;
+    uint r_lim = min(p.R, 256u);
+    device const ushort* w1_row = W1 + ulong(pt) * p.R;
+    for (uint r = tid; r < r_lim; r += 128u) {
+        s_w1[r] = as_type<float>(uint(w1_row[r]) << 16);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint sg = tid >> 5;
+    uint lane = tid & 31u;
+    uint r4 = r_lim >> 2;
+    uint v_base = tgid * 16u + sg * 4u;
+    float best_v = -INFINITY;
+    int best_i = 0x7fffffff;
+    for (uint k = 0u; k < 4u; ++k) {
+        uint v = v_base + k;
+        if (v < p.V) {
+            device const ushort4* w2p = reinterpret_cast<device const ushort4*>(W2 + ulong(v) * p.R);
+            float4 acc = float4(0.0f);
+            for (uint r = lane; r < r4; r += 32u) {
+                uint ro = r << 2;
+                float4 xv = float4(s_w1[ro], s_w1[ro + 1u], s_w1[ro + 2u], s_w1[ro + 3u]);
+                ushort4 q = w2p[r];
+                float4 fv = float4(as_type<float>(uint(q.x) << 16), as_type<float>(uint(q.y) << 16),
+                                   as_type<float>(uint(q.z) << 16), as_type<float>(uint(q.w) << 16));
+                acc = fma(xv, fv, acc);
+            }
+            float val = base_logits[v] + simd_sum(acc.x + acc.y + acc.z + acc.w);
+            if (lane == 0u && (val > best_v || (val == best_v && int(v) < best_i))) {
+                best_v = val;
+                best_i = int(v);
+            }
+        }
+    }
+
+    threadgroup float sg_val[4];
+    threadgroup int sg_idx[4];
+    if (lane == 0u) {
+        sg_val[sg] = best_v;
+        sg_idx[sg] = best_i;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {
+        float tv = sg_val[0];
+        int ti = sg_idx[0];
+        for (uint s = 1u; s < 4u; ++s) {
+            float ov = sg_val[s];
+            int oi = sg_idx[s];
+            if (ov > tv || (ov == tv && oi < ti)) {
+                tv = ov;
+                ti = oi;
+            }
+        }
+        partial_vals[tgid] = tv;
+        partial_idxs[tgid] = ti;
+    }
+}
+
+kernel void ds_markov_bias_argmax_p2(
+    device const float* partial_vals [[buffer(0)]],
+    device const int* partial_idxs [[buffer(1)]],
+    device int* out_tok [[buffer(2)]],
+    constant uint& num_tg [[buffer(3)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tptg [[threads_per_threadgroup]]) {
+    float bv = -INFINITY;
+    int bi = 0x7fffffff;
+    for (uint i = tid; i < num_tg; i += tptg) {
+        float v = partial_vals[i];
+        int idx = partial_idxs[i];
+        if (v > bv || (v == bv && idx < bi)) {
+            bv = v;
+            bi = idx;
+        }
+    }
+    threadgroup float s_val[256];
+    threadgroup int s_idx[256];
+    s_val[tid] = bv;
+    s_idx[tid] = bi;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tptg >> 1; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            float ov = s_val[tid + stride];
+            int oi = s_idx[tid + stride];
+            if (ov > s_val[tid] || (ov == s_val[tid] && oi < s_idx[tid])) {
+                s_val[tid] = ov;
+                s_idx[tid] = oi;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) out_tok[0] = (s_idx[0] == 0x7fffffff) ? 0 : s_idx[0];
+}

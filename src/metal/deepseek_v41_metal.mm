@@ -491,6 +491,8 @@ struct DeepSeekV41Model::Impl {
         id<MTLBuffer> b_inp_g = nil;
         id<MTLBuffer> b_logits_blk = nil;
         id<MTLBuffer> b_markov_logits = nil;
+        id<MTLBuffer> b_markov_p1_val = nil;
+        id<MTLBuffer> b_markov_p1_idx = nil;
         id<MTLBuffer> b_markov_toks = nil;
         id<MTLBuffer> b_conf = nil;
 
@@ -510,6 +512,8 @@ struct DeepSeekV41Model::Impl {
             b_inp_g = nil;
             b_logits_blk = nil;
             b_markov_logits = nil;
+            b_markov_p1_val = nil;
+            b_markov_p1_idx = nil;
             b_markov_toks = nil;
             b_conf = nil;
             gguf.close();
@@ -828,6 +832,16 @@ struct DeepSeekV41Model::Impl {
         }
         if (M >= 2u && M <= 6u && (x_offset & 15u) == 0u &&
             (w.type == GgmlType::Q6_K || w.type == GgmlType::Q5_K || w.type == GgmlType::Q8_0)) {
+            if (w.type == GgmlType::Q8_0 && (((w.base_offset + w_offset) & 1u) == 0u)) {
+                [enc setComputePipelineState:pso("gguf_gemv_q8_0_multi_2r")];
+                [enc setBuffer:x offset:x_offset atIndex:0];
+                [enc setBuffer:w.buf offset:w.base_offset + w_offset atIndex:1];
+                [enc setBuffer:y offset:y_offset atIndex:2];
+                [enc setBytes:&p length:sizeof(p) atIndex:3];
+                [enc dispatchThreadgroups:MTLSizeMake((w.rows + 3u) / 4u, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+                return;
+            }
             const char* kname = (w.type == GgmlType::Q6_K) ? "gguf_gemv_q6_k_multi"
                               : (w.type == GgmlType::Q5_K) ? "gguf_gemv_q5_k_multi"
                                                            : "gguf_gemv_q8_0_multi";
@@ -1411,6 +1425,9 @@ void DeepSeekV41Model::load(const std::string& model_path, int max_seq, int max_
         ds.b_inp_g = impl_->alloc_buf(Tmax * D * sizeof(float));
         ds.b_logits_blk = impl_->alloc_buf(max_blk * (size_t)cfg.vocab_size * sizeof(float));
         ds.b_markov_logits = impl_->alloc_buf((size_t)cfg.vocab_size * sizeof(float));
+        size_t markov_p1_tg = ((size_t)cfg.vocab_size + 15) / 16;
+        ds.b_markov_p1_val = impl_->alloc_buf(markov_p1_tg * sizeof(float));
+        ds.b_markov_p1_idx = impl_->alloc_buf(markov_p1_tg * sizeof(int32_t));
         ds.b_markov_toks = impl_->alloc_buf((max_blk + 1) * sizeof(int32_t));
         ds.b_conf = impl_->alloc_buf(max_blk * sizeof(float));
         if (draft_k <= 0) draft_k = ds.block_size;
@@ -2337,16 +2354,6 @@ void DeepSeekV41Model::draft_tokens(int32_t anchor_tok, int anchor_pos, int num_
 
         if (il > 0) {
             impl_->encode_hc_pre(enc, impl_->b_streams_a, pre_ffn, impl_->b_hidden, (uint32_t)B, (uint32_t)D, hc);
-        } else {
-            [enc endEncoding];
-            id<MTLBlitCommandEncoder> bl0 = [cb blitCommandEncoder];
-            for (int b = 0; b < B; ++b) {
-                [bl0 copyFromBuffer:impl_->b_streams_a sourceOffset:(size_t)b * hc * D * sizeof(float)
-                           toBuffer:impl_->b_hidden destinationOffset:(size_t)b * D * sizeof(float)
-                               size:D * sizeof(float)];
-            }
-            [bl0 endEncoding];
-            enc = [cb computeCommandEncoder];
         }
 
         impl_->encode_rmsnorm(enc, impl_->b_hidden, dl.attn_norm, impl_->b_norm, (uint32_t)B, (uint32_t)D, ds.rms_norm_eps);
@@ -2395,7 +2402,17 @@ void DeepSeekV41Model::draft_tokens(int32_t anchor_tok, int anchor_pos, int num_
         }
 
         uint32_t o_groups = dl.wo_a.groups;
-        if (dl.wo_a.type == GgmlType::Q8_0 && (dl.wo_a.cols & 31u) == 0u) {
+        if (dl.wo_a.type == GgmlType::Q8_0 && (dl.wo_a.cols & 31u) == 0u &&
+            B >= 2 && B <= 6 && ((dl.wo_a.base_offset & 1u) == 0u) && ((dl.wo_a.group_stride_bytes & 1u) == 0u)) {
+            GgufGroupedGemvParams gp{(uint32_t)B, o_groups, dl.wo_a.rows, dl.wo_a.cols, dl.wo_a.group_stride_bytes};
+            [enc setComputePipelineState:impl_->pso("gguf_grouped_gemv_q8_0_multi")];
+            [enc setBuffer:impl_->b_attn_out offset:0 atIndex:0];
+            [enc setBuffer:dl.wo_a.buf offset:dl.wo_a.base_offset atIndex:1];
+            [enc setBuffer:impl_->b_oa offset:0 atIndex:2];
+            [enc setBytes:&gp length:sizeof(gp) atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake((dl.wo_a.rows + 1u) / 2u, o_groups, 1)
+                threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        } else if (dl.wo_a.type == GgmlType::Q8_0 && (dl.wo_a.cols & 31u) == 0u) {
             GgufGroupedGemvParams gp{(uint32_t)B, o_groups, dl.wo_a.rows, dl.wo_a.cols, dl.wo_a.group_stride_bytes};
             [enc setComputePipelineState:impl_->pso("gguf_grouped_gemv_q8_0_fast")];
             [enc setBuffer:impl_->b_attn_out offset:0 atIndex:0];
@@ -2489,22 +2506,44 @@ void DeepSeekV41Model::draft_tokens(int32_t anchor_tok, int anchor_pos, int num_
 
     uint32_t v_sz = (uint32_t)cfg.vocab_size;
     DsMarkovBiasParams mp{v_sz, (uint32_t)ds.markov_rank};
+    bool use_fused_markov = (ds.markov_rank <= 256 && (ds.markov_rank & 3) == 0 &&
+                             ((ds.markov_w2.base_offset & 7u) == 0u));
+    uint32_t markov_p1_tg = (v_sz + 15u) / 16u;
     uint32_t markov_tg = (v_sz + 3u) / 4u;
     for (int i = 0; i < B; ++i) {
-        [enc setComputePipelineState:impl_->pso("ds_markov_bias_add_bf16")];
-        [enc setBuffer:ds.b_logits_blk offset:(size_t)i * (size_t)v_sz * sizeof(float) atIndex:0];
-        [enc setBuffer:ds.markov_w1.buf offset:ds.markov_w1.base_offset atIndex:1];
-        [enc setBuffer:ds.markov_w2.buf offset:ds.markov_w2.base_offset atIndex:2];
-        [enc setBuffer:ds.b_markov_toks offset:(size_t)i * sizeof(int32_t) atIndex:3];
-        [enc setBuffer:ds.b_markov_logits offset:0 atIndex:4];
-        [enc setBytes:&mp length:sizeof(mp) atIndex:5];
-        [enc dispatchThreadgroups:MTLSizeMake(markov_tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        if (use_fused_markov) {
+            [enc setComputePipelineState:impl_->pso("ds_markov_bias_argmax_bf16_p1")];
+            [enc setBuffer:ds.b_logits_blk offset:(size_t)i * (size_t)v_sz * sizeof(float) atIndex:0];
+            [enc setBuffer:ds.markov_w1.buf offset:ds.markov_w1.base_offset atIndex:1];
+            [enc setBuffer:ds.markov_w2.buf offset:ds.markov_w2.base_offset atIndex:2];
+            [enc setBuffer:ds.b_markov_toks offset:(size_t)i * sizeof(int32_t) atIndex:3];
+            [enc setBuffer:ds.b_markov_p1_val offset:0 atIndex:4];
+            [enc setBuffer:ds.b_markov_p1_idx offset:0 atIndex:5];
+            [enc setBytes:&mp length:sizeof(mp) atIndex:6];
+            [enc dispatchThreadgroups:MTLSizeMake(markov_p1_tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
 
-        [enc setComputePipelineState:impl_->pso("ds_argmax_f32")];
-        [enc setBuffer:ds.b_markov_logits offset:0 atIndex:0];
-        [enc setBuffer:ds.b_markov_toks offset:(size_t)(i + 1) * sizeof(int32_t) atIndex:1];
-        [enc setBytes:&v_sz length:sizeof(v_sz) atIndex:2];
-        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc setComputePipelineState:impl_->pso("ds_markov_bias_argmax_p2")];
+            [enc setBuffer:ds.b_markov_p1_val offset:0 atIndex:0];
+            [enc setBuffer:ds.b_markov_p1_idx offset:0 atIndex:1];
+            [enc setBuffer:ds.b_markov_toks offset:(size_t)(i + 1) * sizeof(int32_t) atIndex:2];
+            [enc setBytes:&markov_p1_tg length:sizeof(markov_p1_tg) atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        } else {
+            [enc setComputePipelineState:impl_->pso("ds_markov_bias_add_bf16")];
+            [enc setBuffer:ds.b_logits_blk offset:(size_t)i * (size_t)v_sz * sizeof(float) atIndex:0];
+            [enc setBuffer:ds.markov_w1.buf offset:ds.markov_w1.base_offset atIndex:1];
+            [enc setBuffer:ds.markov_w2.buf offset:ds.markov_w2.base_offset atIndex:2];
+            [enc setBuffer:ds.b_markov_toks offset:(size_t)i * sizeof(int32_t) atIndex:3];
+            [enc setBuffer:ds.b_markov_logits offset:0 atIndex:4];
+            [enc setBytes:&mp length:sizeof(mp) atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake(markov_tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+
+            [enc setComputePipelineState:impl_->pso("ds_argmax_f32")];
+            [enc setBuffer:ds.b_markov_logits offset:0 atIndex:0];
+            [enc setBuffer:ds.b_markov_toks offset:(size_t)(i + 1) * sizeof(int32_t) atIndex:1];
+            [enc setBytes:&v_sz length:sizeof(v_sz) atIndex:2];
+            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        }
     }
 
     if (ds.conf_proj != nil) {
