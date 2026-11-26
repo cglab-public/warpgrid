@@ -1074,6 +1074,107 @@ static void test_gguf_moe_indexed_iq1_s() {
     }
 }
 
+static void test_gguf_gemm_tiled_and_smallk_parity() {
+    const uint32_t M = 37, N = 41, K = 512;
+    std::vector<float> x((size_t)M * K);
+    for (size_t i = 0; i < x.size(); ++i) x[i] = std::sin((float)(i + 3) * 0.031f) * 0.5f;
+
+    auto run_tiled = [&](const char* kname, const std::vector<uint8_t>& w, std::vector<float>& y) {
+        id<MTLBuffer> bx = [g_ctx.dev newBufferWithBytes:x.data() length:x.size() * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bw = [g_ctx.dev newBufferWithBytes:w.data() length:w.size() options:MTLResourceStorageModeShared];
+        id<MTLBuffer> by = [g_ctx.dev newBufferWithLength:(size_t)M * N * sizeof(float) options:MTLResourceStorageModeShared];
+        GgufGemvParams p{M, N, K};
+        id<MTLCommandBuffer> cb = [g_ctx.q commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:g_ctx.pso(kname)];
+        [enc setBuffer:bx offset:0 atIndex:0];
+        [enc setBuffer:bw offset:0 atIndex:1];
+        [enc setBuffer:by offset:0 atIndex:2];
+        [enc setBytes:&p length:sizeof(p) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake((N + 31u) / 32u, (M + 31u) / 32u, 1)
+            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        y.resize((size_t)M * N);
+        memcpy(y.data(), by.contents, y.size() * sizeof(float));
+    };
+
+    {
+        const uint32_t nb = K / 256;
+        std::vector<uint8_t> w((size_t)N * nb * 210, 0);
+        for (uint32_t n = 0; n < N; ++n) {
+            for (uint32_t b = 0; b < nb; ++b) {
+                uint8_t* blk = w.data() + ((size_t)n * nb + b) * 210;
+                for (int i = 0; i < 128; ++i) blk[i] = (uint8_t)((n * 17 + b * 23 + i * 7) & 0xFFu);
+                for (int i = 0; i < 64; ++i) blk[128 + i] = (uint8_t)((n * 13 + b * 5 + i * 11) & 0xFFu);
+                for (int i = 0; i < 16; ++i) ((int8_t*)(blk + 192))[i] = (int8_t)((int)((n + b + i) % 15) - 7);
+                uint16_t d = f32_to_f16_bits(0.05f);
+                memcpy(blk + 208, &d, 2);
+            }
+        }
+        std::vector<float> y_ref, y_tiled, y_smallk;
+        dispatch_gguf_gemv("gguf_gemv_q6_k", x, w, M, N, K, y_ref);
+        run_tiled("gguf_gemm_q6_k_tiled", w, y_tiled);
+        for (size_t i = 0; i < y_ref.size(); ++i) EXPECT_TRUE(std::abs(y_tiled[i] - y_ref[i]) <= 5e-2f + 2e-3f * std::abs(y_ref[i]));
+
+        id<MTLBuffer> bx = [g_ctx.dev newBufferWithBytes:x.data() length:x.size() * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bw = [g_ctx.dev newBufferWithBytes:w.data() length:w.size() options:MTLResourceStorageModeShared];
+        id<MTLBuffer> by = [g_ctx.dev newBufferWithLength:(size_t)M * N * sizeof(float) options:MTLResourceStorageModeShared];
+        GgufGemvParams p{M, N, K};
+        id<MTLCommandBuffer> cb = [g_ctx.q commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:g_ctx.pso("gguf_gemv_q6_k_smallk")];
+        [enc setBuffer:bx offset:0 atIndex:0];
+        [enc setBuffer:bw offset:0 atIndex:1];
+        [enc setBuffer:by offset:0 atIndex:2];
+        [enc setBytes:&p length:sizeof(p) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake((N + 7u) / 8u, M, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        y_smallk.resize((size_t)M * N);
+        memcpy(y_smallk.data(), by.contents, y_smallk.size() * sizeof(float));
+        for (size_t i = 0; i < y_ref.size(); ++i) EXPECT_TRUE(std::abs(y_smallk[i] - y_ref[i]) < 1e-2f);
+    }
+    {
+        const uint32_t nb = K / 256;
+        std::vector<uint8_t> w((size_t)N * nb * 176, 0);
+        for (uint32_t n = 0; n < N; ++n) {
+            for (uint32_t b = 0; b < nb; ++b) {
+                uint8_t* blk = w.data() + ((size_t)n * nb + b) * 176;
+                uint16_t d = f32_to_f16_bits(0.005f);
+                uint16_t dm = f32_to_f16_bits(0.002f);
+                memcpy(blk, &d, 2);
+                memcpy(blk + 2, &dm, 2);
+                for (int i = 0; i < 12; ++i) blk[4 + i] = (uint8_t)((n * 7 + b * 3 + i * 5) & 0x3Fu);
+                for (int i = 0; i < 32; ++i) blk[16 + i] = (uint8_t)((n * 11 + b * 13 + i) & 0xFFu);
+                for (int i = 0; i < 128; ++i) blk[48 + i] = (uint8_t)((n * 19 + b * 7 + i * 3) & 0xFFu);
+            }
+        }
+        std::vector<float> y_ref, y_tiled;
+        dispatch_gguf_gemv("gguf_gemv_q5_k", x, w, M, N, K, y_ref);
+        run_tiled("gguf_gemm_q5_k_tiled", w, y_tiled);
+        for (size_t i = 0; i < y_ref.size(); ++i) EXPECT_TRUE(std::abs(y_tiled[i] - y_ref[i]) <= 5e-2f + 2e-3f * std::abs(y_ref[i]));
+    }
+    {
+        const uint32_t nb = K / 32;
+        std::vector<uint8_t> w((size_t)N * nb * 34, 0);
+        for (uint32_t n = 0; n < N; ++n) {
+            for (uint32_t b = 0; b < nb; ++b) {
+                uint8_t* blk = w.data() + ((size_t)n * nb + b) * 34;
+                uint16_t d = f32_to_f16_bits(0.03f);
+                memcpy(blk, &d, 2);
+                for (int i = 0; i < 32; ++i) ((int8_t*)(blk + 2))[i] = (int8_t)((int)((n * 5 + b * 7 + i * 3) % 63) - 31);
+            }
+        }
+        std::vector<float> y_ref, y_tiled;
+        dispatch_gguf_gemv("gguf_gemv_q8_0", x, w, M, N, K, y_ref);
+        run_tiled("gguf_gemm_q8_0_tiled", w, y_tiled);
+        for (size_t i = 0; i < y_ref.size(); ++i) EXPECT_TRUE(std::abs(y_tiled[i] - y_ref[i]) <= 5e-2f + 2e-3f * std::abs(y_ref[i]));
+    }
+}
+
 int main() {
     @autoreleasepool {
         if (!g_ctx.init()) {
@@ -1096,6 +1197,7 @@ int main() {
         run_test("test_ds_mhc_sinkhorn_doubly_stochastic", test_ds_mhc_sinkhorn_doubly_stochastic);
         run_test("test_ds_router_topk6_sigmoid_bias", test_ds_router_topk6_sigmoid_bias);
         run_test("test_ds_csa_hca_causal_attention", test_ds_csa_hca_causal_attention);
+        run_test("test_gguf_gemm_tiled_and_smallk_parity", test_gguf_gemm_tiled_and_smallk_parity);
         printf("GGUF Metal kernel tests: %d passed, %d failed\n", g_passed, g_failed);
         return g_failed == 0 ? 0 : 1;
     }

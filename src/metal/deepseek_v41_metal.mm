@@ -483,7 +483,29 @@ struct DeepSeekV41Model::Impl {
             [enc dispatchThreadgroups:MTLSizeMake(w.rows, M, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             return;
         }
+        if (M >= 8u && (w.type == GgmlType::Q6_K || w.type == GgmlType::Q5_K || w.type == GgmlType::Q8_0)) {
+            const char* kname = (w.type == GgmlType::Q6_K) ? "gguf_gemm_q6_k_tiled"
+                              : (w.type == GgmlType::Q5_K) ? "gguf_gemm_q5_k_tiled"
+                                                           : "gguf_gemm_q8_0_tiled";
+            [enc setComputePipelineState:pso(kname)];
+            [enc setBuffer:x offset:x_offset atIndex:0];
+            [enc setBuffer:w.buf offset:w.base_offset + w_offset atIndex:1];
+            [enc setBuffer:y offset:y_offset atIndex:2];
+            [enc setBytes:&p length:sizeof(p) atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake((w.rows + 31u) / 32u, (M + 31u) / 32u, 1)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            return;
+        }
         if (w.type == GgmlType::Q6_K && (x_offset & 15u) == 0u) {
+            if (w.cols <= 2048u && w.rows >= 4096u) {
+                [enc setComputePipelineState:pso("gguf_gemv_q6_k_smallk")];
+                [enc setBuffer:x offset:x_offset atIndex:0];
+                [enc setBuffer:w.buf offset:w.base_offset + w_offset atIndex:1];
+                [enc setBuffer:y offset:y_offset atIndex:2];
+                [enc setBytes:&p length:sizeof(p) atIndex:3];
+                [enc dispatchThreadgroups:MTLSizeMake((w.rows + 7u) / 8u, M, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                return;
+            }
             [enc setComputePipelineState:pso("gguf_gemv_q6_k_fast")];
             [enc setBuffer:x offset:x_offset atIndex:0];
             [enc setBuffer:w.buf offset:w.base_offset + w_offset atIndex:1];
@@ -580,7 +602,8 @@ struct DeepSeekV41Model::Impl {
         [enc setBuffer:topk_ids offset:0 atIndex:3];
         [enc setBuffer:y offset:0 atIndex:4];
         [enc setBytes:&sp length:sizeof(sp) atIndex:5];
-        [enc dispatchThreadgroups:MTLSizeMake((wg.rows + 7u) / 8u, T * top_k, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        uint32_t rows_per_tg = (wg.type == GgmlType::IQ1_S) ? 4u : 8u;
+        [enc dispatchThreadgroups:MTLSizeMake((wg.rows + rows_per_tg - 1u) / rows_per_tg, T * top_k, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
     }
 
     void encode_rmsnorm(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> x, id<MTLBuffer> w, id<MTLBuffer> y,
@@ -895,11 +918,17 @@ void DeepSeekV41Model::load(const std::string& model_path, int max_seq, int max_
     impl_->b_argmax = impl_->alloc_buf(sizeof(int32_t));
     impl_->b_dummy_bias = impl_->alloc_buf((size_t)std::max(1, cfg.n_routed_experts) * sizeof(float));
 
-    fprintf(stderr, "[warpgrid] Loaded DeepSeek-V4.1 (%s): %d layers, D=%d, H=%d, hc=%d, E=%d (top-%d), slots=%d, max_seq=%d, engram=%s, moe_res=%d/%d\n",
+    if (max_slots == 1) {
+        num_kv_blocks = std::max(1, max_seq_len / 64);
+        num_snapshots = 1;
+    }
+
+    fprintf(stderr, "[warpgrid] Loaded DeepSeek-V4.1 (%s): %d layers, D=%d, H=%d, hc=%d, E=%d (top-%d), slots=%d, max_seq=%d, engram=%s, moe_res=%d/%d, prefix_cache=%s\n",
             cfg.arch.c_str(), cfg.num_hidden_layers, cfg.hidden_size, cfg.num_attention_heads,
             cfg.hc_mult, cfg.n_routed_experts, cfg.num_experts_per_tok, max_slots, max_seq_len,
             (engram.is_open() || impl_->engram_in_main_gguf) ? "ON" : "OFF",
-            resident_moe_layers, cfg.num_hidden_layers);
+            resident_moe_layers, cfg.num_hidden_layers,
+            num_snapshots > 0 ? "ON" : "OFF");
 }
 
 void DeepSeekV41Model::reset_cache(int slot_id) {
@@ -1275,6 +1304,9 @@ int32_t DeepSeekV41Model::forward_and_greedy(const int32_t* h_tokens, int T, int
                 size_t g_stride = lw.ffn_gate_exps.group_stride_bytes;
                 size_t u_stride = lw.ffn_up_exps.group_stride_bytes;
                 size_t d_stride = lw.ffn_down_exps.group_stride_bytes;
+                const uint8_t* src_g = lw.ffn_gate_exps.raw_data;
+                const uint8_t* src_u = lw.ffn_up_exps.raw_data;
+                const uint8_t* src_d = lw.ffn_down_exps.raw_data;
                 constexpr size_t kMaxStageChunk = 16u;
                 size_t cap_u = std::min<size_t>(U, kMaxStageChunk);
                 impl_->ensure_moe_stage(cap_u * g_stride, cap_u * u_stride, cap_u * d_stride);
@@ -1282,9 +1314,6 @@ int32_t DeepSeekV41Model::forward_and_greedy(const int32_t* h_tokens, int T, int
                 uint8_t* dst_g = static_cast<uint8_t*>(impl_->b_moe_stage_gate.contents);
                 uint8_t* dst_u = static_cast<uint8_t*>(impl_->b_moe_stage_up.contents);
                 uint8_t* dst_d = static_cast<uint8_t*>(impl_->b_moe_stage_down.contents);
-                const uint8_t* src_g = lw.ffn_gate_exps.raw_data;
-                const uint8_t* src_u = lw.ffn_up_exps.raw_data;
-                const uint8_t* src_d = lw.ffn_down_exps.raw_data;
                 const int32_t* uids = uniq_ids.data();
 
                 for (size_t base_u = 0; base_u < U; base_u += kMaxStageChunk) {

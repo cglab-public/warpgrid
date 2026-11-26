@@ -288,6 +288,28 @@ kernel void gguf_gemv_q6_k(
     if (lane == 0u) Y[ulong(m) * p.N + n] = sum;
 }
 
+inline float gguf_q6_k_sub4(
+    device const uchar* b,
+    uint ql_off,
+    uint qh_off,
+    uint sc_off,
+    float4 y0,
+    float4 y1,
+    float4 y2,
+    float4 y3) {
+    uchar4 a = uchar4(*reinterpret_cast<device const packed_uchar4*>(b + ql_off));
+    uchar4 c = uchar4(*reinterpret_cast<device const packed_uchar4*>(b + ql_off + 32u));
+    uchar4 h = uchar4(*reinterpret_cast<device const packed_uchar4*>(b + qh_off));
+    device const char* sc = reinterpret_cast<device const char*>(b + sc_off);
+    float d = gguf_load_f16(b + 208u);
+    float4 q0 = float4(int4((a & 0x0Fu) | ((h & 0x03u) << 4)) - 32);
+    float4 q1 = float4(int4((c & 0x0Fu) | ((h & 0x0Cu) << 2)) - 32);
+    float4 q2 = float4(int4((a >> 4) | (h & 0x30u)) - 32);
+    float4 q3 = float4(int4((c >> 4) | ((h & 0xC0u) >> 2)) - 32);
+    return d * (dot(y0, q0) * float(sc[0]) + dot(y1, q1) * float(sc[2]) +
+                dot(y2, q2) * float(sc[4]) + dot(y3, q3) * float(sc[6]));
+}
+
 kernel void gguf_gemv_q6_k_fast(
     device const float* X [[buffer(0)]],
     device const uchar* W [[buffer(1)]],
@@ -325,40 +347,8 @@ kernel void gguf_gemv_q6_k_fast(
         float4 y2 = *reinterpret_cast<device const float4*>(y + 64u);
         float4 y3 = *reinterpret_cast<device const float4*>(y + 96u);
         ulong boff = ulong(i) * 210ul;
-        {
-            device const uchar* b = w0 + boff;
-            device const uchar* q1 = b + ql_off;
-            device const uchar* q2 = q1 + 32u;
-            device const uchar* qh = b + qh_off;
-            device const char* sc = reinterpret_cast<device const char*>(b + sc_off);
-            float d = gguf_load_f16(b + 208u);
-            float4 s = float4(0.0f);
-            for (uint l = 0; l < 4u; ++l) {
-                uchar a = q1[l], c = q2[l], h = qh[l];
-                s.x += y0[l] * float(int((a & 0x0Fu) | ((h & 0x03u) << 4)) - 32);
-                s.y += y1[l] * float(int((c & 0x0Fu) | ((h & 0x0Cu) << 2)) - 32);
-                s.z += y2[l] * float(int((a >> 4) | (h & 0x30u)) - 32);
-                s.w += y3[l] * float(int((c >> 4) | ((h & 0xC0u) >> 2)) - 32);
-            }
-            sumf0 += d * (s.x * float(sc[0]) + s.y * float(sc[2]) + s.z * float(sc[4]) + s.w * float(sc[6]));
-        }
-        if (has_r1) {
-            device const uchar* b = w1 + boff;
-            device const uchar* q1 = b + ql_off;
-            device const uchar* q2 = q1 + 32u;
-            device const uchar* qh = b + qh_off;
-            device const char* sc = reinterpret_cast<device const char*>(b + sc_off);
-            float d = gguf_load_f16(b + 208u);
-            float4 s = float4(0.0f);
-            for (uint l = 0; l < 4u; ++l) {
-                uchar a = q1[l], c = q2[l], h = qh[l];
-                s.x += y0[l] * float(int((a & 0x0Fu) | ((h & 0x03u) << 4)) - 32);
-                s.y += y1[l] * float(int((c & 0x0Fu) | ((h & 0x0Cu) << 2)) - 32);
-                s.z += y2[l] * float(int((a >> 4) | (h & 0x30u)) - 32);
-                s.w += y3[l] * float(int((c >> 4) | ((h & 0xC0u) >> 2)) - 32);
-            }
-            sumf1 += d * (s.x * float(sc[0]) + s.y * float(sc[2]) + s.z * float(sc[4]) + s.w * float(sc[6]));
-        }
+        sumf0 += gguf_q6_k_sub4(w0 + boff, ql_off, qh_off, sc_off, y0, y1, y2, y3);
+        if (has_r1) sumf1 += gguf_q6_k_sub4(w1 + boff, ql_off, qh_off, sc_off, y0, y1, y2, y3);
     }
     float out0 = simd_sum(sumf0);
     float out1 = simd_sum(sumf1);
@@ -366,6 +356,50 @@ kernel void gguf_gemv_q6_k_fast(
         ulong yb = ulong(m) * p.N;
         Y[yb + n0] = out0;
         if (has_r1) Y[yb + n0 + 1u] = out1;
+    }
+}
+
+kernel void gguf_gemv_q6_k_smallk(
+    device const float* X [[buffer(0)]],
+    device const uchar* W [[buffer(1)]],
+    device float* Y [[buffer(2)]],
+    constant GgufGemvParams& p [[buffer(3)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    uint m = tgid.y;
+    uint sg = tid >> 5;
+    uint tiisg = tid & 31u;
+    uint row_sub = tiisg >> 4;
+    uint lane_id = tiisg & 15u;
+    uint n = tgid.x * 8u + sg * 2u + row_sub;
+    if (m >= p.M || n >= p.N) return;
+    uint nb = p.K >> 8;
+    ulong row_bytes = ulong(nb) * 210ul;
+    device const float* yy = X + ulong(m) * p.K;
+    uint ip = lane_id >> 3;
+    uint il = lane_id & 7u;
+    uint l0 = il << 2;
+    uint is = (ip << 3) + (l0 >> 4);
+    uint y_off = (ip << 7) + l0;
+    uint ql_off = (ip << 6) + l0;
+    uint qh_off = 128u + (ip << 5) + l0;
+    uint sc_off = 192u + is;
+    device const uchar* w = W + ulong(n) * row_bytes;
+    float sumf = 0.0f;
+    for (uint i = 0; i < nb; ++i) {
+        device const float* y = yy + (i << 8) + y_off;
+        float4 y0 = *reinterpret_cast<device const float4*>(y + 0u);
+        float4 y1 = *reinterpret_cast<device const float4*>(y + 32u);
+        float4 y2 = *reinterpret_cast<device const float4*>(y + 64u);
+        float4 y3 = *reinterpret_cast<device const float4*>(y + 96u);
+        sumf += gguf_q6_k_sub4(w + ulong(i) * 210ul, ql_off, qh_off, sc_off, y0, y1, y2, y3);
+    }
+    sumf += simd_shuffle_xor(sumf, 8u);
+    sumf += simd_shuffle_xor(sumf, 4u);
+    sumf += simd_shuffle_xor(sumf, 2u);
+    sumf += simd_shuffle_xor(sumf, 1u);
+    if (lane_id == 0u) {
+        Y[ulong(m) * p.N + n] = sumf;
     }
 }
 
@@ -407,40 +441,8 @@ kernel void gguf_grouped_gemv_q6_k_fast(
         float4 y2 = *reinterpret_cast<device const float4*>(y + 64u);
         float4 y3 = *reinterpret_cast<device const float4*>(y + 96u);
         ulong boff = ulong(i) * 210ul;
-        {
-            device const uchar* b = w0 + boff;
-            device const uchar* q1 = b + ql_off;
-            device const uchar* q2 = q1 + 32u;
-            device const uchar* qh = b + qh_off;
-            device const char* sc = reinterpret_cast<device const char*>(b + sc_off);
-            float d = gguf_load_f16(b + 208u);
-            float4 s = float4(0.0f);
-            for (uint l = 0; l < 4u; ++l) {
-                uchar a = q1[l], c = q2[l], h = qh[l];
-                s.x += y0[l] * float(int((a & 0x0Fu) | ((h & 0x03u) << 4)) - 32);
-                s.y += y1[l] * float(int((c & 0x0Fu) | ((h & 0x0Cu) << 2)) - 32);
-                s.z += y2[l] * float(int((a >> 4) | (h & 0x30u)) - 32);
-                s.w += y3[l] * float(int((c >> 4) | ((h & 0xC0u) >> 2)) - 32);
-            }
-            sumf0 += d * (s.x * float(sc[0]) + s.y * float(sc[2]) + s.z * float(sc[4]) + s.w * float(sc[6]));
-        }
-        if (has_r1) {
-            device const uchar* b = w1 + boff;
-            device const uchar* q1 = b + ql_off;
-            device const uchar* q2 = q1 + 32u;
-            device const uchar* qh = b + qh_off;
-            device const char* sc = reinterpret_cast<device const char*>(b + sc_off);
-            float d = gguf_load_f16(b + 208u);
-            float4 s = float4(0.0f);
-            for (uint l = 0; l < 4u; ++l) {
-                uchar a = q1[l], c = q2[l], h = qh[l];
-                s.x += y0[l] * float(int((a & 0x0Fu) | ((h & 0x03u) << 4)) - 32);
-                s.y += y1[l] * float(int((c & 0x0Fu) | ((h & 0x0Cu) << 2)) - 32);
-                s.z += y2[l] * float(int((a >> 4) | (h & 0x30u)) - 32);
-                s.w += y3[l] * float(int((c >> 4) | ((h & 0xC0u) >> 2)) - 32);
-            }
-            sumf1 += d * (s.x * float(sc[0]) + s.y * float(sc[2]) + s.z * float(sc[4]) + s.w * float(sc[6]));
-        }
+        sumf0 += gguf_q6_k_sub4(w0 + boff, ql_off, qh_off, sc_off, y0, y1, y2, y3);
+        if (has_r1) sumf1 += gguf_q6_k_sub4(w1 + boff, ql_off, qh_off, sc_off, y0, y1, y2, y3);
     }
     float out0 = simd_sum(sumf0);
     float out1 = simd_sum(sumf1);
@@ -2838,6 +2840,29 @@ inline float gguf_iq2xxs_sub32(device const uchar* blk, uint ib, float4 v0, floa
     return db * s;
 }
 
+inline float gguf_iq1s_sub32_h(device const uchar* blk, uint ib, half4 v0, half4 v1, half4 v2, half4 v3, half4 v4, half4 v5, half4 v6, half4 v7, float sumy) {
+    float d = gguf_load_f16(blk);
+    uchar2 qhb = uchar2(*reinterpret_cast<device const packed_uchar2*>(blk + 34u + ib * 2u));
+    ushort qh = ushort(qhb.x) | (ushort(qhb.y) << 8);
+    float dl = d * float(2u * ((uint(qh) >> 12) & 7u) + 1u);
+    float delta = (qh & 0x8000u) ? (-1.0f - 0.125f) : (-1.0f + 0.125f);
+    uchar4 qs4 = uchar4(*reinterpret_cast<device const packed_uchar4*>(blk + 2u + ib * 4u));
+    half s = half(0.0h);
+    #define IQ1S_GH(L, QBYTE, VA, VB) do { \
+        uint idx = uint(QBYTE) | (((uint(qh) >> (3u * (L))) & 7u) << 8); \
+        uint pk = kGgufIq1sGridGpu[idx]; \
+        uint b0 = pk & 0xFFu, b1 = (pk >> 8) & 0xFFu, b2 = (pk >> 16) & 0xFFu, b3 = (pk >> 24) & 0xFFu; \
+        s += dot((VA), half4(half(b0 & 0x0Fu), half(b1 & 0x0Fu), half(b2 & 0x0Fu), half(b3 & 0x0Fu))) \
+           + dot((VB), half4(half(b0 >> 4), half(b1 >> 4), half(b2 >> 4), half(b3 >> 4))); \
+    } while (0)
+    IQ1S_GH(0u, qs4.x, v0, v1);
+    IQ1S_GH(1u, qs4.y, v2, v3);
+    IQ1S_GH(2u, qs4.z, v4, v5);
+    IQ1S_GH(3u, qs4.w, v6, v7);
+    #undef IQ1S_GH
+    return dl * fma(delta, sumy, float(s));
+}
+
 kernel void gguf_moe_gate_up_swiglu_iq1_s(
     device const float* X [[buffer(0)]],
     device const uchar* Wg [[buffer(1)]],
@@ -2850,12 +2875,14 @@ kernel void gguf_moe_gate_up_swiglu_iq1_s(
     uint tr = tgid.y;
     uint sg = tid >> 5;
     uint lane = tid & 31u;
-    uint n0 = tgid.x * 8u + sg * 4u;
+    uint n0 = tgid.x * 4u + sg * 2u;
     if (tr >= p.T * p.top_k || n0 >= p.N) return;
+    bool has_r1 = (n0 + 1u < p.N);
     int e_id = topk_ids[tr];
     if (e_id < 0) {
         if (lane == 0u) {
-            for (uint r = 0; r < 4u && n0 + r < p.N; ++r) Y[ulong(tr) * p.N + n0 + r] = 0.0f;
+            Y[ulong(tr) * p.N + n0] = 0.0f;
+            if (has_r1) Y[ulong(tr) * p.N + n0 + 1u] = 0.0f;
         }
         return;
     }
@@ -2864,33 +2891,37 @@ kernel void gguf_moe_gate_up_swiglu_iq1_s(
     ulong row_bytes = ulong(p.K >> 8) * 50ul;
     ulong e_off = ulong(uint(e_id)) * ulong(p.expert_stride_bytes);
     device const float* x_row = X + ulong(t) * p.K;
-    uint cnt = min(4u, p.N - n0);
-    float ga[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    float ua[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float ga0 = 0.0f, ga1 = 0.0f;
+    float ua0 = 0.0f, ua1 = 0.0f;
     for (uint ib32 = lane; ib32 < nb32; ib32 += 32u) {
         device const float4* xp4 = reinterpret_cast<device const float4*>(x_row + (ib32 << 5));
-        float4 v0 = xp4[0], v1 = xp4[1], v2 = xp4[2], v3 = xp4[3];
-        float4 v4 = xp4[4], v5 = xp4[5], v6 = xp4[6], v7 = xp4[7];
-        float4 sv = (v0 + v1) + (v2 + v3) + (v4 + v5) + (v6 + v7);
+        float4 f0 = xp4[0], f1 = xp4[1], f2 = xp4[2], f3 = xp4[3];
+        float4 f4 = xp4[4], f5 = xp4[5], f6 = xp4[6], f7 = xp4[7];
+        float4 sv = (f0 + f1) + (f2 + f3) + (f4 + f5) + (f6 + f7);
         float sumy = sv.x + sv.y + sv.z + sv.w;
+        half4 v0 = half4(f0), v1 = half4(f1), v2 = half4(f2), v3 = half4(f3);
+        half4 v4 = half4(f4), v5 = half4(f5), v6 = half4(f6), v7 = half4(f7);
         uint ibl = ib32 >> 3;
         uint ib = ib32 & 7u;
         ulong boff = e_off + ulong(n0) * row_bytes + ulong(ibl) * 50ul;
-        for (uint r = 0; r < cnt; ++r) {
-            ga[r] += gguf_iq1s_sub32(Wg + boff + ulong(r) * row_bytes, ib, v0, v1, v2, v3, v4, v5, v6, v7, sumy);
-            ua[r] += gguf_iq1s_sub32(Wu + boff + ulong(r) * row_bytes, ib, v0, v1, v2, v3, v4, v5, v6, v7, sumy);
+        ga0 += gguf_iq1s_sub32_h(Wg + boff, ib, v0, v1, v2, v3, v4, v5, v6, v7, sumy);
+        ua0 += gguf_iq1s_sub32_h(Wu + boff, ib, v0, v1, v2, v3, v4, v5, v6, v7, sumy);
+        if (has_r1) {
+            ga1 += gguf_iq1s_sub32_h(Wg + boff + row_bytes, ib, v0, v1, v2, v3, v4, v5, v6, v7, sumy);
+            ua1 += gguf_iq1s_sub32_h(Wu + boff + row_bytes, ib, v0, v1, v2, v3, v4, v5, v6, v7, sumy);
         }
     }
-    for (uint r = 0; r < cnt; ++r) {
-        float gv = simd_sum(ga[r]);
-        float uv = simd_sum(ua[r]);
-        if (lane == 0u) {
-            if (p.clamp_val > 0.0f) {
-                gv = clamp(gv, -p.clamp_val, p.clamp_val);
-                uv = clamp(uv, -p.clamp_val, p.clamp_val);
-            }
-            Y[ulong(tr) * p.N + n0 + r] = (gv / (1.0f + exp(-gv))) * uv;
+    float gv0 = simd_sum(ga0), uv0 = simd_sum(ua0);
+    float gv1 = simd_sum(ga1), uv1 = simd_sum(ua1);
+    if (lane == 0u) {
+        if (p.clamp_val > 0.0f) {
+            gv0 = clamp(gv0, -p.clamp_val, p.clamp_val);
+            uv0 = clamp(uv0, -p.clamp_val, p.clamp_val);
+            gv1 = clamp(gv1, -p.clamp_val, p.clamp_val);
+            uv1 = clamp(uv1, -p.clamp_val, p.clamp_val);
         }
+        Y[ulong(tr) * p.N + n0] = (gv0 / (1.0f + exp(-gv0))) * uv0;
+        if (has_r1) Y[ulong(tr) * p.N + n0 + 1u] = (gv1 / (1.0f + exp(-gv1))) * uv1;
     }
 }
 
@@ -2922,15 +2953,17 @@ kernel void gguf_moe_down_accum_iq1_s_4r(
         float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         for (uint ib32 = lane; ib32 < nb32; ib32 += 32u) {
             device const float4* xp4 = reinterpret_cast<device const float4*>(x_row + (ib32 << 5));
-            float4 v0 = xp4[0], v1 = xp4[1], v2 = xp4[2], v3 = xp4[3];
-            float4 v4 = xp4[4], v5 = xp4[5], v6 = xp4[6], v7 = xp4[7];
-            float4 sv = (v0 + v1) + (v2 + v3) + (v4 + v5) + (v6 + v7);
+            float4 f0 = xp4[0], f1 = xp4[1], f2 = xp4[2], f3 = xp4[3];
+            float4 f4 = xp4[4], f5 = xp4[5], f6 = xp4[6], f7 = xp4[7];
+            float4 sv = (f0 + f1) + (f2 + f3) + (f4 + f5) + (f6 + f7);
             float sumy = sv.x + sv.y + sv.z + sv.w;
+            half4 v0 = half4(f0), v1 = half4(f1), v2 = half4(f2), v3 = half4(f3);
+            half4 v4 = half4(f4), v5 = half4(f5), v6 = half4(f6), v7 = half4(f7);
             uint ibl = ib32 >> 3;
             uint ib = ib32 & 7u;
             ulong boff = e_off + ulong(ibl) * 50ul;
             for (uint r = 0; r < cnt; ++r) {
-                acc[r] += gguf_iq1s_sub32(W + boff + ulong(r) * row_bytes, ib, v0, v1, v2, v3, v4, v5, v6, v7, sumy);
+                acc[r] += gguf_iq1s_sub32_h(W + boff + ulong(r) * row_bytes, ib, v0, v1, v2, v3, v4, v5, v6, v7, sumy);
             }
         }
         for (uint r = 0; r < cnt; ++r) tot[r] = fma(gw, acc[r], tot[r]);
@@ -3215,5 +3248,244 @@ kernel void gguf_gemv_bf16_fast(
         ulong yb = ulong(m) * p.N;
         Y[yb + n0] = out0;
         if (has_r1) Y[yb + n0 + 1u] = out1;
+    }
+}
+
+kernel void gguf_gemm_q6_k_tiled(
+    device const float* X [[buffer(0)]],
+    device const uchar* W [[buffer(1)]],
+    device float* Y [[buffer(2)]],
+    constant GgufGemvParams& p [[buffer(3)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint sg_id [[simdgroup_index_in_threadgroup]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    uint m0 = tgid.y * 32u;
+    uint n0 = tgid.x * 32u;
+    if (m0 >= p.M || n0 >= p.N) return;
+    ulong row_bytes = ulong(p.K >> 8) * 210ul;
+
+    threadgroup half smX[32 * 32];
+    threadgroup half smW[32 * 32];
+    threadgroup float smOut[32 * 32];
+
+    uint sg_r = (sg_id >> 1) * 16u;
+    uint sg_c = (sg_id & 1u) * 16u;
+
+    simdgroup_matrix<float, 8, 8> acc[2][2];
+    for (uint i = 0; i < 2u; ++i)
+        for (uint j = 0; j < 2u; ++j)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (uint k0 = 0; k0 < p.K; k0 += 32u) {
+        uint b_idx = k0 >> 8;
+        uint e_base = k0 & 255u;
+        uint half_idx = e_base >> 7;
+        uint quad = (e_base & 127u) >> 5;
+        uint ql_quad = (half_idx << 6) + ((quad & 1u) << 5);
+        uint qh_half = 128u + (half_idx << 5);
+        uint sc_quad = 192u + (half_idx << 3) + (quad << 1);
+        uint qh_shift = quad << 1;
+
+        for (uint idx = tid; idx < 1024u; idx += 128u) {
+            uint r = idx >> 5;
+            uint l = idx & 31u;
+            uint gm = m0 + r;
+            uint gn = n0 + r;
+            uint gk = k0 + l;
+            smX[idx] = (gm < p.M && gk < p.K) ? half(X[ulong(gm) * p.K + gk]) : half(0.0h);
+            half wv = half(0.0h);
+            if (gn < p.N && gk < p.K) {
+                device const uchar* blk = W + ulong(gn) * row_bytes + ulong(b_idx) * 210ul;
+                uchar ql_b = blk[ql_quad + l];
+                uchar ql_v = (quad < 2u) ? (ql_b & 0x0Fu) : (ql_b >> 4);
+                uchar qh_v = (blk[qh_half + l] >> qh_shift) & 3u;
+                int q = int(ql_v | (qh_v << 4)) - 32;
+                char sc = reinterpret_cast<device const char*>(blk)[sc_quad + (l >> 4)];
+                wv = half(gguf_load_f16(blk + 208u) * float(sc) * float(q));
+            }
+            smW[l * 32u + r] = wv;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint kk = 0; kk < 32u; kk += 8u) {
+            simdgroup_matrix<half, 8, 8> ma0, ma1, mb0, mb1;
+            simdgroup_load(ma0, smX + (sg_r + 0u) * 32u + kk, 32u);
+            simdgroup_load(ma1, smX + (sg_r + 8u) * 32u + kk, 32u);
+            simdgroup_load(mb0, smW + kk * 32u + (sg_c + 0u), 32u);
+            simdgroup_load(mb1, smW + kk * 32u + (sg_c + 8u), 32u);
+            simdgroup_multiply_accumulate(acc[0][0], ma0, mb0, acc[0][0]);
+            simdgroup_multiply_accumulate(acc[0][1], ma0, mb1, acc[0][1]);
+            simdgroup_multiply_accumulate(acc[1][0], ma1, mb0, acc[1][0]);
+            simdgroup_multiply_accumulate(acc[1][1], ma1, mb1, acc[1][1]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint i = 0; i < 2u; ++i)
+        for (uint j = 0; j < 2u; ++j)
+            simdgroup_store(acc[i][j], smOut + (sg_r + i * 8u) * 32u + (sg_c + j * 8u), 32u);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint idx = tid; idx < 1024u; idx += 128u) {
+        uint r = idx >> 5;
+        uint c = idx & 31u;
+        uint gm = m0 + r;
+        uint gn = n0 + c;
+        if (gm < p.M && gn < p.N) Y[ulong(gm) * p.N + gn] = smOut[idx];
+    }
+}
+
+kernel void gguf_gemm_q5_k_tiled(
+    device const float* X [[buffer(0)]],
+    device const uchar* W [[buffer(1)]],
+    device float* Y [[buffer(2)]],
+    constant GgufGemvParams& p [[buffer(3)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint sg_id [[simdgroup_index_in_threadgroup]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    uint m0 = tgid.y * 32u;
+    uint n0 = tgid.x * 32u;
+    if (m0 >= p.M || n0 >= p.N) return;
+    ulong row_bytes = ulong(p.K >> 8) * 176ul;
+
+    threadgroup half smX[32 * 32];
+    threadgroup half smW[32 * 32];
+    threadgroup float smOut[32 * 32];
+
+    uint sg_r = (sg_id >> 1) * 16u;
+    uint sg_c = (sg_id & 1u) * 16u;
+
+    simdgroup_matrix<float, 8, 8> acc[2][2];
+    for (uint i = 0; i < 2u; ++i)
+        for (uint j = 0; j < 2u; ++j)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (uint k0 = 0; k0 < p.K; k0 += 32u) {
+        uint b_idx = k0 >> 8;
+        uint e_base = k0 & 255u;
+        uint sb = e_base >> 6;
+        uint hi = (e_base >> 5) & 1u;
+        uint j_sc = (sb << 1) + hi;
+
+        for (uint idx = tid; idx < 1024u; idx += 128u) {
+            uint r = idx >> 5;
+            uint l = idx & 31u;
+            uint gm = m0 + r;
+            uint gn = n0 + r;
+            uint gk = k0 + l;
+            smX[idx] = (gm < p.M && gk < p.K) ? half(X[ulong(gm) * p.K + gk]) : half(0.0h);
+            half wv = half(0.0h);
+            if (gn < p.N && gk < p.K) {
+                device const uchar* blk = W + ulong(gn) * row_bytes + ulong(b_idx) * 176ul;
+                float d = gguf_load_f16(blk);
+                float dmin = gguf_load_f16(blk + 2u);
+                uchar sc = 0, mn = 0;
+                gguf_get_scale_min_k4(j_sc, blk + 4u, sc, mn);
+                uchar qb = blk[48u + (sb << 5) + l];
+                uint q4 = hi ? uint(qb >> 4) : uint(qb & 0x0Fu);
+                uint hbit = (uint(blk[16u + l]) >> j_sc) & 1u;
+                wv = half(d * float(sc) * float(q4 + (hbit << 4)) - dmin * float(mn));
+            }
+            smW[l * 32u + r] = wv;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint kk = 0; kk < 32u; kk += 8u) {
+            simdgroup_matrix<half, 8, 8> ma0, ma1, mb0, mb1;
+            simdgroup_load(ma0, smX + (sg_r + 0u) * 32u + kk, 32u);
+            simdgroup_load(ma1, smX + (sg_r + 8u) * 32u + kk, 32u);
+            simdgroup_load(mb0, smW + kk * 32u + (sg_c + 0u), 32u);
+            simdgroup_load(mb1, smW + kk * 32u + (sg_c + 8u), 32u);
+            simdgroup_multiply_accumulate(acc[0][0], ma0, mb0, acc[0][0]);
+            simdgroup_multiply_accumulate(acc[0][1], ma0, mb1, acc[0][1]);
+            simdgroup_multiply_accumulate(acc[1][0], ma1, mb0, acc[1][0]);
+            simdgroup_multiply_accumulate(acc[1][1], ma1, mb1, acc[1][1]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint i = 0; i < 2u; ++i)
+        for (uint j = 0; j < 2u; ++j)
+            simdgroup_store(acc[i][j], smOut + (sg_r + i * 8u) * 32u + (sg_c + j * 8u), 32u);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint idx = tid; idx < 1024u; idx += 128u) {
+        uint r = idx >> 5;
+        uint c = idx & 31u;
+        uint gm = m0 + r;
+        uint gn = n0 + c;
+        if (gm < p.M && gn < p.N) Y[ulong(gm) * p.N + gn] = smOut[idx];
+    }
+}
+
+kernel void gguf_gemm_q8_0_tiled(
+    device const float* X [[buffer(0)]],
+    device const uchar* W [[buffer(1)]],
+    device float* Y [[buffer(2)]],
+    constant GgufGemvParams& p [[buffer(3)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint sg_id [[simdgroup_index_in_threadgroup]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    uint m0 = tgid.y * 32u;
+    uint n0 = tgid.x * 32u;
+    if (m0 >= p.M || n0 >= p.N) return;
+    ulong row_bytes = ulong(p.K >> 5) * 34ul;
+
+    threadgroup half smX[32 * 32];
+    threadgroup half smW[32 * 32];
+    threadgroup float smOut[32 * 32];
+
+    uint sg_r = (sg_id >> 1) * 16u;
+    uint sg_c = (sg_id & 1u) * 16u;
+
+    simdgroup_matrix<float, 8, 8> acc[2][2];
+    for (uint i = 0; i < 2u; ++i)
+        for (uint j = 0; j < 2u; ++j)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (uint k0 = 0; k0 < p.K; k0 += 32u) {
+        uint b_idx = k0 >> 5;
+        for (uint idx = tid; idx < 1024u; idx += 128u) {
+            uint r = idx >> 5;
+            uint l = idx & 31u;
+            uint gm = m0 + r;
+            uint gn = n0 + r;
+            uint gk = k0 + l;
+            smX[idx] = (gm < p.M && gk < p.K) ? half(X[ulong(gm) * p.K + gk]) : half(0.0h);
+            half wv = half(0.0h);
+            if (gn < p.N && gk < p.K) {
+                device const uchar* blk = W + ulong(gn) * row_bytes + ulong(b_idx) * 34ul;
+                char q = reinterpret_cast<device const char*>(blk + 2u)[l];
+                wv = half(gguf_load_f16(blk) * float(q));
+            }
+            smW[l * 32u + r] = wv;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint kk = 0; kk < 32u; kk += 8u) {
+            simdgroup_matrix<half, 8, 8> ma0, ma1, mb0, mb1;
+            simdgroup_load(ma0, smX + (sg_r + 0u) * 32u + kk, 32u);
+            simdgroup_load(ma1, smX + (sg_r + 8u) * 32u + kk, 32u);
+            simdgroup_load(mb0, smW + kk * 32u + (sg_c + 0u), 32u);
+            simdgroup_load(mb1, smW + kk * 32u + (sg_c + 8u), 32u);
+            simdgroup_multiply_accumulate(acc[0][0], ma0, mb0, acc[0][0]);
+            simdgroup_multiply_accumulate(acc[0][1], ma0, mb1, acc[0][1]);
+            simdgroup_multiply_accumulate(acc[1][0], ma1, mb0, acc[1][0]);
+            simdgroup_multiply_accumulate(acc[1][1], ma1, mb1, acc[1][1]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint i = 0; i < 2u; ++i)
+        for (uint j = 0; j < 2u; ++j)
+            simdgroup_store(acc[i][j], smOut + (sg_r + i * 8u) * 32u + (sg_c + j * 8u), 32u);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint idx = tid; idx < 1024u; idx += 128u) {
+        uint r = idx >> 5;
+        uint c = idx & 31u;
+        uint gm = m0 + r;
+        uint gn = n0 + c;
+        if (gm < p.M && gn < p.N) Y[ulong(gm) * p.N + gn] = smOut[idx];
     }
 }
