@@ -2018,6 +2018,7 @@ int32_t DeepSeekV41Model::forward_and_greedy(const int32_t* h_tokens, int T, int
                                         ? (loc - (int32_t)base_u)
                                         : -1;
                     }
+                    auto t_cp0 = std::chrono::steady_clock::now();
                     std::atomic<bool> io_err{false};
                     std::atomic<bool>* io_err_p = &io_err;
                     dispatch_apply(chunk_u, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t u) {
@@ -2034,6 +2035,10 @@ int32_t DeepSeekV41Model::forward_and_greedy(const int32_t* h_tokens, int T, int
                     if (io_err.load(std::memory_order_relaxed)) {
                         throw std::runtime_error("pread failed on GGUF shard");
                     }
+                    if (profile_stages) {
+                        impl_->prof.exp_pread_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_cp0).count();
+                    }
+                    t_m0 = std::chrono::steady_clock::now();
 
                     gate_w.buf = impl_->b_moe_stage_gate;
                     gate_w.base_offset = 0;
@@ -2066,6 +2071,9 @@ int32_t DeepSeekV41Model::forward_and_greedy(const int32_t* h_tokens, int T, int
                         [enc endEncoding];
                         [cb commit];
                         [cb waitUntilCompleted];
+                        if (profile_stages) {
+                            impl_->prof.moe_gpu_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_m0).count();
+                        }
                     }
                 }
                 }
