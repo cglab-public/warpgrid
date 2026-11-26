@@ -33,6 +33,7 @@ struct CliOptions {
     int draft_k = 0;
     std::string draft_vocab_file;
     std::string dflash2_dir;
+    std::string dspark_path;
     std::string dump_imatrix_path;
     std::string calib_file;
     std::string otlp_endpoint;
@@ -62,6 +63,7 @@ inline bool parse_cli_args(int argc, char** argv, CliOptions& opts, std::string&
         else if (a == "--draft-k" && i + 1 < argc) opts.draft_k = std::stoi(argv[++i]);
         else if (a == "--draft-vocab-file" && i + 1 < argc) opts.draft_vocab_file = argv[++i];
         else if (a == "--dflash2" && i + 1 < argc) opts.dflash2_dir = argv[++i];
+        else if (a == "--dspark" && i + 1 < argc) opts.dspark_path = argv[++i];
         else if (a == "--dump-imatrix" && i + 1 < argc) opts.dump_imatrix_path = argv[++i];
         else if (a == "--calib-file" && i + 1 < argc) opts.calib_file = argv[++i];
         else if (a == "--otlp-endpoint" && i + 1 < argc) opts.otlp_endpoint = argv[++i];

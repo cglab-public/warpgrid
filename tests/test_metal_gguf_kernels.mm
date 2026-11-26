@@ -1175,6 +1175,129 @@ static void test_gguf_gemm_tiled_and_smallk_parity() {
     }
 }
 
+static void test_ds_dspark_and_multi_gemv_parity() {
+    const uint32_t M = 4, N = 37, K = 512;
+    std::vector<float> x((size_t)M * K);
+    for (size_t i = 0; i < x.size(); ++i) x[i] = std::sin((float)(i + 3) * 0.031f);
+
+    auto run_multi = [&](const char* kname, const std::vector<uint8_t>& w, std::vector<float>& y_out) {
+        id<MTLComputePipelineState> pso = g_ctx.pso(kname);
+        EXPECT_TRUE(pso != nil);
+        id<MTLBuffer> bx = [g_ctx.dev newBufferWithBytes:x.data() length:x.size() * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bw = [g_ctx.dev newBufferWithBytes:w.data() length:w.size() options:MTLResourceStorageModeShared];
+        id<MTLBuffer> by = [g_ctx.dev newBufferWithLength:(size_t)M * N * sizeof(float) options:MTLResourceStorageModeShared];
+        GgufGemvParams p{M, N, K};
+        id<MTLCommandBuffer> cb = [g_ctx.q commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:bx offset:0 atIndex:0];
+        [enc setBuffer:bw offset:0 atIndex:1];
+        [enc setBuffer:by offset:0 atIndex:2];
+        [enc setBytes:&p length:sizeof(p) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake((N + 1u) / 2u, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        y_out.resize((size_t)M * N);
+        memcpy(y_out.data(), by.contents, y_out.size() * sizeof(float));
+    };
+
+    {
+        const uint32_t nb = K / 256;
+        std::vector<uint8_t> w((size_t)N * nb * 210, 0);
+        for (uint32_t n = 0; n < N; ++n) {
+            for (uint32_t b = 0; b < nb; ++b) {
+                uint8_t* blk = w.data() + ((size_t)n * nb + b) * 210;
+                for (int i = 0; i < 128; ++i) blk[i] = (uint8_t)((n * 13 + b * 7 + i * 5) & 0xFFu);
+                for (int i = 0; i < 64; ++i) blk[128 + i] = (uint8_t)((n * 17 + b * 11 + i * 3) & 0xFFu);
+                for (int i = 0; i < 16; ++i) ((int8_t*)(blk + 192))[i] = (int8_t)((int)((n + b + i) % 15) - 7);
+                uint16_t d = f32_to_f16_bits(0.01f);
+                memcpy(blk + 208, &d, 2);
+            }
+        }
+        std::vector<float> y_ref, y_m;
+        dispatch_gguf_gemv("gguf_gemv_q6_k", x, w, M, N, K, y_ref);
+        run_multi("gguf_gemv_q6_k_multi", w, y_m);
+        for (size_t i = 0; i < y_ref.size(); ++i) EXPECT_TRUE(std::abs(y_m[i] - y_ref[i]) < 1e-3f);
+    }
+    {
+        const uint32_t nb = K / 256;
+        std::vector<uint8_t> w((size_t)N * nb * 176, 0);
+        for (uint32_t n = 0; n < N; ++n) {
+            for (uint32_t b = 0; b < nb; ++b) {
+                uint8_t* blk = w.data() + ((size_t)n * nb + b) * 176;
+                uint16_t d = f32_to_f16_bits(0.005f), dm = f32_to_f16_bits(0.002f);
+                memcpy(blk, &d, 2);
+                memcpy(blk + 2, &dm, 2);
+                for (int i = 0; i < 12; ++i) blk[4 + i] = (uint8_t)((n * 7 + b * 3 + i * 5) & 0x3Fu);
+                for (int i = 0; i < 32; ++i) blk[16 + i] = (uint8_t)((n * 11 + b * 13 + i) & 0xFFu);
+                for (int i = 0; i < 128; ++i) blk[48 + i] = (uint8_t)((n * 19 + b * 7 + i * 3) & 0xFFu);
+            }
+        }
+        std::vector<float> y_ref, y_m;
+        dispatch_gguf_gemv("gguf_gemv_q5_k", x, w, M, N, K, y_ref);
+        run_multi("gguf_gemv_q5_k_multi", w, y_m);
+        for (size_t i = 0; i < y_ref.size(); ++i) EXPECT_TRUE(std::abs(y_m[i] - y_ref[i]) < 1e-3f);
+    }
+    {
+        const uint32_t nb = K / 32;
+        std::vector<uint8_t> w((size_t)N * nb * 34, 0);
+        for (uint32_t n = 0; n < N; ++n) {
+            for (uint32_t b = 0; b < nb; ++b) {
+                uint8_t* blk = w.data() + ((size_t)n * nb + b) * 34;
+                uint16_t d = f32_to_f16_bits(0.03f);
+                memcpy(blk, &d, 2);
+                for (int i = 0; i < 32; ++i) ((int8_t*)(blk + 2))[i] = (int8_t)((int)((n * 5 + b * 7 + i * 3) % 63) - 31);
+            }
+        }
+        std::vector<float> y_ref, y_m;
+        dispatch_gguf_gemv("gguf_gemv_q8_0", x, w, M, N, K, y_ref);
+        run_multi("gguf_gemv_q8_0_multi", w, y_m);
+        for (size_t i = 0; i < y_ref.size(); ++i) EXPECT_TRUE(std::abs(y_m[i] - y_ref[i]) < 1e-3f);
+    }
+    {
+        struct DsMarkovBiasParams { uint32_t V; uint32_t R; };
+        const uint32_t V = 19, R = 16;
+        std::vector<float> base(V);
+        std::vector<uint16_t> w1((size_t)V * R), w2((size_t)V * R);
+        auto f32_to_bf16 = [](float f) -> uint16_t { uint32_t u; memcpy(&u, &f, 4); return (uint16_t)(u >> 16); };
+        auto bf16_to_f32 = [](uint16_t b) -> float { uint32_t u = (uint32_t)b << 16; float f; memcpy(&f, &u, 4); return f; };
+        for (uint32_t v = 0; v < V; ++v) {
+            base[v] = std::cos((float)v * 0.2f);
+            for (uint32_t r = 0; r < R; ++r) {
+                w1[v * R + r] = f32_to_bf16(std::sin((float)(v * R + r) * 0.1f));
+                w2[v * R + r] = f32_to_bf16(std::cos((float)(v * R + r) * 0.13f));
+            }
+        }
+        int32_t prev = 7;
+        id<MTLBuffer> bb = [g_ctx.dev newBufferWithBytes:base.data() length:V * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bw1 = [g_ctx.dev newBufferWithBytes:w1.data() length:w1.size() * sizeof(uint16_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bw2 = [g_ctx.dev newBufferWithBytes:w2.data() length:w2.size() * sizeof(uint16_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bp = [g_ctx.dev newBufferWithBytes:&prev length:sizeof(int32_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bo = [g_ctx.dev newBufferWithLength:V * sizeof(float) options:MTLResourceStorageModeShared];
+        DsMarkovBiasParams mp{V, R};
+        id<MTLCommandBuffer> cb = [g_ctx.q commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:g_ctx.pso("ds_markov_bias_add_bf16")];
+        [enc setBuffer:bb offset:0 atIndex:0];
+        [enc setBuffer:bw1 offset:0 atIndex:1];
+        [enc setBuffer:bw2 offset:0 atIndex:2];
+        [enc setBuffer:bp offset:0 atIndex:3];
+        [enc setBuffer:bo offset:0 atIndex:4];
+        [enc setBytes:&mp length:sizeof(mp) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake((V + 3u) / 4u, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        const float* out = static_cast<const float*>(bo.contents);
+        for (uint32_t v = 0; v < V; ++v) {
+            float ref = base[v];
+            for (uint32_t r = 0; r < R; ++r) ref += bf16_to_f32(w1[(size_t)prev * R + r]) * bf16_to_f32(w2[(size_t)v * R + r]);
+            EXPECT_TRUE(std::abs(out[v] - ref) < 1e-4f);
+        }
+    }
+}
+
 int main() {
     @autoreleasepool {
         if (!g_ctx.init()) {
@@ -1198,6 +1321,7 @@ int main() {
         run_test("test_ds_router_topk6_sigmoid_bias", test_ds_router_topk6_sigmoid_bias);
         run_test("test_ds_csa_hca_causal_attention", test_ds_csa_hca_causal_attention);
         run_test("test_gguf_gemm_tiled_and_smallk_parity", test_gguf_gemm_tiled_and_smallk_parity);
+        run_test("test_ds_dspark_and_multi_gemv_parity", test_ds_dspark_and_multi_gemv_parity);
         printf("GGUF Metal kernel tests: %d passed, %d failed\n", g_passed, g_failed);
         return g_failed == 0 ? 0 : 1;
     }

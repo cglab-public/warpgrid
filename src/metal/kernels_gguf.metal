@@ -3489,3 +3489,324 @@ kernel void gguf_gemm_q8_0_tiled(
         if (gm < p.M && gn < p.N) Y[ulong(gm) * p.N + gn] = smOut[idx];
     }
 }
+
+
+struct DsHcMeanTapParams {
+    uint T;
+    uint D;
+    uint hc;
+    uint n_taps;
+    uint tap_idx;
+};
+
+kernel void ds_hc_mean_to_tap_f32(
+    device const float* streams [[buffer(0)]],
+    device float* taps [[buffer(1)]],
+    constant DsHcMeanTapParams& p [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    uint d = gid.x;
+    uint t = gid.y;
+    if (d >= p.D || t >= p.T) return;
+    float s = 0.0f;
+    ulong base = ulong(t) * p.hc * p.D + d;
+    for (uint c = 0u; c < p.hc; ++c) s += streams[base + ulong(c) * p.D];
+    taps[(ulong(t) * p.n_taps + p.tap_idx) * p.D + d] = s / float(p.hc);
+}
+
+struct DsDsparkKvRingParams {
+    uint T;
+    uint start_pos;
+    uint n_swa;
+    uint head_dim;
+};
+
+kernel void ds_dspark_kv_ring_write_f32(
+    device const float* kv_in [[buffer(0)]],
+    device float* kv_ring [[buffer(1)]],
+    constant DsDsparkKvRingParams& p [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    uint d = gid.x;
+    uint t = gid.y;
+    if (d >= p.head_dim || t >= p.T) return;
+    uint slot = (p.start_pos + t) % p.n_swa;
+    kv_ring[ulong(slot) * p.head_dim + d] = kv_in[ulong(t) * p.head_dim + d];
+}
+
+struct DsDsparkAttnParams {
+    uint B;
+    uint n_heads;
+    uint head_dim;
+    uint anchor_pos;
+    uint n_swa;
+    float scale;
+};
+
+kernel void ds_dspark_mqa_sink_attn_f32(
+    device const float* Q [[buffer(0)]],
+    device const float* K_ring [[buffer(1)]],
+    device const float* K_blk [[buffer(2)]],
+    device const float* sinks [[buffer(3)]],
+    device float* O [[buffer(4)]],
+    constant DsDsparkAttnParams& p [[buffer(5)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    uint h = tgid.x;
+    uint b = tgid.y;
+    if (h >= p.n_heads || b >= p.B) return;
+    uint ctx_start = (p.anchor_pos > p.n_swa) ? (p.anchor_pos - p.n_swa) : 0u;
+    uint ctx_len = p.anchor_pos - ctx_start;
+    device const float* qp = Q + (ulong(b) * p.n_heads + h) * p.head_dim;
+    device float* op = O + (ulong(b) * p.n_heads + h) * p.head_dim;
+
+    if (p.head_dim == 512u) {
+        device const float4* q4 = reinterpret_cast<device const float4*>(qp);
+        float4 qv0 = q4[tid];
+        float4 qv1 = q4[tid + 32u];
+        float4 qv2 = q4[tid + 64u];
+        float4 qv3 = q4[tid + 96u];
+        float4 acc0 = float4(0.0f), acc1 = float4(0.0f), acc2 = float4(0.0f), acc3 = float4(0.0f);
+        float m_max = sinks[h];
+        float l_sum = 1.0f;
+        for (uint j = 0u; j < ctx_len; ++j) {
+            uint rs = (ctx_start + j) % p.n_swa;
+            device const float4* kv4 = reinterpret_cast<device const float4*>(K_ring + ulong(rs) * 512ul);
+            float4 k0 = kv4[tid], k1 = kv4[tid + 32u], k2 = kv4[tid + 64u], k3 = kv4[tid + 96u];
+            float sc = simd_sum(dot(qv0, k0) + dot(qv1, k1) + dot(qv2, k2) + dot(qv3, k3)) * p.scale;
+            float m_new = max(m_max, sc);
+            float alpha = exp(m_max - m_new);
+            float w = exp(sc - m_new);
+            l_sum = fma(l_sum, alpha, w);
+            acc0 = fma(acc0, alpha, w * k0);
+            acc1 = fma(acc1, alpha, w * k1);
+            acc2 = fma(acc2, alpha, w * k2);
+            acc3 = fma(acc3, alpha, w * k3);
+            m_max = m_new;
+        }
+        for (uint j = 0u; j < p.B; ++j) {
+            device const float4* kv4 = reinterpret_cast<device const float4*>(K_blk + ulong(j) * 512ul);
+            float4 k0 = kv4[tid], k1 = kv4[tid + 32u], k2 = kv4[tid + 64u], k3 = kv4[tid + 96u];
+            float sc = simd_sum(dot(qv0, k0) + dot(qv1, k1) + dot(qv2, k2) + dot(qv3, k3)) * p.scale;
+            float m_new = max(m_max, sc);
+            float alpha = exp(m_max - m_new);
+            float w = exp(sc - m_new);
+            l_sum = fma(l_sum, alpha, w);
+            acc0 = fma(acc0, alpha, w * k0);
+            acc1 = fma(acc1, alpha, w * k1);
+            acc2 = fma(acc2, alpha, w * k2);
+            acc3 = fma(acc3, alpha, w * k3);
+            m_max = m_new;
+        }
+        float inv_l = 1.0f / max(l_sum, 1e-20f);
+        device float4* o4 = reinterpret_cast<device float4*>(op);
+        o4[tid] = acc0 * inv_l;
+        o4[tid + 32u] = acc1 * inv_l;
+        o4[tid + 64u] = acc2 * inv_l;
+        o4[tid + 96u] = acc3 * inv_l;
+        return;
+    }
+
+    float m_max = sinks[h];
+    float l_sum = 1.0f;
+    for (uint d = tid; d < p.head_dim; d += 32u) op[d] = 0.0f;
+    for (uint j = 0u; j < ctx_len + p.B; ++j) {
+        device const float* kvp = (j < ctx_len)
+            ? (K_ring + ulong((ctx_start + j) % p.n_swa) * p.head_dim)
+            : (K_blk + ulong(j - ctx_len) * p.head_dim);
+        float dsum = 0.0f;
+        for (uint d = tid; d < p.head_dim; d += 32u) dsum += qp[d] * kvp[d];
+        float sc = simd_sum(dsum) * p.scale;
+        float m_new = max(m_max, sc);
+        float alpha = exp(m_max - m_new);
+        float w = exp(sc - m_new);
+        l_sum = fma(l_sum, alpha, w);
+        for (uint d = tid; d < p.head_dim; d += 32u) op[d] = fma(op[d], alpha, w * kvp[d]);
+        m_max = m_new;
+    }
+    float inv_l = 1.0f / max(l_sum, 1e-20f);
+    for (uint d = tid; d < p.head_dim; d += 32u) op[d] *= inv_l;
+}
+
+struct DsMarkovBiasParams {
+    uint V;
+    uint R;
+};
+
+kernel void ds_markov_bias_add_bf16(
+    device const float* base_logits [[buffer(0)]],
+    device const ushort* W1 [[buffer(1)]],
+    device const ushort* W2 [[buffer(2)]],
+    device const int* prev_tok_buf [[buffer(3)]],
+    device float* out_logits [[buffer(4)]],
+    constant DsMarkovBiasParams& p [[buffer(5)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    uint sg = tid >> 5;
+    uint lane = tid & 31u;
+    uint v0 = tgid * 4u + sg * 2u;
+    if (v0 >= p.V) return;
+    int prev = prev_tok_buf[0];
+    uint pt = (prev >= 0 && uint(prev) < p.V) ? uint(prev) : 0u;
+    uint r4 = p.R >> 2;
+    bool has_v1 = (v0 + 1u < p.V);
+    device const ushort4* w1p = reinterpret_cast<device const ushort4*>(W1 + ulong(pt) * p.R);
+    device const ushort4* w2a = reinterpret_cast<device const ushort4*>(W2 + ulong(v0) * p.R);
+    device const ushort4* w2b = has_v1 ? reinterpret_cast<device const ushort4*>(W2 + ulong(v0 + 1u) * p.R) : w2a;
+    float4 acc0 = float4(0.0f);
+    float4 acc1 = float4(0.0f);
+    for (uint r = lane; r < r4; r += 32u) {
+        ushort4 qx = w1p[r];
+        float4 xv = float4(as_type<float>(uint(qx.x) << 16), as_type<float>(uint(qx.y) << 16),
+                           as_type<float>(uint(qx.z) << 16), as_type<float>(uint(qx.w) << 16));
+        ushort4 q0 = w2a[r];
+        float4 f0 = float4(as_type<float>(uint(q0.x) << 16), as_type<float>(uint(q0.y) << 16),
+                           as_type<float>(uint(q0.z) << 16), as_type<float>(uint(q0.w) << 16));
+        acc0 = fma(xv, f0, acc0);
+        if (has_v1) {
+            ushort4 q1 = w2b[r];
+            float4 f1 = float4(as_type<float>(uint(q1.x) << 16), as_type<float>(uint(q1.y) << 16),
+                               as_type<float>(uint(q1.z) << 16), as_type<float>(uint(q1.w) << 16));
+            acc1 = fma(xv, f1, acc1);
+        }
+    }
+    float b0 = simd_sum(acc0.x + acc0.y + acc0.z + acc0.w);
+    float b1 = simd_sum(acc1.x + acc1.y + acc1.z + acc1.w);
+    if (lane == 0u) {
+        out_logits[v0] = base_logits[v0] + b0;
+        if (has_v1) out_logits[v0 + 1u] = base_logits[v0 + 1u] + b1;
+    }
+}
+
+
+kernel void gguf_gemv_q8_0_multi(
+    device const float* X [[buffer(0)]],
+    device const uchar* W [[buffer(1)]],
+    device float* Y [[buffer(2)]],
+    constant GgufGemvParams& p [[buffer(3)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    uint sg = tid >> 5;
+    uint lane = tid & 31u;
+    uint n = tgid * 2u + sg;
+    if (n >= p.N || p.M == 0u || p.M > 6u) return;
+    uint nb = p.K >> 5;
+    ulong row_bytes = ulong(nb) * 34ul;
+    device const uchar* w0 = W + ulong(n) * row_bytes;
+    float acc[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint b = lane; b < nb; b += 32u) {
+        device const uchar* blk = w0 + ulong(b) * 34ul;
+        float d = gguf_load_f16(blk);
+        device const char* q = reinterpret_cast<device const char*>(blk + 2u);
+        float4 q0 = float4(q[0], q[1], q[2], q[3]);
+        float4 q1 = float4(q[4], q[5], q[6], q[7]);
+        float4 q2 = float4(q[8], q[9], q[10], q[11]);
+        float4 q3 = float4(q[12], q[13], q[14], q[15]);
+        float4 q4 = float4(q[16], q[17], q[18], q[19]);
+        float4 q5 = float4(q[20], q[21], q[22], q[23]);
+        float4 q6 = float4(q[24], q[25], q[26], q[27]);
+        float4 q7 = float4(q[28], q[29], q[30], q[31]);
+        for (uint m = 0u; m < p.M; ++m) {
+            device const float4* xp4 = reinterpret_cast<device const float4*>(X + ulong(m) * p.K + (b << 5));
+            float s = dot(xp4[0], q0) + dot(xp4[1], q1) + dot(xp4[2], q2) + dot(xp4[3], q3)
+                    + dot(xp4[4], q4) + dot(xp4[5], q5) + dot(xp4[6], q6) + dot(xp4[7], q7);
+            acc[m] = fma(d, s, acc[m]);
+        }
+    }
+    for (uint m = 0u; m < p.M; ++m) {
+        float out = simd_sum(acc[m]);
+        if (lane == 0u) Y[ulong(m) * p.N + n] = out;
+    }
+}
+
+kernel void gguf_gemv_q5_k_multi(
+    device const float* X [[buffer(0)]],
+    device const uchar* W [[buffer(1)]],
+    device float* Y [[buffer(2)]],
+    constant GgufGemvParams& p [[buffer(3)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    uint sg = tid >> 5;
+    uint lane = tid & 31u;
+    uint n = tgid * 2u + sg;
+    if (n >= p.N || p.M == 0u || p.M > 6u) return;
+    uint nb = p.K >> 8;
+    ulong row_bytes = ulong(nb) * 176ul;
+    device const uchar* w0 = W + ulong(n) * row_bytes;
+    float acc[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint b = 0u; b < nb; ++b) {
+        device const uchar* blk = w0 + ulong(b) * 176ul;
+        float d = gguf_load_f16(blk);
+        float dm = gguf_load_f16(blk + 2u);
+        device const uchar* sc_p = blk + 4u;
+        uchar h = blk[16u + lane];
+        device const uchar* qs = blk + 48u;
+        uchar u1 = 1u;
+        uchar u2 = 2u;
+        for (uint sb = 0u; sb < 4u; ++sb) {
+            uchar s0 = 0, m0 = 0, s1 = 0, m1 = 0;
+            gguf_get_scale_min_k4(sb * 2u, sc_p, s0, m0);
+            gguf_get_scale_min_k4(sb * 2u + 1u, sc_p, s1, m1);
+            uchar q = qs[sb * 32u + lane];
+            float wlo = d * float(s0) * float((q & 0x0Fu) + ((h & u1) ? 16u : 0u)) - dm * float(m0);
+            float whi = d * float(s1) * float((q >> 4) + ((h & u2) ? 16u : 0u)) - dm * float(m1);
+            uint x_off_lo = (b << 8) + sb * 64u + lane;
+            uint x_off_hi = x_off_lo + 32u;
+            for (uint m = 0u; m < p.M; ++m) {
+                device const float* xm = X + ulong(m) * p.K;
+                acc[m] = fma(xm[x_off_lo], wlo, fma(xm[x_off_hi], whi, acc[m]));
+            }
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+    }
+    for (uint m = 0u; m < p.M; ++m) {
+        float out = simd_sum(acc[m]);
+        if (lane == 0u) Y[ulong(m) * p.N + n] = out;
+    }
+}
+
+kernel void gguf_gemv_q6_k_multi(
+    device const float* X [[buffer(0)]],
+    device const uchar* W [[buffer(1)]],
+    device float* Y [[buffer(2)]],
+    constant GgufGemvParams& p [[buffer(3)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    uint sg = tid >> 5;
+    uint lane = tid & 31u;
+    uint n = tgid * 2u + sg;
+    if (n >= p.N || p.M == 0u || p.M > 6u) return;
+    uint nb = p.K >> 8;
+    ulong row_bytes = ulong(nb) * 210ul;
+    device const uchar* w0 = W + ulong(n) * row_bytes;
+    float acc[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint b = 0u; b < nb; ++b) {
+        device const uchar* blk = w0 + ulong(b) * 210ul;
+        float d = gguf_load_f16(blk + 208u);
+        device const uchar* ql = blk;
+        device const uchar* qh = blk + 128u;
+        device const char* sc = reinterpret_cast<device const char*>(blk + 192u);
+        uint l = lane;
+        uint is = l >> 4;
+        for (uint half_idx = 0u; half_idx < 2u; ++half_idx) {
+            device const uchar* qlh = ql + (half_idx << 6);
+            device const uchar* qhh = qh + (half_idx << 5);
+            device const char* sch = sc + (half_idx << 3);
+            uchar ql0 = qlh[l];
+            uchar ql1 = qlh[l + 32u];
+            uchar qhv = qhh[l];
+            float w_0 = d * float(sch[is + 0u]) * float(int((ql0 & 0x0Fu) | ((qhv & 0x03u) << 4)) - 32);
+            float w_1 = d * float(sch[is + 2u]) * float(int((ql1 & 0x0Fu) | (((qhv >> 2) & 0x03u) << 4)) - 32);
+            float w_2 = d * float(sch[is + 4u]) * float(int((ql0 >> 4) | (((qhv >> 4) & 0x03u) << 4)) - 32);
+            float w_3 = d * float(sch[is + 6u]) * float(int((ql1 >> 4) | (((qhv >> 6) & 0x03u) << 4)) - 32);
+            uint x_base = (b << 8) + (half_idx << 7) + l;
+            for (uint m = 0u; m < p.M; ++m) {
+                device const float* xm = X + ulong(m) * p.K + x_base;
+                acc[m] = fma(xm[0], w_0, fma(xm[32], w_1, fma(xm[64], w_2, fma(xm[96], w_3, acc[m]))));
+            }
+        }
+    }
+    for (uint m = 0u; m < p.M; ++m) {
+        float out = simd_sum(acc[m]);
+        if (lane == 0u) Y[ulong(m) * p.N + n] = out;
+    }
+}

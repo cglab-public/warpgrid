@@ -107,6 +107,9 @@ def main():
     ap.add_argument("--max-seq", type=int, default=32768)
     ap.add_argument("--max-slots", type=int, default=1)
     ap.add_argument("--max-tokens", type=int, default=64)
+    ap.add_argument("--dspark", default="")
+    ap.add_argument("--draft-k", type=int, default=0)
+    ap.add_argument("--passes", type=int, default=1)
     ap.add_argument("--needle", action="store_true")
     ap.add_argument("--needle-only", action="store_true")
     args = ap.parse_args()
@@ -118,6 +121,10 @@ def main():
         "--max-slots", str(args.max_slots),
         "--port", str(args.port),
     ]
+    if args.dspark:
+        cmd += ["--dspark", args.dspark]
+    if args.draft_k > 0:
+        cmd += ["--draft-k", str(args.draft_k)]
     base_url = f"http://127.0.0.1:{args.port}"
     log_f = open("/tmp/warpgrid_live_bench.log", "w")
     proc = subprocess.Popen(cmd, stdout=log_f, stderr=subprocess.STDOUT)
@@ -129,12 +136,17 @@ def main():
         outputs = []
         peak_rss = rss_gib(proc.pid)
         if not args.needle_only:
-            for p in PROMPTS:
-                r = run_completion(base_url, p, max_tokens=args.max_tokens)
-                peak_rss = max(peak_rss, rss_gib(proc.pid))
-                tps = r["completion_tokens"] / max(r["elapsed_s"], 1e-6)
-                tok_s_list.append(tps)
-                outputs.append(json.dumps({"text": r["text"], "reasoning": r["reasoning"]}, sort_keys=True))
+            for pass_i in range(max(1, args.passes)):
+                pass_tok_s = []
+                pass_outs = []
+                for p in PROMPTS:
+                    r = run_completion(base_url, p, max_tokens=args.max_tokens)
+                    peak_rss = max(peak_rss, rss_gib(proc.pid))
+                    tps = r["completion_tokens"] / max(r["elapsed_s"], 1e-6)
+                    pass_tok_s.append(tps)
+                    pass_outs.append(json.dumps({"text": r["text"], "reasoning": r["reasoning"]}, sort_keys=True))
+                tok_s_list = pass_tok_s
+                outputs = pass_outs
 
         out_hash = hashlib.sha256("\n---\n".join(outputs).encode("utf-8")).hexdigest()[:16] if outputs else ""
         sample_out = ""

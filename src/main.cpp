@@ -43,6 +43,8 @@ int main(int argc, char** argv) {
             if (!opts.served_name_explicit) opts.served_name = "DeepSeek-V4.1-Flash";
             auto ds = std::make_unique<ink::DeepSeekV41Model>();
             ds->engram_path = opts.engram_path;
+            ds->dspark_path = opts.dspark_path;
+            ds->draft_k = (opts.draft_k == 0 && !opts.dspark_path.empty()) ? 3 : opts.draft_k;
             ds->load(opts.model_dir, opts.max_seq, opts.max_chunk, opts.max_slots);
             ds->load_tokenizer(tok);
             model = std::move(ds);

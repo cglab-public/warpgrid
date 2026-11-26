@@ -32,6 +32,11 @@ public:
     void reset_cache(int slot_id = 0) override;
 
     int32_t forward_and_greedy(const int32_t* h_tokens, int T, int start_pos, int slot_id = 0) override;
+    void forward_verify_greedy(const int32_t* h_tokens, int T, int start_pos, int32_t* h_out_tokens) override;
+    void rollback_conv_states(int accepted_len, int slot_id = 0) override;
+    void commit_dspark_context(int count, int start_pos, int slot_id = 0, int aux_tok_offset = 0) override;
+    int max_dspark_slots() const override;
+    void draft_tokens(int32_t anchor_tok, int anchor_pos, int num_draft, int32_t* h_out_drafts, int slot_id = 0) override;
 
     void forward_batch_decode_greedy(
         const int32_t* h_tokens, const int32_t* h_slots, const int32_t* h_positions,

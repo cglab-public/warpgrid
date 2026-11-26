@@ -137,6 +137,35 @@ struct DsStreamCollapseParams {
     uint32_t hc_mult;
 };
 
+struct DsHcMeanTapParams {
+    uint32_t T;
+    uint32_t D;
+    uint32_t hc;
+    uint32_t n_taps;
+    uint32_t tap_idx;
+};
+
+struct DsDsparkKvRingParams {
+    uint32_t T;
+    uint32_t start_pos;
+    uint32_t n_swa;
+    uint32_t head_dim;
+};
+
+struct DsDsparkAttnParams {
+    uint32_t B;
+    uint32_t n_heads;
+    uint32_t head_dim;
+    uint32_t anchor_pos;
+    uint32_t n_swa;
+    float scale;
+};
+
+struct DsMarkovBiasParams {
+    uint32_t V;
+    uint32_t R;
+};
+
 struct WeightBuf {
     id<MTLBuffer> buf = nil;
     size_t base_offset = 0;
@@ -378,6 +407,95 @@ struct DeepSeekV41Model::Impl {
     size_t moe_stage_cap_down = 0;
     std::vector<int> nocache_fds;
     ExpLruCache exp_cache;
+
+    struct DsparkLayer {
+        id<MTLBuffer> attn_norm = nil;
+        id<MTLBuffer> attn_sinks = nil;
+        WeightBuf wq_a;
+        id<MTLBuffer> attn_q_a_norm = nil;
+        WeightBuf wq_b;
+        WeightBuf wkv;
+        id<MTLBuffer> attn_kv_norm = nil;
+        WeightBuf wo_a;
+        WeightBuf wo_b;
+        WeightBuf hc_attn_fn;
+        id<MTLBuffer> hc_attn_base = nil;
+        id<MTLBuffer> hc_attn_scale = nil;
+        WeightBuf hc_ffn_fn;
+        id<MTLBuffer> hc_ffn_base = nil;
+        id<MTLBuffer> hc_ffn_scale = nil;
+        id<MTLBuffer> ffn_norm = nil;
+        WeightBuf router;
+        id<MTLBuffer> router_bias = nil;
+        WeightBuf ffn_gate_exps;
+        WeightBuf ffn_up_exps;
+        WeightBuf ffn_down_exps;
+        WeightBuf ffn_gate_shexp;
+        WeightBuf ffn_up_shexp;
+        WeightBuf ffn_down_shexp;
+    };
+
+    struct DsparkState {
+        bool loaded = false;
+        GgufFile gguf;
+        int num_layers = 0;
+        int hidden_size = 0;
+        int n_heads = 0;
+        int head_dim = 0;
+        int n_rot = 0;
+        int q_lora_rank = 0;
+        int o_group_count = 0;
+        int o_lora_rank = 0;
+        int n_swa = 128;
+        int n_experts = 0;
+        int top_k = 0;
+        int hc_mult = 4;
+        int hc_sinkhorn_iters = 20;
+        int block_size = 5;
+        int mask_token_id = 128799;
+        int markov_rank = 0;
+        float rms_norm_eps = 1e-20f;
+        float hc_eps = 1e-6f;
+        float rope_freq_base = 10000.0f;
+        float route_scale = 1.5f;
+        float swiglu_clamp_exp = 10.0f;
+        float swiglu_clamp_shexp = 10.0f;
+        std::vector<int> target_layers;
+        std::vector<int> layer_to_tap;
+        WeightBuf fc;
+        id<MTLBuffer> enc_output_norm = nil;
+        id<MTLBuffer> output_norm = nil;
+        WeightBuf markov_w1;
+        WeightBuf markov_w2;
+        std::vector<DsparkLayer> layers;
+        std::vector<id<MTLBuffer>> kv_rings;
+        id<MTLBuffer> b_taps = nil;
+        id<MTLBuffer> b_inp_g = nil;
+        id<MTLBuffer> b_logits_blk = nil;
+        id<MTLBuffer> b_markov_logits = nil;
+        id<MTLBuffer> b_markov_toks = nil;
+
+        void reset() {
+            loaded = false;
+            layers.clear();
+            kv_rings.clear();
+            target_layers.clear();
+            layer_to_tap.clear();
+            fc = WeightBuf{};
+            enc_output_norm = nil;
+            output_norm = nil;
+            markov_w1 = WeightBuf{};
+            markov_w2 = WeightBuf{};
+            b_taps = nil;
+            b_inp_g = nil;
+            b_logits_blk = nil;
+            b_markov_logits = nil;
+            b_markov_toks = nil;
+            gguf.close();
+        }
+    } dspark;
+    int last_verify_start_pos = 0;
+    int32_t* verify_out_buf = nullptr;
 
     void close_nocache_fds() {
         for (int fd : nocache_fds) {
@@ -645,7 +763,7 @@ struct DeepSeekV41Model::Impl {
     }
 
     void encode_gemv(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> x, const WeightBuf& w, id<MTLBuffer> y,
-                     uint32_t M, size_t x_offset = 0, size_t w_offset = 0, size_t y_offset = 0) {
+                     uint32_t M, size_t x_offset = 0, size_t w_offset = 0, size_t y_offset = 0, bool force_fp32_x = false) {
         if (!w.valid()) throw std::runtime_error("Attempted Metal GEMV on missing weight buffer");
         GgufGemvParams p{M, w.rows, w.cols};
         if (w.type == GgmlType::F32 && w.rows <= 64u && (w.cols & 3u) == 0u && ((w.base_offset + w_offset) & 15u) == 0u && (x_offset & 15u) == 0u) {
@@ -657,7 +775,7 @@ struct DeepSeekV41Model::Impl {
             [enc dispatchThreadgroups:MTLSizeMake(w.rows, M, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             return;
         }
-        if (M >= 8u && (w.type == GgmlType::Q6_K || w.type == GgmlType::Q5_K || w.type == GgmlType::Q8_0)) {
+        if (!force_fp32_x && M >= 8u && (w.type == GgmlType::Q6_K || w.type == GgmlType::Q5_K || w.type == GgmlType::Q8_0)) {
             const char* kname = (w.type == GgmlType::Q6_K) ? "gguf_gemm_q6_k_tiled"
                               : (w.type == GgmlType::Q5_K) ? "gguf_gemm_q5_k_tiled"
                                                            : "gguf_gemm_q8_0_tiled";
@@ -668,6 +786,20 @@ struct DeepSeekV41Model::Impl {
             [enc setBytes:&p length:sizeof(p) atIndex:3];
             [enc dispatchThreadgroups:MTLSizeMake((w.rows + 31u) / 32u, (M + 31u) / 32u, 1)
                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            return;
+        }
+        if (M >= 2u && M <= 6u && (x_offset & 15u) == 0u &&
+            (w.type == GgmlType::Q6_K || w.type == GgmlType::Q5_K || w.type == GgmlType::Q8_0)) {
+            const char* kname = (w.type == GgmlType::Q6_K) ? "gguf_gemv_q6_k_multi"
+                              : (w.type == GgmlType::Q5_K) ? "gguf_gemv_q5_k_multi"
+                                                           : "gguf_gemv_q8_0_multi";
+            [enc setComputePipelineState:pso(kname)];
+            [enc setBuffer:x offset:x_offset atIndex:0];
+            [enc setBuffer:w.buf offset:w.base_offset + w_offset atIndex:1];
+            [enc setBuffer:y offset:y_offset atIndex:2];
+            [enc setBytes:&p length:sizeof(p) atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake((w.rows + 1u) / 2u, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
             return;
         }
         if (w.type == GgmlType::Q6_K && (x_offset & 15u) == 0u) {
@@ -939,6 +1071,9 @@ void DeepSeekV41Model::load(const std::string& model_path, int max_seq, int max_
             if (safe_avail < moe_budget_bytes) moe_budget_bytes = safe_avail;
         }
     }
+    if (!dspark_path.empty() && moe_budget_bytes > (8ull << 30)) {
+        moe_budget_bytes -= (8ull << 30);
+    }
     if (const char* env_gb = std::getenv("WARPGRID_DS_MOE_BUDGET_GB")) {
         double gb = std::atof(env_gb);
         if (gb >= 0.0) moe_budget_bytes = (uint64_t)(gb * 1024.0 * 1024.0 * 1024.0);
@@ -1132,9 +1267,106 @@ void DeepSeekV41Model::load(const std::string& model_path, int max_seq, int max_
     impl_->b_ffn_up = impl_->alloc_buf(Tmax * top_k_sz * Inter * sizeof(float));
     impl_->b_ffn_act = impl_->alloc_buf(Tmax * top_k_sz * Inter * sizeof(float));
     impl_->b_ffn_tmp = impl_->alloc_buf(Tmax * D * sizeof(float));
-    impl_->b_logits = impl_->alloc_buf((size_t)cfg.vocab_size * sizeof(float));
-    impl_->b_argmax = impl_->alloc_buf(sizeof(int32_t));
+    size_t verify_cap = (size_t)std::max(1, draft_k + 1);
+    impl_->b_logits = impl_->alloc_buf(verify_cap * (size_t)cfg.vocab_size * sizeof(float));
+    impl_->b_argmax = impl_->alloc_buf(std::max<size_t>(8, verify_cap) * sizeof(int32_t));
     impl_->b_dummy_bias = impl_->alloc_buf((size_t)std::max(1, cfg.n_routed_experts) * sizeof(float));
+
+    impl_->dspark.reset();
+    if (!dspark_path.empty()) {
+        auto& ds = impl_->dspark;
+        ds.gguf.open(dspark_path);
+        ds.num_layers = (int)ds.gguf.get_i64("dflash.block_count", 3);
+        ds.hidden_size = (int)ds.gguf.get_i64("dflash.embedding_length", cfg.hidden_size);
+        ds.n_heads = (int)ds.gguf.get_i64("dflash.attention.head_count", cfg.num_attention_heads);
+        ds.head_dim = (int)ds.gguf.get_i64("dflash.attention.key_length", cfg.head_dim);
+        ds.n_rot = (int)ds.gguf.get_i64("dflash.rope.dimension_count", cfg.n_rot);
+        ds.q_lora_rank = (int)ds.gguf.get_i64("dflash.attention.q_lora_rank", cfg.q_lora_rank);
+        ds.o_group_count = (int)ds.gguf.get_i64("dflash.attention.output_group_count", cfg.o_group_count);
+        ds.o_lora_rank = (int)ds.gguf.get_i64("dflash.attention.output_lora_rank", cfg.o_lora_rank);
+        ds.n_swa = (int)ds.gguf.get_i64("dflash.attention.sliding_window", 128);
+        ds.n_experts = (int)ds.gguf.get_i64("dflash.expert_count", 128);
+        ds.top_k = (int)ds.gguf.get_i64("dflash.expert_used_count", 3);
+        ds.hc_mult = (int)ds.gguf.get_i64("dflash.hyper_connection.count", cfg.hc_mult);
+        ds.hc_sinkhorn_iters = (int)ds.gguf.get_i64("dflash.hyper_connection.sinkhorn_iterations", cfg.hc_sinkhorn_iters);
+        ds.block_size = (int)ds.gguf.get_i64("dflash.block_size", 5);
+        ds.mask_token_id = (int)ds.gguf.get_i64("tokenizer.ggml.mask_token_id", 128799);
+        ds.rms_norm_eps = (float)ds.gguf.get_f64("dflash.attention.layer_norm_rms_epsilon", cfg.rms_norm_eps);
+        ds.hc_eps = (float)ds.gguf.get_f64("dflash.hyper_connection.epsilon", cfg.hc_eps);
+        ds.rope_freq_base = (float)ds.gguf.get_f64("dflash.rope.freq_base", cfg.rope_freq_base);
+        ds.route_scale = (float)ds.gguf.get_f64("dflash.expert_weights_scale", 1.5);
+        if (ds.gguf.has_kv("dflash.swiglu_clamp_exp") && !ds.gguf.kv("dflash.swiglu_clamp_exp").f64_arr.empty()) {
+            ds.swiglu_clamp_exp = (float)ds.gguf.kv("dflash.swiglu_clamp_exp").f64_arr[0];
+        }
+        if (ds.gguf.has_kv("dflash.swiglu_clamp_shexp") && !ds.gguf.kv("dflash.swiglu_clamp_shexp").f64_arr.empty()) {
+            ds.swiglu_clamp_shexp = (float)ds.gguf.kv("dflash.swiglu_clamp_shexp").f64_arr[0];
+        }
+        if (ds.gguf.has_kv("dflash.target_layers")) {
+            const auto& tv = ds.gguf.kv("dflash.target_layers");
+            for (int64_t x : tv.i64_arr) ds.target_layers.push_back((int)x);
+            for (uint64_t x : tv.u64_arr) ds.target_layers.push_back((int)x);
+        }
+        if (ds.target_layers.empty()) {
+            throw std::runtime_error("DSpark GGUF missing dflash.target_layers");
+        }
+        ds.layer_to_tap.assign((size_t)cfg.num_hidden_layers, -1);
+        for (size_t i = 0; i < ds.target_layers.size(); ++i) {
+            int tl = ds.target_layers[i];
+            if (tl < 0 || tl >= cfg.num_hidden_layers) {
+                throw std::runtime_error("DSpark target layer out of range: " + std::to_string(tl));
+            }
+            ds.layer_to_tap[(size_t)tl] = (int)i;
+        }
+        ds.fc = impl_->load_weight_required(ds.gguf, "fc.weight");
+        ds.enc_output_norm = impl_->load_f32_required(ds.gguf, "enc.output_norm.weight");
+        ds.output_norm = impl_->load_f32_required(ds.gguf, "output_norm.weight");
+        ds.markov_w1 = impl_->load_weight_required(ds.gguf, "markov_w1.weight");
+        ds.markov_w2 = impl_->load_weight_required(ds.gguf, "markov_w2.weight");
+        ds.markov_rank = (int)ds.markov_w1.cols;
+        ds.layers.resize((size_t)ds.num_layers);
+        ds.kv_rings.resize((size_t)ds.num_layers);
+        size_t ring_bytes = (size_t)max_slots * (size_t)ds.n_swa * (size_t)ds.head_dim * sizeof(float);
+        for (int il = 0; il < ds.num_layers; ++il) {
+            std::string p = "blk." + std::to_string(il) + ".";
+            auto& dl = ds.layers[(size_t)il];
+            dl.attn_norm = impl_->load_f32_required(ds.gguf, p + "attn_norm.weight");
+            dl.attn_sinks = impl_->load_f32_required(ds.gguf, p + "attn_sinks.weight");
+            dl.wq_a = impl_->load_weight_required(ds.gguf, p + "attn_q_a.weight");
+            dl.attn_q_a_norm = impl_->load_f32_required(ds.gguf, p + "attn_q_a_norm.weight");
+            dl.wq_b = impl_->load_weight_required(ds.gguf, p + "attn_q_b.weight");
+            dl.wkv = impl_->load_weight_required(ds.gguf, p + "attn_kv.weight");
+            dl.attn_kv_norm = impl_->load_f32_required(ds.gguf, p + "attn_kv_a_norm.weight");
+            dl.wo_a = impl_->load_weight_required(ds.gguf, p + "attn_output_a.weight", (uint32_t)std::max(1, ds.o_group_count));
+            dl.wo_b = impl_->load_weight_required(ds.gguf, p + "attn_output_b.weight");
+            dl.hc_attn_fn = impl_->load_weight_required(ds.gguf, p + "hc_attn_fn.weight");
+            dl.hc_attn_base = impl_->load_f32_required(ds.gguf, p + "hc_attn_base.weight");
+            dl.hc_attn_scale = impl_->load_f32_required(ds.gguf, p + "hc_attn_scale.weight");
+            dl.hc_ffn_fn = impl_->load_weight_required(ds.gguf, p + "hc_ffn_fn.weight");
+            dl.hc_ffn_base = impl_->load_f32_required(ds.gguf, p + "hc_ffn_base.weight");
+            dl.hc_ffn_scale = impl_->load_f32_required(ds.gguf, p + "hc_ffn_scale.weight");
+            dl.ffn_norm = impl_->load_f32_required(ds.gguf, p + "ffn_norm.weight");
+            dl.router = impl_->load_weight_required(ds.gguf, p + "ffn_gate_inp.weight");
+            dl.router_bias = impl_->load_f32_required(ds.gguf, p + "exp_probs_b.bias");
+            dl.ffn_gate_exps = impl_->load_weight_required(ds.gguf, p + "ffn_gate_exps.weight");
+            dl.ffn_up_exps = impl_->load_weight_required(ds.gguf, p + "ffn_up_exps.weight");
+            dl.ffn_down_exps = impl_->load_weight_required(ds.gguf, p + "ffn_down_exps.weight");
+            dl.ffn_gate_shexp = impl_->load_weight_required(ds.gguf, p + "ffn_gate_shexp.weight");
+            dl.ffn_up_shexp = impl_->load_weight_required(ds.gguf, p + "ffn_up_shexp.weight");
+            dl.ffn_down_shexp = impl_->load_weight_required(ds.gguf, p + "ffn_down_shexp.weight");
+            ds.kv_rings[(size_t)il] = impl_->alloc_buf(ring_bytes);
+        }
+        size_t max_blk = (size_t)std::max(8, ds.block_size + 1);
+        ds.b_taps = impl_->alloc_buf(Tmax * ds.target_layers.size() * D * sizeof(float));
+        ds.b_inp_g = impl_->alloc_buf(Tmax * D * sizeof(float));
+        ds.b_logits_blk = impl_->alloc_buf(max_blk * (size_t)cfg.vocab_size * sizeof(float));
+        ds.b_markov_logits = impl_->alloc_buf((size_t)cfg.vocab_size * sizeof(float));
+        ds.b_markov_toks = impl_->alloc_buf((max_blk + 1) * sizeof(int32_t));
+        if (draft_k <= 0) draft_k = 3;
+        if (draft_k > ds.block_size) draft_k = ds.block_size;
+        ds.loaded = true;
+        fprintf(stderr, "[warpgrid] Loaded DeepSeek DSpark: %d layers, E=%d (top-%d MXFP4), swa=%d, block=%d, draft_k=%d, taps=%zu, mask=%d\n",
+                ds.num_layers, ds.n_experts, ds.top_k, ds.n_swa, ds.block_size, draft_k, ds.target_layers.size(), ds.mask_token_id);
+    }
 
     if (max_slots == 1) {
         num_kv_blocks = std::max(1, (max_seq_len + 63) / 64);
@@ -1173,6 +1405,14 @@ void DeepSeekV41Model::reset_cache(int slot_id) {
         if (kv.comp_raw_kv != nil) {
             memset(static_cast<uint8_t*>(kv.comp_raw_kv.contents) + (size_t)slot_id * slot_bytes, 0, slot_bytes);
             memset(static_cast<uint8_t*>(kv.comp_raw_score.contents) + (size_t)slot_id * slot_bytes, 0, slot_bytes);
+        }
+    }
+    if (impl_->dspark.loaded) {
+        size_t ds_slot_bytes = (size_t)impl_->dspark.n_swa * (size_t)impl_->dspark.head_dim * sizeof(float);
+        for (auto& ring : impl_->dspark.kv_rings) {
+            if (ring != nil) {
+                memset(static_cast<uint8_t*>(ring.contents) + (size_t)slot_id * ds_slot_bytes, 0, ds_slot_bytes);
+            }
         }
     }
 }
@@ -1261,6 +1501,16 @@ int32_t DeepSeekV41Model::forward_and_greedy(const int32_t* h_tokens, int T, int
             [enc setBuffer:lw.engram_gate offset:0 atIndex:2];
             [enc setBytes:&eap length:sizeof(eap) atIndex:3];
             [enc dispatchThreadgroups:MTLSizeMake(hc, (uint32_t)T, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        }
+
+        if (impl_->dspark.loaded && (size_t)l < impl_->dspark.layer_to_tap.size() && impl_->dspark.layer_to_tap[(size_t)l] >= 0) {
+            DsHcMeanTapParams tp{(uint32_t)T, (uint32_t)D, hc, (uint32_t)impl_->dspark.target_layers.size(), (uint32_t)impl_->dspark.layer_to_tap[(size_t)l]};
+            [enc setComputePipelineState:impl_->pso("ds_hc_mean_to_tap_f32")];
+            [enc setBuffer:impl_->b_streams_a offset:0 atIndex:0];
+            [enc setBuffer:impl_->dspark.b_taps offset:0 atIndex:1];
+            [enc setBytes:&tp length:sizeof(tp) atIndex:2];
+            [enc dispatchThreads:MTLSizeMake((uint32_t)D, (uint32_t)T, 1)
+                threadsPerThreadgroup:MTLSizeMake(std::min<uint32_t>(64u, (uint32_t)D), 1, 1)];
         }
 
         impl_->encode_hc_mixes(enc, impl_->b_streams_a, lw.hc_attn_fn, lw.hc_attn_scale, lw.hc_attn_base,
@@ -1708,9 +1958,25 @@ int32_t DeepSeekV41Model::forward_and_greedy(const int32_t* h_tokens, int T, int
         impl_->encode_hc_pre(enc, impl_->b_streams_a, pre_ffn, impl_->b_hidden, (uint32_t)T, (uint32_t)D, hc);
     }
     impl_->encode_rmsnorm(enc, impl_->b_hidden, impl_->output_norm, impl_->b_norm, (uint32_t)T, (uint32_t)D, cfg.rms_norm_eps);
+    uint32_t v_sz = (uint32_t)cfg.vocab_size;
+    if (impl_->verify_out_buf != nullptr) {
+        impl_->encode_gemv(enc, impl_->b_norm, impl_->lm_head, impl_->b_logits, (uint32_t)T);
+        [enc setComputePipelineState:impl_->pso("ds_argmax_f32")];
+        [enc setBytes:&v_sz length:sizeof(v_sz) atIndex:2];
+        for (int t = 0; t < T; ++t) {
+            [enc setBuffer:impl_->b_logits offset:(size_t)t * (size_t)v_sz * sizeof(float) atIndex:0];
+            [enc setBuffer:impl_->b_argmax offset:(size_t)t * sizeof(int32_t) atIndex:1];
+            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        }
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        const int32_t* argp = static_cast<const int32_t*>(impl_->b_argmax.contents);
+        memcpy(impl_->verify_out_buf, argp, (size_t)T * sizeof(int32_t));
+        return argp[T - 1];
+    }
     size_t last_off = (size_t)(T - 1) * D * sizeof(float);
     impl_->encode_gemv(enc, impl_->b_norm, impl_->lm_head, impl_->b_logits, 1u, last_off, 0, 0);
-    uint32_t v_sz = (uint32_t)cfg.vocab_size;
     [enc setComputePipelineState:impl_->pso("ds_argmax_f32")];
     [enc setBuffer:impl_->b_logits offset:0 atIndex:0];
     [enc setBuffer:impl_->b_argmax offset:0 atIndex:1];
@@ -1720,6 +1986,265 @@ int32_t DeepSeekV41Model::forward_and_greedy(const int32_t* h_tokens, int T, int
     [cb commit];
     [cb waitUntilCompleted];
     return *static_cast<const int32_t*>(impl_->b_argmax.contents);
+    }
+}
+
+void DeepSeekV41Model::forward_verify_greedy(const int32_t* h_tokens, int T, int start_pos, int32_t* h_out_tokens) {
+    if (T <= 0) return;
+    if ((size_t)T * (size_t)cfg.vocab_size * sizeof(float) > impl_->b_logits.length) {
+        impl_->b_logits = impl_->alloc_buf((size_t)T * (size_t)cfg.vocab_size * sizeof(float));
+    }
+    if ((size_t)T * sizeof(int32_t) > impl_->b_argmax.length) {
+        impl_->b_argmax = impl_->alloc_buf((size_t)T * sizeof(int32_t));
+    }
+    impl_->last_verify_start_pos = start_pos;
+    struct ResetGuard {
+        int32_t*& ptr;
+        ~ResetGuard() { ptr = nullptr; }
+    } guard{impl_->verify_out_buf};
+    impl_->verify_out_buf = h_out_tokens;
+    forward_and_greedy(h_tokens, T, start_pos, 0);
+}
+
+void DeepSeekV41Model::rollback_conv_states(int accepted_len, int slot_id) {
+    if (slot_id < 0 || slot_id >= max_slots) return;
+    auto& hist = impl_->slot_tok_history[(size_t)slot_id];
+    size_t keep = (size_t)std::max(0, impl_->last_verify_start_pos + accepted_len);
+    if (hist.size() > keep) hist.resize(keep);
+}
+
+int DeepSeekV41Model::max_dspark_slots() const {
+    return impl_->dspark.loaded ? max_slots : 0;
+}
+
+void DeepSeekV41Model::commit_dspark_context(int count, int start_pos, int slot_id, int aux_tok_offset) {
+    if (!impl_->dspark.loaded || count <= 0 || slot_id < 0 || slot_id >= max_slots) return;
+    @autoreleasepool {
+    auto& ds = impl_->dspark;
+    size_t D = (size_t)ds.hidden_size;
+    size_t n_taps = ds.target_layers.size();
+    size_t tap_off = (size_t)aux_tok_offset * n_taps * D * sizeof(float);
+    size_t slot_ring_off = (size_t)slot_id * (size_t)ds.n_swa * (size_t)ds.head_dim * sizeof(float);
+    uint32_t n_nope = (uint32_t)std::max(0, ds.head_dim - ds.n_rot);
+    uint32_t n_rot = (uint32_t)std::max(0, ds.n_rot);
+
+    id<MTLCommandBuffer> cb = [impl_->queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+
+    impl_->encode_gemv(enc, ds.b_taps, ds.fc, ds.b_inp_g, (uint32_t)count, tap_off, 0, 0, true);
+    impl_->encode_rmsnorm(enc, ds.b_inp_g, ds.enc_output_norm, ds.b_inp_g, (uint32_t)count, (uint32_t)D, ds.rms_norm_eps);
+
+    for (int il = 0; il < ds.num_layers; ++il) {
+        const auto& dl = ds.layers[(size_t)il];
+        impl_->encode_gemv(enc, ds.b_inp_g, dl.wkv, impl_->b_kv, (uint32_t)count);
+        impl_->encode_rmsnorm(enc, impl_->b_kv, dl.attn_kv_norm, impl_->b_kv_norm, (uint32_t)count, (uint32_t)ds.head_dim, ds.rms_norm_eps);
+        if (n_rot >= 2) {
+            DsPartialRopeParams rk{(uint32_t)count, (uint32_t)start_pos, 1u, 1u, (uint32_t)ds.head_dim, n_nope, n_rot, 0u, ds.rope_freq_base};
+            [enc setComputePipelineState:impl_->pso("ds_rope_partial_f32")];
+            [enc setBuffer:impl_->b_kv_norm offset:0 atIndex:0];
+            [enc setBytes:&rk length:sizeof(rk) atIndex:1];
+            [enc dispatchThreads:MTLSizeMake(n_rot / 2u, 1u, (uint32_t)count)
+                threadsPerThreadgroup:MTLSizeMake(std::min<uint32_t>(32u, n_rot / 2u), 1, 1)];
+        }
+        DsDsparkKvRingParams krp{(uint32_t)count, (uint32_t)start_pos, (uint32_t)ds.n_swa, (uint32_t)ds.head_dim};
+        [enc setComputePipelineState:impl_->pso("ds_dspark_kv_ring_write_f32")];
+        [enc setBuffer:impl_->b_kv_norm offset:0 atIndex:0];
+        [enc setBuffer:ds.kv_rings[(size_t)il] offset:slot_ring_off atIndex:1];
+        [enc setBytes:&krp length:sizeof(krp) atIndex:2];
+        [enc dispatchThreads:MTLSizeMake((uint32_t)ds.head_dim, (uint32_t)count, 1)
+            threadsPerThreadgroup:MTLSizeMake(std::min<uint32_t>(64u, (uint32_t)ds.head_dim), 1, 1)];
+    }
+
+    [enc endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    }
+}
+
+void DeepSeekV41Model::draft_tokens(int32_t anchor_tok, int anchor_pos, int num_draft, int32_t* h_out_drafts, int slot_id) {
+    if (!impl_->dspark.loaded || num_draft <= 0 || slot_id < 0 || slot_id >= max_slots) return;
+    @autoreleasepool {
+    auto& ds = impl_->dspark;
+    int B = std::clamp(num_draft, 1, ds.block_size);
+    size_t D = (size_t)ds.hidden_size;
+    uint32_t hc = (uint32_t)std::max(1, ds.hc_mult);
+    uint32_t n_nope = (uint32_t)std::max(0, ds.head_dim - ds.n_rot);
+    uint32_t n_rot = (uint32_t)std::max(0, ds.n_rot);
+    size_t slot_ring_off = (size_t)slot_id * (size_t)ds.n_swa * (size_t)ds.head_dim * sizeof(float);
+
+    float* hidden_ptr = static_cast<float*>(impl_->b_hidden.contents);
+    const auto& emb_ti = gguf.tensor("token_embd.weight");
+    size_t row_stride = ggml_row_nbytes(emb_ti.type, emb_ti.dims[0]);
+    const uint8_t* emb_base = gguf.tensor_data("token_embd.weight");
+    uint64_t nrows = emb_ti.num_rows();
+    for (int b = 0; b < B; ++b) {
+        int32_t tok = (b == 0) ? anchor_tok : ds.mask_token_id;
+        uint64_t tid = (uint64_t)std::clamp(tok, 0, (int32_t)(nrows > 0 ? nrows - 1 : 0));
+        dequant_row_fp32(emb_ti.type, emb_base + tid * row_stride, hidden_ptr + (size_t)b * D, D);
+    }
+
+    int32_t* markov_toks = static_cast<int32_t*>(ds.b_markov_toks.contents);
+    markov_toks[0] = anchor_tok;
+
+    id<MTLCommandBuffer> cb = [impl_->queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    {
+        DsStreamCollapseParams scp{(uint32_t)B, (uint32_t)D, hc};
+        [enc setComputePipelineState:impl_->pso("ds_mhc_expand_f32")];
+        [enc setBuffer:impl_->b_hidden offset:0 atIndex:0];
+        [enc setBuffer:impl_->b_streams_a offset:0 atIndex:1];
+        [enc setBytes:&scp length:sizeof(scp) atIndex:2];
+        [enc dispatchThreads:MTLSizeMake((uint32_t)D, (uint32_t)B, 1)
+            threadsPerThreadgroup:MTLSizeMake(std::min<uint32_t>(64u, (uint32_t)D), 1, 1)];
+    }
+
+    id<MTLBuffer> pre_attn = impl_->b_hc_pre_a;
+    id<MTLBuffer> pre_ffn = impl_->b_hc_pre_b;
+    float attn_scale = 1.0f / std::sqrt((float)ds.head_dim);
+
+    for (int il = 0; il < ds.num_layers; ++il) {
+        const auto& dl = ds.layers[(size_t)il];
+
+        impl_->encode_hc_mixes(enc, impl_->b_streams_a, dl.hc_attn_fn, dl.hc_attn_scale, dl.hc_attn_base,
+                               pre_attn, impl_->b_hc_post, impl_->b_hc_comb,
+                               (uint32_t)B, (uint32_t)D, hc, (uint32_t)ds.hc_sinkhorn_iters, ds.rms_norm_eps, ds.hc_eps);
+
+        if (il > 0) {
+            impl_->encode_hc_pre(enc, impl_->b_streams_a, pre_ffn, impl_->b_hidden, (uint32_t)B, (uint32_t)D, hc);
+        } else {
+            [enc endEncoding];
+            id<MTLBlitCommandEncoder> bl0 = [cb blitCommandEncoder];
+            for (int b = 0; b < B; ++b) {
+                [bl0 copyFromBuffer:impl_->b_streams_a sourceOffset:(size_t)b * hc * D * sizeof(float)
+                           toBuffer:impl_->b_hidden destinationOffset:(size_t)b * D * sizeof(float)
+                               size:D * sizeof(float)];
+            }
+            [bl0 endEncoding];
+            enc = [cb computeCommandEncoder];
+        }
+
+        impl_->encode_rmsnorm(enc, impl_->b_hidden, dl.attn_norm, impl_->b_norm, (uint32_t)B, (uint32_t)D, ds.rms_norm_eps);
+        impl_->encode_gemv(enc, impl_->b_norm, dl.wq_a, impl_->b_qr, (uint32_t)B);
+        impl_->encode_rmsnorm(enc, impl_->b_qr, dl.attn_q_a_norm, impl_->b_qr_norm, (uint32_t)B, (uint32_t)ds.q_lora_rank, ds.rms_norm_eps);
+        impl_->encode_gemv(enc, impl_->b_qr_norm, dl.wq_b, impl_->b_q, (uint32_t)B);
+
+        impl_->encode_gemv(enc, impl_->b_norm, dl.wkv, impl_->b_kv, (uint32_t)B);
+        impl_->encode_rmsnorm(enc, impl_->b_kv, dl.attn_kv_norm, impl_->b_kv_norm, (uint32_t)B, (uint32_t)ds.head_dim, ds.rms_norm_eps);
+
+        if (n_rot >= 2) {
+            DsPartialRopeParams rq{(uint32_t)B, (uint32_t)anchor_pos, 1u, (uint32_t)ds.n_heads, (uint32_t)ds.head_dim, n_nope, n_rot, 0u, ds.rope_freq_base};
+            [enc setComputePipelineState:impl_->pso("ds_rope_partial_f32")];
+            [enc setBuffer:impl_->b_q offset:0 atIndex:0];
+            [enc setBytes:&rq length:sizeof(rq) atIndex:1];
+            [enc dispatchThreads:MTLSizeMake(n_rot / 2u, (uint32_t)ds.n_heads, (uint32_t)B)
+                threadsPerThreadgroup:MTLSizeMake(std::min<uint32_t>(32u, n_rot / 2u), 1, 1)];
+
+            DsPartialRopeParams rk{(uint32_t)B, (uint32_t)anchor_pos, 1u, 1u, (uint32_t)ds.head_dim, n_nope, n_rot, 0u, ds.rope_freq_base};
+            [enc setBuffer:impl_->b_kv_norm offset:0 atIndex:0];
+            [enc setBytes:&rk length:sizeof(rk) atIndex:1];
+            [enc dispatchThreads:MTLSizeMake(n_rot / 2u, 1u, (uint32_t)B)
+                threadsPerThreadgroup:MTLSizeMake(std::min<uint32_t>(32u, n_rot / 2u), 1, 1)];
+        }
+
+        {
+            DsDsparkAttnParams ap{(uint32_t)B, (uint32_t)ds.n_heads, (uint32_t)ds.head_dim, (uint32_t)anchor_pos, (uint32_t)ds.n_swa, attn_scale};
+            [enc setComputePipelineState:impl_->pso("ds_dspark_mqa_sink_attn_f32")];
+            [enc setBuffer:impl_->b_q offset:0 atIndex:0];
+            [enc setBuffer:ds.kv_rings[(size_t)il] offset:slot_ring_off atIndex:1];
+            [enc setBuffer:impl_->b_kv_norm offset:0 atIndex:2];
+            [enc setBuffer:dl.attn_sinks offset:0 atIndex:3];
+            [enc setBuffer:impl_->b_attn_out offset:0 atIndex:4];
+            [enc setBytes:&ap length:sizeof(ap) atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake((uint32_t)ds.n_heads, (uint32_t)B, 1)
+                threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        }
+
+        if (n_rot >= 2) {
+            DsPartialRopeParams rd{(uint32_t)B, (uint32_t)anchor_pos, 1u, (uint32_t)ds.n_heads, (uint32_t)ds.head_dim, n_nope, n_rot, 1u, ds.rope_freq_base};
+            [enc setComputePipelineState:impl_->pso("ds_rope_partial_f32")];
+            [enc setBuffer:impl_->b_attn_out offset:0 atIndex:0];
+            [enc setBytes:&rd length:sizeof(rd) atIndex:1];
+            [enc dispatchThreads:MTLSizeMake(n_rot / 2u, (uint32_t)ds.n_heads, (uint32_t)B)
+                threadsPerThreadgroup:MTLSizeMake(std::min<uint32_t>(32u, n_rot / 2u), 1, 1)];
+        }
+
+        uint32_t o_groups = dl.wo_a.groups;
+        for (int b = 0; b < B; ++b) {
+            for (uint32_t g = 0; g < o_groups; ++g) {
+                size_t x_off = ((size_t)b * o_groups + g) * dl.wo_a.cols * sizeof(float);
+                size_t w_off = (size_t)g * dl.wo_a.group_stride_bytes;
+                size_t y_off = ((size_t)b * o_groups + g) * dl.wo_a.rows * sizeof(float);
+                impl_->encode_gemv(enc, impl_->b_attn_out, dl.wo_a, impl_->b_oa, 1u, x_off, w_off, y_off);
+            }
+        }
+        impl_->encode_gemv(enc, impl_->b_oa, dl.wo_b, impl_->b_sub_out, (uint32_t)B);
+        impl_->encode_hc_post(enc, impl_->b_sub_out, impl_->b_streams_a, impl_->b_hc_post, impl_->b_hc_comb,
+                              impl_->b_streams_b, (uint32_t)B, (uint32_t)D, hc);
+        std::swap(impl_->b_streams_a, impl_->b_streams_b);
+
+        impl_->encode_hc_mixes(enc, impl_->b_streams_a, dl.hc_ffn_fn, dl.hc_ffn_scale, dl.hc_ffn_base,
+                               pre_ffn, impl_->b_hc_post, impl_->b_hc_comb,
+                               (uint32_t)B, (uint32_t)D, hc, (uint32_t)ds.hc_sinkhorn_iters, ds.rms_norm_eps, ds.hc_eps);
+        impl_->encode_hc_pre(enc, impl_->b_streams_a, pre_attn, impl_->b_hidden, (uint32_t)B, (uint32_t)D, hc);
+        impl_->encode_rmsnorm(enc, impl_->b_hidden, dl.ffn_norm, impl_->b_norm, (uint32_t)B, (uint32_t)D, ds.rms_norm_eps);
+
+        impl_->encode_gemv(enc, impl_->b_norm, dl.ffn_gate_shexp, impl_->b_ffn_gate, (uint32_t)B);
+        impl_->encode_gemv(enc, impl_->b_norm, dl.ffn_up_shexp, impl_->b_ffn_up, (uint32_t)B);
+        impl_->encode_swiglu(enc, impl_->b_ffn_gate, impl_->b_ffn_up, impl_->b_ffn_act,
+                             (uint32_t)((size_t)B * dl.ffn_gate_shexp.rows), ds.swiglu_clamp_shexp);
+        impl_->encode_gemv(enc, impl_->b_ffn_act, dl.ffn_down_shexp, impl_->b_sub_out, (uint32_t)B);
+
+        impl_->encode_gemv(enc, impl_->b_norm, dl.router, impl_->b_router_logits, (uint32_t)B);
+        {
+            DsRouterParams rp{(uint32_t)B, (uint32_t)ds.n_experts, (uint32_t)ds.top_k, 1u, ds.route_scale};
+            [enc setComputePipelineState:impl_->pso("ds_router_topk_f32")];
+            [enc setBuffer:impl_->b_router_logits offset:0 atIndex:0];
+            [enc setBuffer:dl.router_bias offset:0 atIndex:1];
+            [enc setBuffer:impl_->b_topk_ids offset:0 atIndex:2];
+            [enc setBuffer:impl_->b_topk_w offset:0 atIndex:3];
+            [enc setBytes:&rp length:sizeof(rp) atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake((uint32_t)B, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        }
+        impl_->encode_moe_indexed(enc, impl_->b_norm, dl.ffn_gate_exps, impl_->b_topk_ids, impl_->b_ffn_gate, (uint32_t)B, (uint32_t)ds.top_k);
+        impl_->encode_moe_indexed(enc, impl_->b_norm, dl.ffn_up_exps, impl_->b_topk_ids, impl_->b_ffn_up, (uint32_t)B, (uint32_t)ds.top_k);
+        impl_->encode_swiglu(enc, impl_->b_ffn_gate, impl_->b_ffn_up, impl_->b_ffn_act,
+                             (uint32_t)((size_t)B * (size_t)ds.top_k * dl.ffn_gate_exps.rows), ds.swiglu_clamp_exp);
+        impl_->encode_moe_down_accum(enc, impl_->b_ffn_act, dl.ffn_down_exps, impl_->b_topk_ids, impl_->b_topk_w,
+                                     impl_->b_sub_out, (uint32_t)B, (uint32_t)ds.top_k);
+
+        impl_->encode_hc_post(enc, impl_->b_sub_out, impl_->b_streams_a, impl_->b_hc_post, impl_->b_hc_comb,
+                              impl_->b_streams_b, (uint32_t)B, (uint32_t)D, hc);
+        std::swap(impl_->b_streams_a, impl_->b_streams_b);
+    }
+
+    impl_->encode_hc_pre(enc, impl_->b_streams_a, pre_ffn, impl_->b_hidden, (uint32_t)B, (uint32_t)D, hc);
+    impl_->encode_rmsnorm(enc, impl_->b_hidden, ds.output_norm, impl_->b_norm, (uint32_t)B, (uint32_t)D, ds.rms_norm_eps);
+    impl_->encode_gemv(enc, impl_->b_norm, impl_->lm_head, ds.b_logits_blk, (uint32_t)B);
+
+    uint32_t v_sz = (uint32_t)cfg.vocab_size;
+    DsMarkovBiasParams mp{v_sz, (uint32_t)ds.markov_rank};
+    uint32_t markov_tg = (v_sz + 3u) / 4u;
+    for (int i = 0; i < B; ++i) {
+        [enc setComputePipelineState:impl_->pso("ds_markov_bias_add_bf16")];
+        [enc setBuffer:ds.b_logits_blk offset:(size_t)i * (size_t)v_sz * sizeof(float) atIndex:0];
+        [enc setBuffer:ds.markov_w1.buf offset:ds.markov_w1.base_offset atIndex:1];
+        [enc setBuffer:ds.markov_w2.buf offset:ds.markov_w2.base_offset atIndex:2];
+        [enc setBuffer:ds.b_markov_toks offset:(size_t)i * sizeof(int32_t) atIndex:3];
+        [enc setBuffer:ds.b_markov_logits offset:0 atIndex:4];
+        [enc setBytes:&mp length:sizeof(mp) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake(markov_tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+
+        [enc setComputePipelineState:impl_->pso("ds_argmax_f32")];
+        [enc setBuffer:ds.b_markov_logits offset:0 atIndex:0];
+        [enc setBuffer:ds.b_markov_toks offset:(size_t)(i + 1) * sizeof(int32_t) atIndex:1];
+        [enc setBytes:&v_sz length:sizeof(v_sz) atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    }
+
+    [enc endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    for (int i = 0; i < B; ++i) h_out_drafts[i] = markov_toks[i + 1];
     }
 }
 
