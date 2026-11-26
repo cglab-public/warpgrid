@@ -4023,6 +4023,26 @@ kernel void gguf_gemv_f32_fast(
     }
 }
 
+inline void gguf_q6_k_load_sub4(
+    device const uchar* b,
+    uint ql_off,
+    uint qh_off,
+    uint sc_off,
+    thread float4& q0,
+    thread float4& q1,
+    thread float4& q2,
+    thread float4& q3) {
+    uchar4 a = uchar4(*reinterpret_cast<device const packed_uchar4*>(b + ql_off));
+    uchar4 c = uchar4(*reinterpret_cast<device const packed_uchar4*>(b + ql_off + 32u));
+    uchar4 h = uchar4(*reinterpret_cast<device const packed_uchar4*>(b + qh_off));
+    device const char* sc = reinterpret_cast<device const char*>(b + sc_off);
+    float d = gguf_load_f16(b + 208u);
+    q0 = (d * float(sc[0])) * float4(int4((a & 0x0Fu) | ((h & 0x03u) << 4)) - 32);
+    q1 = (d * float(sc[2])) * float4(int4((c & 0x0Fu) | ((h & 0x0Cu) << 2)) - 32);
+    q2 = (d * float(sc[4])) * float4(int4((a >> 4) | (h & 0x30u)) - 32);
+    q3 = (d * float(sc[6])) * float4(int4((c >> 4) | ((h & 0xC0u) >> 2)) - 32);
+}
+
 kernel void gguf_grouped_gemv_q6_k_multi(
     device const float* X [[buffer(0)]],
     device const uchar* W [[buffer(1)]],
@@ -4032,42 +4052,39 @@ kernel void gguf_grouped_gemv_q6_k_multi(
     uint tid [[thread_index_in_threadgroup]]) {
     uint g = tgid.y;
     uint sg = tid >> 5;
-    uint lane = tid & 31u;
+    uint tiisg = tid & 31u;
     uint n = tgid.x * 2u + sg;
     if (g >= p.G || n >= p.N || p.T == 0u || p.T > 6u) return;
     uint nb = p.K >> 8;
     ulong row_bytes = ulong(nb) * 210ul;
+    uint lane_id = tiisg >> 1;
+    uint ix = tiisg & 1u;
+    uint ip = lane_id >> 3;
+    uint il = lane_id & 7u;
+    uint l0 = il << 2;
+    uint is = (ip << 3) + (l0 >> 4);
+    uint y_off = (ip << 7) + l0;
+    uint ql_off = (ip << 6) + l0;
+    uint qh_off = 128u + (ip << 5) + l0;
+    uint sc_off = 192u + is;
     device const uchar* w0 = W + ulong(g) * ulong(p.group_stride_bytes) + ulong(n) * row_bytes;
     float acc[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-    for (uint b = 0u; b < nb; ++b) {
-        device const uchar* blk = w0 + ulong(b) * 210ul;
-        float d = gguf_load_f16(blk + 208u);
-        device const uchar* ql = blk;
-        device const uchar* qh = blk + 128u;
-        device const char* sc = reinterpret_cast<device const char*>(blk + 192u);
-        uint l = lane;
-        uint is = l >> 4;
-        for (uint half_idx = 0u; half_idx < 2u; ++half_idx) {
-            device const uchar* qlh = ql + (half_idx << 6);
-            device const uchar* qhh = qh + (half_idx << 5);
-            device const char* sch = sc + (half_idx << 3);
-            uchar ql0 = qlh[l];
-            uchar ql1 = qlh[l + 32u];
-            uchar qhv = qhh[l];
-            float w_0 = d * float(sch[is + 0u]) * float(int((ql0 & 0x0Fu) | ((qhv & 0x03u) << 4)) - 32);
-            float w_1 = d * float(sch[is + 2u]) * float(int((ql1 & 0x0Fu) | (((qhv >> 2) & 0x03u) << 4)) - 32);
-            float w_2 = d * float(sch[is + 4u]) * float(int((ql0 >> 4) | (((qhv >> 4) & 0x03u) << 4)) - 32);
-            float w_3 = d * float(sch[is + 6u]) * float(int((ql1 >> 4) | (((qhv >> 6) & 0x03u) << 4)) - 32);
-            uint x_base = (b << 8) + (half_idx << 7) + l;
-            for (uint t = 0u; t < p.T; ++t) {
-                device const float* xt = X + ulong(t * p.G + g) * p.K + x_base;
-                acc[t] = fma(xt[0], w_0, fma(xt[32], w_1, fma(xt[64], w_2, fma(xt[96], w_3, acc[t]))));
-            }
+    for (uint i = ix; i < nb; i += 2u) {
+        float4 q0, q1, q2, q3;
+        gguf_q6_k_load_sub4(w0 + ulong(i) * 210ul, ql_off, qh_off, sc_off, q0, q1, q2, q3);
+        uint x_base = (i << 8) + y_off;
+        for (uint t = 0u; t < p.T; ++t) {
+            device const float* y = X + ulong(t * p.G + g) * p.K + x_base;
+            float4 y0 = *reinterpret_cast<device const float4*>(y + 0u);
+            float4 y1 = *reinterpret_cast<device const float4*>(y + 32u);
+            float4 y2 = *reinterpret_cast<device const float4*>(y + 64u);
+            float4 y3 = *reinterpret_cast<device const float4*>(y + 96u);
+            acc[t] += dot(y0, q0) + dot(y1, q1) + dot(y2, q2) + dot(y3, q3);
         }
     }
     for (uint t = 0u; t < p.T; ++t) {
         float out = simd_sum(acc[t]);
-        if (lane == 0u) Y[ulong(t * p.G + g) * p.N + n] = out;
+        if (tiisg == 0u) Y[ulong(t * p.G + g) * p.N + n] = out;
     }
 }
 
@@ -4352,4 +4369,138 @@ kernel void ds_markov_bias_argmax_p2(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     if (tid == 0u) out_tok[0] = (s_idx[0] == 0x7fffffff) ? 0 : s_idx[0];
+}
+
+struct GgufGemvSwigluParams {
+    uint M;
+    uint N;
+    uint K;
+    float clamp_val;
+};
+
+kernel void gguf_gemv_q6_k_multi_fast(
+    device const float* X [[buffer(0)]],
+    device const uchar* W [[buffer(1)]],
+    device float* Y [[buffer(2)]],
+    constant GgufGemvParams& p [[buffer(3)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    uint sg = tid >> 5;
+    uint tiisg = tid & 31u;
+    uint n0 = tgid * 4u + sg * 2u;
+    if (n0 >= p.N || p.M == 0u || p.M > 6u) return;
+    uint nb = p.K >> 8;
+    ulong row_bytes = ulong(nb) * 210ul;
+    bool has_r1 = (n0 + 1u < p.N);
+    uint lane_id = tiisg >> 1;
+    uint ix = tiisg & 1u;
+    uint ip = lane_id >> 3;
+    uint il = lane_id & 7u;
+    uint l0 = il << 2;
+    uint is = (ip << 3) + (l0 >> 4);
+    uint y_off = (ip << 7) + l0;
+    uint ql_off = (ip << 6) + l0;
+    uint qh_off = 128u + (ip << 5) + l0;
+    uint sc_off = 192u + is;
+    device const uchar* w0 = W + ulong(n0) * row_bytes;
+    device const uchar* w1 = has_r1 ? (w0 + row_bytes) : w0;
+    float acc0[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float acc1[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint i = ix; i < nb; i += 2u) {
+        ulong boff = ulong(i) * 210ul;
+        uint x_base = (i << 8) + y_off;
+        float4 q0, q1, q2, q3;
+        gguf_q6_k_load_sub4(w0 + boff, ql_off, qh_off, sc_off, q0, q1, q2, q3);
+        for (uint m = 0u; m < p.M; ++m) {
+            device const float* y = X + ulong(m) * p.K + x_base;
+            float4 y0 = *reinterpret_cast<device const float4*>(y + 0u);
+            float4 y1 = *reinterpret_cast<device const float4*>(y + 32u);
+            float4 y2 = *reinterpret_cast<device const float4*>(y + 64u);
+            float4 y3 = *reinterpret_cast<device const float4*>(y + 96u);
+            acc0[m] += dot(y0, q0) + dot(y1, q1) + dot(y2, q2) + dot(y3, q3);
+        }
+        if (has_r1) {
+            gguf_q6_k_load_sub4(w1 + boff, ql_off, qh_off, sc_off, q0, q1, q2, q3);
+            for (uint m = 0u; m < p.M; ++m) {
+                device const float* y = X + ulong(m) * p.K + x_base;
+                float4 y0 = *reinterpret_cast<device const float4*>(y + 0u);
+                float4 y1 = *reinterpret_cast<device const float4*>(y + 32u);
+                float4 y2 = *reinterpret_cast<device const float4*>(y + 64u);
+                float4 y3 = *reinterpret_cast<device const float4*>(y + 96u);
+                acc1[m] += dot(y0, q0) + dot(y1, q1) + dot(y2, q2) + dot(y3, q3);
+            }
+        }
+    }
+    for (uint m = 0u; m < p.M; ++m) {
+        float o0 = simd_sum(acc0[m]);
+        float o1 = has_r1 ? simd_sum(acc1[m]) : 0.0f;
+        if (tiisg == 0u) {
+            Y[ulong(m) * p.N + n0] = o0;
+            if (has_r1) Y[ulong(m) * p.N + n0 + 1u] = o1;
+        }
+    }
+}
+
+kernel void gguf_gemv_gate_up_swiglu_q6_k(
+    device const float* X [[buffer(0)]],
+    device const uchar* Wg [[buffer(1)]],
+    device const uchar* Wu [[buffer(2)]],
+    device float* Y [[buffer(3)]],
+    constant GgufGemvSwigluParams& p [[buffer(4)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    uint sg = tid >> 5;
+    uint tiisg = tid & 31u;
+    uint n = tgid * 2u + sg;
+    if (n >= p.N || p.M == 0u || p.M > 6u) return;
+    uint nb = p.K >> 8;
+    ulong row_bytes = ulong(nb) * 210ul;
+    uint lane_id = tiisg >> 1;
+    uint ix = tiisg & 1u;
+    uint ip = lane_id >> 3;
+    uint il = lane_id & 7u;
+    uint l0 = il << 2;
+    uint is = (ip << 3) + (l0 >> 4);
+    uint y_off = (ip << 7) + l0;
+    uint ql_off = (ip << 6) + l0;
+    uint qh_off = 128u + (ip << 5) + l0;
+    uint sc_off = 192u + is;
+    device const uchar* wg0 = Wg + ulong(n) * row_bytes;
+    device const uchar* wu0 = Wu + ulong(n) * row_bytes;
+    float ga[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float ua[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint i = ix; i < nb; i += 2u) {
+        ulong boff = ulong(i) * 210ul;
+        uint x_base = (i << 8) + y_off;
+        float4 q0, q1, q2, q3;
+        gguf_q6_k_load_sub4(wg0 + boff, ql_off, qh_off, sc_off, q0, q1, q2, q3);
+        for (uint m = 0u; m < p.M; ++m) {
+            device const float* y = X + ulong(m) * p.K + x_base;
+            float4 y0 = *reinterpret_cast<device const float4*>(y + 0u);
+            float4 y1 = *reinterpret_cast<device const float4*>(y + 32u);
+            float4 y2 = *reinterpret_cast<device const float4*>(y + 64u);
+            float4 y3 = *reinterpret_cast<device const float4*>(y + 96u);
+            ga[m] += dot(y0, q0) + dot(y1, q1) + dot(y2, q2) + dot(y3, q3);
+        }
+        gguf_q6_k_load_sub4(wu0 + boff, ql_off, qh_off, sc_off, q0, q1, q2, q3);
+        for (uint m = 0u; m < p.M; ++m) {
+            device const float* y = X + ulong(m) * p.K + x_base;
+            float4 y0 = *reinterpret_cast<device const float4*>(y + 0u);
+            float4 y1 = *reinterpret_cast<device const float4*>(y + 32u);
+            float4 y2 = *reinterpret_cast<device const float4*>(y + 64u);
+            float4 y3 = *reinterpret_cast<device const float4*>(y + 96u);
+            ua[m] += dot(y0, q0) + dot(y1, q1) + dot(y2, q2) + dot(y3, q3);
+        }
+    }
+    for (uint m = 0u; m < p.M; ++m) {
+        float gv = simd_sum(ga[m]);
+        float uv = simd_sum(ua[m]);
+        if (tiisg == 0u) {
+            if (p.clamp_val > 0.0f) {
+                gv = clamp(gv, -p.clamp_val, p.clamp_val);
+                uv = clamp(uv, -p.clamp_val, p.clamp_val);
+            }
+            Y[ulong(m) * p.N + n] = (gv / (1.0f + exp(-gv))) * uv;
+        }
+    }
 }

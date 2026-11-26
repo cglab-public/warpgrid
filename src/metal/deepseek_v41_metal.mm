@@ -832,6 +832,16 @@ struct DeepSeekV41Model::Impl {
         }
         if (M >= 2u && M <= 6u && (x_offset & 15u) == 0u &&
             (w.type == GgmlType::Q6_K || w.type == GgmlType::Q5_K || w.type == GgmlType::Q8_0)) {
+            if (w.type == GgmlType::Q6_K) {
+                [enc setComputePipelineState:pso("gguf_gemv_q6_k_multi_fast")];
+                [enc setBuffer:x offset:x_offset atIndex:0];
+                [enc setBuffer:w.buf offset:w.base_offset + w_offset atIndex:1];
+                [enc setBuffer:y offset:y_offset atIndex:2];
+                [enc setBytes:&p length:sizeof(p) atIndex:3];
+                [enc dispatchThreadgroups:MTLSizeMake((w.rows + 3u) / 4u, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+                return;
+            }
             if (w.type == GgmlType::Q8_0 && (((w.base_offset + w_offset) & 1u) == 0u)) {
                 [enc setComputePipelineState:pso("gguf_gemv_q8_0_multi_2r")];
                 [enc setBuffer:x offset:x_offset atIndex:0];
@@ -995,6 +1005,27 @@ struct DeepSeekV41Model::Impl {
         [enc setBuffer:out offset:0 atIndex:2];
         [enc setBytes:&sp length:sizeof(sp) atIndex:3];
         [enc dispatchThreadgroups:MTLSizeMake((n + 255u) / 256u, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    }
+
+    void encode_shexp_gate_up_swiglu(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> x,
+                                     const WeightBuf& wg, const WeightBuf& wu,
+                                     id<MTLBuffer> gate_tmp, id<MTLBuffer> up_tmp, id<MTLBuffer> out,
+                                     uint32_t T, float clamp_val) {
+        if (T >= 1u && T <= 6u && wg.type == GgmlType::Q6_K && wu.type == GgmlType::Q6_K &&
+            wg.rows == wu.rows && wg.cols == wu.cols && (wg.cols & 255u) == 0u) {
+            struct { uint32_t M; uint32_t N; uint32_t K; float clamp_val; } sp{T, wg.rows, wg.cols, clamp_val};
+            [enc setComputePipelineState:pso("gguf_gemv_gate_up_swiglu_q6_k")];
+            [enc setBuffer:x offset:0 atIndex:0];
+            [enc setBuffer:wg.buf offset:wg.base_offset atIndex:1];
+            [enc setBuffer:wu.buf offset:wu.base_offset atIndex:2];
+            [enc setBuffer:out offset:0 atIndex:3];
+            [enc setBytes:&sp length:sizeof(sp) atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake((wg.rows + 1u) / 2u, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            return;
+        }
+        encode_gemv(enc, x, wg, gate_tmp, T);
+        encode_gemv(enc, x, wu, up_tmp, T);
+        encode_swiglu(enc, gate_tmp, up_tmp, out, (uint32_t)((size_t)T * wg.rows), clamp_val);
     }
 
     void encode_hc_mixes(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> streams,
@@ -1929,9 +1960,9 @@ int32_t DeepSeekV41Model::forward_and_greedy(const int32_t* h_tokens, int T, int
 
         bool overlap_shexp = (cfg.num_experts_per_tok > 0 && lw.ffn_gate_exps.groups > 0 && lw.ffn_gate_exps.is_streamed());
         if (!overlap_shexp) {
-            impl_->encode_gemv(enc, impl_->b_norm, lw.ffn_gate_shexp, impl_->b_ffn_gate, (uint32_t)T);
-            impl_->encode_gemv(enc, impl_->b_norm, lw.ffn_up_shexp, impl_->b_ffn_up, (uint32_t)T);
-            impl_->encode_swiglu(enc, impl_->b_ffn_gate, impl_->b_ffn_up, impl_->b_ffn_act, (uint32_t)((size_t)T * lw.ffn_gate_shexp.rows), cfg.swiglu_clamp_shexp);
+            impl_->encode_shexp_gate_up_swiglu(enc, impl_->b_norm, lw.ffn_gate_shexp, lw.ffn_up_shexp,
+                                               impl_->b_ffn_gate, impl_->b_ffn_up, impl_->b_ffn_act,
+                                               (uint32_t)T, cfg.swiglu_clamp_shexp);
             impl_->encode_gemv(enc, impl_->b_ffn_act, lw.ffn_down_shexp, impl_->b_sub_out, (uint32_t)T);
         }
 
@@ -1951,9 +1982,9 @@ int32_t DeepSeekV41Model::forward_and_greedy(const int32_t* h_tokens, int T, int
                 }
                 id<MTLCommandBuffer> cb_sh = [impl_->queue commandBuffer];
                 id<MTLComputeCommandEncoder> enc_sh = [cb_sh computeCommandEncoder];
-                impl_->encode_gemv(enc_sh, impl_->b_norm, lw.ffn_gate_shexp, impl_->b_ffn_gate, (uint32_t)T);
-                impl_->encode_gemv(enc_sh, impl_->b_norm, lw.ffn_up_shexp, impl_->b_ffn_up, (uint32_t)T);
-                impl_->encode_swiglu(enc_sh, impl_->b_ffn_gate, impl_->b_ffn_up, impl_->b_ffn_act, (uint32_t)((size_t)T * lw.ffn_gate_shexp.rows), cfg.swiglu_clamp_shexp);
+                impl_->encode_shexp_gate_up_swiglu(enc_sh, impl_->b_norm, lw.ffn_gate_shexp, lw.ffn_up_shexp,
+                                                   impl_->b_ffn_gate, impl_->b_ffn_up, impl_->b_ffn_act,
+                                                   (uint32_t)T, cfg.swiglu_clamp_shexp);
                 impl_->encode_gemv(enc_sh, impl_->b_ffn_act, lw.ffn_down_shexp, impl_->b_sub_out, (uint32_t)T);
                 [enc_sh endEncoding];
                 [cb_sh commit];

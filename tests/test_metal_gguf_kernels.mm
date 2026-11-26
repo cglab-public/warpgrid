@@ -1804,6 +1804,104 @@ static void test_ds_dspark_draft_fast_kernels_parity() {
     }
 }
 
+static void test_ds_q6_k_multi_fast_and_shexp_swiglu_parity() {
+    struct GgufGemvSwigluParams { uint32_t M; uint32_t N; uint32_t K; float clamp_val; };
+    const uint32_t N = 37, K = 512;
+    const uint32_t nb = K / 256;
+    std::vector<uint8_t> wg((size_t)N * nb * 210, 0);
+    std::vector<uint8_t> wu((size_t)N * nb * 210, 0);
+    for (uint32_t n = 0; n < N; ++n) {
+        for (uint32_t b = 0; b < nb; ++b) {
+            uint8_t* bg = wg.data() + ((size_t)n * nb + b) * 210;
+            uint8_t* bu = wu.data() + ((size_t)n * nb + b) * 210;
+            for (int i = 0; i < 128; ++i) {
+                bg[i] = (uint8_t)((n * 17 + b * 23 + i * 7) & 0xFFu);
+                bu[i] = (uint8_t)((n * 29 + b * 11 + i * 13) & 0xFFu);
+            }
+            for (int i = 0; i < 64; ++i) {
+                bg[128 + i] = (uint8_t)((n * 13 + b * 5 + i * 11) & 0xFFu);
+                bu[128 + i] = (uint8_t)((n * 19 + b * 7 + i * 3) & 0xFFu);
+            }
+            for (int i = 0; i < 16; ++i) {
+                ((int8_t*)(bg + 192))[i] = (int8_t)((int)((n + b + i) % 15) - 7);
+                ((int8_t*)(bu + 192))[i] = (int8_t)((int)((n * 3 + b + i) % 15) - 7);
+            }
+            uint16_t dg = f32_to_f16_bits(0.05f);
+            uint16_t du = f32_to_f16_bits(0.04f);
+            memcpy(bg + 208, &dg, 2);
+            memcpy(bu + 208, &du, 2);
+        }
+    }
+    {
+        const uint32_t M = 5;
+        std::vector<float> x((size_t)M * K);
+        for (size_t i = 0; i < x.size(); ++i) x[i] = std::sin((float)(i + 1) * 0.031f);
+        id<MTLComputePipelineState> p_mf = g_ctx.pso("gguf_gemv_q6_k_multi_fast");
+        EXPECT_TRUE(p_mf != nil);
+        if (p_mf == nil) return;
+        std::vector<float> y_ref;
+        dispatch_gguf_gemv("gguf_gemv_q6_k", x, wg, M, N, K, y_ref);
+        id<MTLBuffer> bx = [g_ctx.dev newBufferWithBytes:x.data() length:x.size() * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bw = [g_ctx.dev newBufferWithBytes:wg.data() length:wg.size() * sizeof(uint8_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> by = [g_ctx.dev newBufferWithLength:(size_t)M * N * sizeof(float) options:MTLResourceStorageModeShared];
+        GgufGemvParams p{M, N, K};
+        id<MTLCommandBuffer> cb = [g_ctx.q commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:p_mf];
+        [enc setBuffer:bx offset:0 atIndex:0];
+        [enc setBuffer:bw offset:0 atIndex:1];
+        [enc setBuffer:by offset:0 atIndex:2];
+        [enc setBytes:&p length:sizeof(p) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake((N + 3u) / 4u, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        const float* ymf = static_cast<const float*>(by.contents);
+        for (size_t i = 0; i < y_ref.size(); ++i) EXPECT_TRUE(std::abs(ymf[i] - y_ref[i]) < 1e-2f);
+    }
+    for (int tc = 0; tc < 2; ++tc) {
+        const uint32_t M = (tc == 0) ? 1u : 5u;
+        const float clamp_val = (tc == 0) ? 0.0f : 7.0f;
+        const float scale_x = (tc == 0) ? 0.5f : 2.5f;
+        std::vector<float> x((size_t)M * K);
+        for (size_t i = 0; i < x.size(); ++i) x[i] = std::cos((float)(i + 3) * 0.027f) * scale_x;
+        id<MTLComputePipelineState> p_sw = g_ctx.pso("gguf_gemv_gate_up_swiglu_q6_k");
+        EXPECT_TRUE(p_sw != nil);
+        if (p_sw == nil) return;
+        std::vector<float> yg_ref, yu_ref;
+        dispatch_gguf_gemv("gguf_gemv_q6_k", x, wg, M, N, K, yg_ref);
+        dispatch_gguf_gemv("gguf_gemv_q6_k", x, wu, M, N, K, yu_ref);
+        id<MTLBuffer> bx = [g_ctx.dev newBufferWithBytes:x.data() length:x.size() * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bwg = [g_ctx.dev newBufferWithBytes:wg.data() length:wg.size() * sizeof(uint8_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bwu = [g_ctx.dev newBufferWithBytes:wu.data() length:wu.size() * sizeof(uint8_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> by = [g_ctx.dev newBufferWithLength:(size_t)M * N * sizeof(float) options:MTLResourceStorageModeShared];
+        GgufGemvSwigluParams sp{M, N, K, clamp_val};
+        id<MTLCommandBuffer> cb = [g_ctx.q commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:p_sw];
+        [enc setBuffer:bx offset:0 atIndex:0];
+        [enc setBuffer:bwg offset:0 atIndex:1];
+        [enc setBuffer:bwu offset:0 atIndex:2];
+        [enc setBuffer:by offset:0 atIndex:3];
+        [enc setBytes:&sp length:sizeof(sp) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake((N + 1u) / 2u, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        const float* ysw = static_cast<const float*>(by.contents);
+        for (size_t i = 0; i < (size_t)M * N; ++i) {
+            float gv = yg_ref[i];
+            float uv = yu_ref[i];
+            if (clamp_val > 0.0f) {
+                gv = std::clamp(gv, -clamp_val, clamp_val);
+                uv = std::clamp(uv, -clamp_val, clamp_val);
+            }
+            float ref = (gv / (1.0f + std::exp(-gv))) * uv;
+            EXPECT_TRUE(std::abs(ysw[i] - ref) <= 2e-2f + 1e-3f * std::abs(ref));
+        }
+    }
+}
+
 int main() {
     @autoreleasepool {
         if (!g_ctx.init()) {
@@ -1832,6 +1930,7 @@ int main() {
         run_test("test_ds_attn_router_fast_kernels_parity", test_ds_attn_router_fast_kernels_parity);
         run_test("test_ds_dspark_conf_head_parity", test_ds_dspark_conf_head_parity);
         run_test("test_ds_dspark_draft_fast_kernels_parity", test_ds_dspark_draft_fast_kernels_parity);
+        run_test("test_ds_q6_k_multi_fast_and_shexp_swiglu_parity", test_ds_q6_k_multi_fast_and_shexp_swiglu_parity);
         printf("GGUF Metal kernel tests: %d passed, %d failed\n", g_passed, g_failed);
         return g_failed == 0 ? 0 : 1;
     }
