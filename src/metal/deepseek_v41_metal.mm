@@ -1033,6 +1033,12 @@ void DeepSeekV41Model::load(const std::string& model_path, int max_seq, int max_
     max_slots = eff_slots;
     max_seq_len = max_seq;
     max_batch_tokens = std::max(1, max_chunk);
+    if (!dspark_path.empty()) {
+        int min_spec_batch = std::max(8, draft_k + 1);
+        if (max_batch_tokens < min_spec_batch) max_batch_tokens = min_spec_batch;
+    } else {
+        draft_k = 0;
+    }
     max_blocks_per_seq = (max_seq_len + 63) / 64;
     num_kv_blocks = max_slots * max_blocks_per_seq;
     num_snapshots = 0;
@@ -2014,13 +2020,19 @@ void DeepSeekV41Model::rollback_conv_states(int accepted_len, int slot_id) {
 }
 
 int DeepSeekV41Model::max_dspark_slots() const {
-    return impl_->dspark.loaded ? max_slots : 0;
+    return impl_->dspark.loaded ? 1 : 0;
 }
 
 void DeepSeekV41Model::commit_dspark_context(int count, int start_pos, int slot_id, int aux_tok_offset) {
     if (!impl_->dspark.loaded || count <= 0 || slot_id < 0 || slot_id >= max_slots) return;
     @autoreleasepool {
     auto& ds = impl_->dspark;
+    if (ds.n_swa > 0 && count > ds.n_swa) {
+        int skip = count - ds.n_swa;
+        aux_tok_offset += skip;
+        start_pos += skip;
+        count = ds.n_swa;
+    }
     size_t D = (size_t)ds.hidden_size;
     size_t n_taps = ds.target_layers.size();
     size_t tap_off = (size_t)aux_tok_offset * n_taps * D * sizeof(float);

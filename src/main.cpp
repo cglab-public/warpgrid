@@ -44,7 +44,7 @@ int main(int argc, char** argv) {
             auto ds = std::make_unique<ink::DeepSeekV41Model>();
             ds->engram_path = opts.engram_path;
             ds->dspark_path = opts.dspark_path;
-            ds->draft_k = (opts.draft_k == 0 && !opts.dspark_path.empty()) ? 3 : opts.draft_k;
+            ds->draft_k = opts.dspark_path.empty() ? 0 : (opts.draft_k > 0 ? opts.draft_k : 3);
             ds->load(opts.model_dir, opts.max_seq, opts.max_chunk, opts.max_slots);
             ds->load_tokenizer(tok);
             model = std::move(ds);
