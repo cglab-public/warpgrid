@@ -1293,6 +1293,11 @@ struct DsIndexerParams {
     float iw_scale;
 };
 
+inline uint gguf_f32_to_ord(float v) {
+    uint u = as_type<uint>(v);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
 kernel void ds_indexer_score_topk_f32(
     device const float* iq [[buffer(0)]],
     device const float* ik_cache [[buffer(1)]],
@@ -1347,46 +1352,48 @@ kernel void ds_indexer_score_topk_f32(
     }
     threadgroup_barrier(mem_flags::mem_device);
 
-    threadgroup float sg_f[8];
     threadgroup uint sg_u[8];
-    threadgroup float b_lo;
-    threadgroup float b_hi;
+    threadgroup uint b_lo;
+    threadgroup uint b_hi;
     threadgroup atomic_uint w_cnt;
     uint sg = tid >> 5;
     uint lane = tid & 31u;
     uint n_sg = (tptg + 31u) >> 5;
 
-    float lmin = 1e30f;
-    float lmax = -1e30f;
+    uint lmin = 0xFFFFFFFFu;
+    uint lmax = 0u;
     for (uint c = tid; c < max_vis; c += tptg) {
-        float v = sc[c];
-        lmin = min(lmin, v);
-        lmax = max(lmax, v);
+        uint kv = gguf_f32_to_ord(sc[c]);
+        lmin = min(lmin, kv);
+        lmax = max(lmax, kv);
     }
-    float smin = simd_min(lmin);
-    float smax = simd_max(lmax);
-    if (lane == 0u) sg_f[sg] = smin;
+    uint smin = simd_min(lmin);
+    uint smax = simd_max(lmax);
+    if (lane == 0u) sg_u[sg] = smin;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0u) {
-        float gmin = 1e30f;
-        for (uint s = 0; s < n_sg; ++s) gmin = min(gmin, sg_f[s]);
+        uint gmin = 0xFFFFFFFFu;
+        for (uint s = 0; s < n_sg; ++s) gmin = min(gmin, sg_u[s]);
         b_lo = gmin;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lane == 0u) sg_f[sg] = smax;
+    if (lane == 0u) sg_u[sg] = smax;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0u) {
-        float gmax = -1e30f;
-        for (uint s = 0; s < n_sg; ++s) gmax = max(gmax, sg_f[s]);
+        uint gmax = 0u;
+        for (uint s = 0; s < n_sg; ++s) gmax = max(gmax, sg_u[s]);
         b_hi = gmax;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint it = 0; it < 24u; ++it) {
-        float mid = 0.5f * (b_lo + b_hi);
+    for (uint it = 0; it < 32u; ++it) {
+        uint lo = b_lo;
+        uint hi = b_hi;
+        if (lo >= hi) break;
+        uint mid = lo + ((hi - lo) >> 1);
         uint cnt = 0u;
         for (uint c = tid; c < max_vis; c += tptg) {
-            if (sc[c] > mid) cnt += 1u;
+            if (gguf_f32_to_ord(sc[c]) > mid) cnt += 1u;
         }
         uint scnt = simd_sum(cnt);
         if (lane == 0u) sg_u[sg] = scnt;
@@ -1395,7 +1402,7 @@ kernel void ds_indexer_score_topk_f32(
             uint tot = 0u;
             for (uint s = 0; s < n_sg; ++s) tot += sg_u[s];
             if (tot >= K) {
-                b_lo = mid;
+                b_lo = mid + 1u;
             } else {
                 b_hi = mid;
             }
@@ -1403,19 +1410,19 @@ kernel void ds_indexer_score_topk_f32(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    float thresh = b_lo;
+    uint thresh = b_lo;
     if (tid == 0u) atomic_store_explicit(&w_cnt, 0u, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint c = tid; c < max_vis; c += tptg) {
-        if (sc[c] > thresh) {
+        if (gguf_f32_to_ord(sc[c]) > thresh) {
             uint idx = atomic_fetch_add_explicit(&w_cnt, 1u, memory_order_relaxed);
             if (idx < K) dst[idx] = int(c);
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint c = tid; c < max_vis; c += tptg) {
-        if (sc[c] == thresh) {
+        if (gguf_f32_to_ord(sc[c]) == thresh) {
             uint cur = atomic_load_explicit(&w_cnt, memory_order_relaxed);
             if (cur < K) {
                 uint idx = atomic_fetch_add_explicit(&w_cnt, 1u, memory_order_relaxed);

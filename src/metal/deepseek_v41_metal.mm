@@ -801,10 +801,23 @@ void DeepSeekV41Model::load(const std::string& model_path, int max_seq, int max_
         lw.router = impl_->load_weight_required(gguf, p + "ffn_gate_inp.weight");
         lw.router_bias = impl_->load_f32_required(gguf, p + "exp_probs_b.bias");
         uint64_t layer_moe_bytes = 0;
-        if (gguf.has_tensor(p + "ffn_gate_exps.weight")) layer_moe_bytes += gguf.tensor(p + "ffn_gate_exps.weight").nbytes;
-        if (gguf.has_tensor(p + "ffn_up_exps.weight")) layer_moe_bytes += gguf.tensor(p + "ffn_up_exps.weight").nbytes;
-        if (gguf.has_tensor(p + "ffn_down_exps.weight")) layer_moe_bytes += gguf.tensor(p + "ffn_down_exps.weight").nbytes;
-        bool stream_layer = (resident_moe_bytes + layer_moe_bytes > moe_budget_bytes);
+        bool has_f16_exp = false;
+        if (gguf.has_tensor(p + "ffn_gate_exps.weight")) {
+            const auto& t = gguf.tensor(p + "ffn_gate_exps.weight");
+            layer_moe_bytes += t.nbytes;
+            has_f16_exp = has_f16_exp || (t.type == GgmlType::F16);
+        }
+        if (gguf.has_tensor(p + "ffn_up_exps.weight")) {
+            const auto& t = gguf.tensor(p + "ffn_up_exps.weight");
+            layer_moe_bytes += t.nbytes;
+            has_f16_exp = has_f16_exp || (t.type == GgmlType::F16);
+        }
+        if (gguf.has_tensor(p + "ffn_down_exps.weight")) {
+            const auto& t = gguf.tensor(p + "ffn_down_exps.weight");
+            layer_moe_bytes += t.nbytes;
+            has_f16_exp = has_f16_exp || (t.type == GgmlType::F16);
+        }
+        bool stream_layer = !has_f16_exp && (resident_moe_bytes + layer_moe_bytes > moe_budget_bytes);
         if (stream_layer) {
             impl_->stream_moe_experts = true;
         } else {

@@ -134,9 +134,13 @@ def main():
                 peak_rss = max(peak_rss, rss_gib(proc.pid))
                 tps = r["completion_tokens"] / max(r["elapsed_s"], 1e-6)
                 tok_s_list.append(tps)
-                outputs.append(r["text"])
+                outputs.append(json.dumps({"text": r["text"], "reasoning": r["reasoning"]}, sort_keys=True))
 
         out_hash = hashlib.sha256("\n---\n".join(outputs).encode("utf-8")).hexdigest()[:16] if outputs else ""
+        sample_out = ""
+        if outputs:
+            first = json.loads(outputs[0])
+            sample_out = (first["text"] or first["reasoning"])[:200]
         result = {
             "startup_s": round(startup_s, 2),
             "median_tok_s": round(statistics.median(tok_s_list), 2) if tok_s_list else 0.0,
@@ -144,7 +148,7 @@ def main():
             "max_tok_s": round(max(tok_s_list), 2) if tok_s_list else 0.0,
             "peak_rss_gib": round(peak_rss, 2),
             "output_hash": out_hash,
-            "sample_output": outputs[0][:200] if outputs else "",
+            "sample_output": sample_out,
         }
         if args.needle or args.needle_only:
             result["needle_50pct"] = run_needle(base_url, args.max_seq // 2)
