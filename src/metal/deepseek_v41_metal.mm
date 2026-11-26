@@ -1,6 +1,8 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include "deepseek_v41_metal.hpp"
+#include "../deepseek_profile.hpp"
+#include <chrono>
 #ifdef WARPGRID_METAL_PRECOMPILED
 #include "kernels_gguf_metallib_embed.hpp"
 #else
@@ -496,6 +498,11 @@ struct DeepSeekV41Model::Impl {
     } dspark;
     int last_verify_start_pos = 0;
     int32_t* verify_out_buf = nullptr;
+    DsStageProfile prof;
+    ExpertUsageProfile usage_prof;
+    std::string expert_profile_path;
+    bool save_expert_profile = false;
+    uint64_t usage_flush_steps = 0;
 
     void close_nocache_fds() {
         for (int fd : nocache_fds) {
@@ -505,6 +512,9 @@ struct DeepSeekV41Model::Impl {
     }
 
     ~Impl() {
+        if (save_expert_profile && !expert_profile_path.empty() && usage_prof.num_layers > 0) {
+            usage_prof.save_tsv(expert_profile_path);
+        }
         close_nocache_fds();
     }
 
@@ -1374,9 +1384,75 @@ void DeepSeekV41Model::load(const std::string& model_path, int max_seq, int max_
                 ds.num_layers, ds.n_experts, ds.top_k, ds.n_swa, ds.block_size, draft_k, ds.target_layers.size(), ds.mask_token_id);
     }
 
-    if (max_slots == 1) {
+        if (max_slots == 1) {
         num_kv_blocks = std::max(1, (max_seq_len + 63) / 64);
         num_snapshots = 1;
+    }
+
+    impl_->usage_prof.init(cfg.num_hidden_layers, cfg.n_routed_experts);
+    impl_->expert_profile_path.clear();
+    impl_->save_expert_profile = false;
+    if (const char* ep = std::getenv("WARPGRID_DS_EXPERT_PROFILE")) {
+        if (ep[0] != '\0') {
+            impl_->expert_profile_path = ep;
+            impl_->save_expert_profile = true;
+        }
+    }
+    if (impl_->exp_cache.enabled() && !impl_->expert_profile_path.empty() &&
+        impl_->usage_prof.load_tsv(impl_->expert_profile_path)) {
+        auto top = impl_->usage_prof.top_experts((size_t)impl_->exp_cache.num_slots);
+        if (!top.empty()) {
+            auto tw0 = std::chrono::steady_clock::now();
+            std::vector<std::vector<int32_t>> by_layer((size_t)cfg.num_hidden_layers);
+            for (const auto& le : top) by_layer[(size_t)le.first].push_back(le.second);
+            struct WarmTask { int l; int slot; int eid; };
+            std::vector<WarmTask> tasks;
+            tasks.reserve(top.size());
+            std::vector<int32_t> slots_out;
+            std::vector<std::pair<int32_t, int32_t>> misses_out;
+            for (int l = 0; l < cfg.num_hidden_layers; ++l) {
+                auto& v = by_layer[(size_t)l];
+                if (v.empty()) continue;
+                impl_->exp_cache.pin_and_resolve(l, v.data(), v.size(), slots_out, misses_out);
+                for (const auto& m : misses_out) tasks.push_back({l, m.first, m.second});
+            }
+            impl_->exp_cache.hits = 0;
+            impl_->exp_cache.misses = 0;
+            if (!tasks.empty()) {
+                uint8_t* dst_g = static_cast<uint8_t*>(impl_->exp_cache.buf_g.contents);
+                uint8_t* dst_u = static_cast<uint8_t*>(impl_->exp_cache.buf_u.contents);
+                uint8_t* dst_d = static_cast<uint8_t*>(impl_->exp_cache.buf_d.contents);
+                size_t c_gu = impl_->exp_cache.gu_stride;
+                size_t c_d = impl_->exp_cache.d_stride;
+                const auto* tp = tasks.data();
+                const auto* layers_p = impl_->layers.data();
+                std::atomic<bool> io_err{false};
+                std::atomic<bool>* io_err_p = &io_err;
+                dispatch_apply(tasks.size(), dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t i) {
+                    const auto& t = tp[i];
+                    const auto& lw = layers_p[(size_t)t.l];
+                    size_t slot = (size_t)t.slot;
+                    size_t eid = (size_t)t.eid;
+                    size_t gs = lw.ffn_gate_exps.group_stride_bytes;
+                    size_t us = lw.ffn_up_exps.group_stride_bytes;
+                    size_t ds = lw.ffn_down_exps.group_stride_bytes;
+                    bool ok = true;
+                    if (lw.ffn_gate_exps.nocache_fd >= 0) ok = ok && pread_all(lw.ffn_gate_exps.nocache_fd, dst_g + slot * c_gu, gs, (off_t)(lw.ffn_gate_exps.file_offset + eid * gs));
+                    else if (lw.ffn_gate_exps.raw_data) memcpy(dst_g + slot * c_gu, lw.ffn_gate_exps.raw_data + eid * gs, gs);
+                    if (lw.ffn_up_exps.nocache_fd >= 0) ok = ok && pread_all(lw.ffn_up_exps.nocache_fd, dst_u + slot * c_gu, us, (off_t)(lw.ffn_up_exps.file_offset + eid * us));
+                    else if (lw.ffn_up_exps.raw_data) memcpy(dst_u + slot * c_gu, lw.ffn_up_exps.raw_data + eid * us, us);
+                    if (lw.ffn_down_exps.nocache_fd >= 0) ok = ok && pread_all(lw.ffn_down_exps.nocache_fd, dst_d + slot * c_d, ds, (off_t)(lw.ffn_down_exps.file_offset + eid * ds));
+                    else if (lw.ffn_down_exps.raw_data) memcpy(dst_d + slot * c_d, lw.ffn_down_exps.raw_data + eid * ds, ds);
+                    if (!ok) io_err_p->store(true, std::memory_order_relaxed);
+                });
+                if (io_err.load(std::memory_order_relaxed)) {
+                    throw std::runtime_error("pread failed during expert cache pre-warm");
+                }
+                double ws = std::chrono::duration<double>(std::chrono::steady_clock::now() - tw0).count();
+                fprintf(stderr, "[warpgrid] Pre-warmed %zu hot experts from %s in %.2fs\n",
+                        tasks.size(), impl_->expert_profile_path.c_str(), ws);
+            }
+        }
     }
 
     if (impl_->exp_cache.enabled()) {
@@ -1435,6 +1511,11 @@ int32_t DeepSeekV41Model::forward_and_greedy(const int32_t* h_tokens, int T, int
     if (slot_id < 0 || slot_id >= max_slots) throw std::runtime_error("Invalid slot_id");
     if (start_pos < 0 || start_pos + T > max_seq_len) throw std::runtime_error("Sequence length exceeds max_seq_len");
 
+    auto t_fwd0 = std::chrono::steady_clock::now();
+    if (profile_stages) {
+        impl_->prof.calls++;
+        impl_->prof.tokens += (uint64_t)T;
+    }
     auto& hist = impl_->slot_tok_history[(size_t)slot_id];
     if ((int)hist.size() < start_pos + T) hist.resize((size_t)(start_pos + T), 0);
     for (int t = 0; t < T; ++t) hist[(size_t)(start_pos + t)] = h_tokens[t];
@@ -1452,26 +1533,55 @@ int32_t DeepSeekV41Model::forward_and_greedy(const int32_t* h_tokens, int T, int
     }
 
     if ((engram.is_open() || impl_->engram_in_main_gguf) && cfg.ple_n_heads > 0 && cfg.ple_head_dim > 0) {
-        std::vector<int32_t> row_ids((size_t)cfg.ple_n_heads, 0);
-        for (size_t e_idx = 0; e_idx < cfg.ple_layers.size(); ++e_idx) {
-            float* erows_ptr = static_cast<float*>(impl_->b_engram_rows[e_idx].contents);
-            for (int t = 0; t < T; ++t) {
-                cfg.engram_hash_token((int)e_idx, hist, start_pos + t, row_ids.data());
-                for (int h = 0; h < cfg.ple_n_heads; ++h) {
-                    float* dst = erows_ptr + ((size_t)t * (size_t)cfg.ple_n_heads + (size_t)h) * (size_t)cfg.ple_head_dim;
-                    if (engram.is_open()) {
-                        engram.lookup_row("per_layer_token_embd.weight", (uint64_t)row_ids[(size_t)h], dst, (size_t)cfg.ple_head_dim);
-                    } else {
-                        const auto& pti = gguf.tensor("per_layer_token_embd.weight");
-                        size_t pstride = ggml_row_nbytes(pti.type, pti.dims[0]);
-                        const uint8_t* pbase = gguf.tensor_data("per_layer_token_embd.weight");
-                        dequant_row_fp32(pti.type, pbase + (size_t)row_ids[(size_t)h] * pstride, dst, (size_t)cfg.ple_head_dim);
+        if (!engram.is_open() && impl_->engram_in_main_gguf && T > 1) {
+            const auto& pti = gguf.tensor("per_layer_token_embd.weight");
+            size_t pstride = ggml_row_nbytes(pti.type, pti.dims[0]);
+            const uint8_t* pbase = gguf.tensor_data("per_layer_token_embd.weight");
+            GgmlType ptype = pti.type;
+            size_t n_ple = cfg.ple_layers.size();
+            size_t n_h = (size_t)cfg.ple_n_heads;
+            size_t h_dim = (size_t)cfg.ple_head_dim;
+            std::vector<int32_t> all_rows(n_ple * (size_t)T * n_h, 0);
+            for (size_t e_idx = 0; e_idx < n_ple; ++e_idx) {
+                for (int t = 0; t < T; ++t) {
+                    cfg.engram_hash_token((int)e_idx, hist, start_pos + t, &all_rows[(e_idx * (size_t)T + (size_t)t) * n_h]);
+                }
+            }
+            const int32_t* rows_p = all_rows.data();
+            const auto* bufs_p = impl_->b_engram_rows.data();
+            size_t total_jobs = n_ple * (size_t)T * n_h;
+            dispatch_apply(total_jobs, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t job) {
+                size_t e_idx = job / ((size_t)T * n_h);
+                size_t rem = job % ((size_t)T * n_h);
+                float* erows_ptr = static_cast<float*>(bufs_p[e_idx].contents);
+                float* dst = erows_ptr + rem * h_dim;
+                dequant_row_fp32(ptype, pbase + (size_t)rows_p[job] * pstride, dst, h_dim);
+            });
+        } else {
+            std::vector<int32_t> row_ids((size_t)cfg.ple_n_heads, 0);
+            for (size_t e_idx = 0; e_idx < cfg.ple_layers.size(); ++e_idx) {
+                float* erows_ptr = static_cast<float*>(impl_->b_engram_rows[e_idx].contents);
+                for (int t = 0; t < T; ++t) {
+                    cfg.engram_hash_token((int)e_idx, hist, start_pos + t, row_ids.data());
+                    for (int h = 0; h < cfg.ple_n_heads; ++h) {
+                        float* dst = erows_ptr + ((size_t)t * (size_t)cfg.ple_n_heads + (size_t)h) * (size_t)cfg.ple_head_dim;
+                        if (engram.is_open()) {
+                            engram.lookup_row("per_layer_token_embd.weight", (uint64_t)row_ids[(size_t)h], dst, (size_t)cfg.ple_head_dim);
+                        } else {
+                            const auto& pti = gguf.tensor("per_layer_token_embd.weight");
+                            size_t pstride = ggml_row_nbytes(pti.type, pti.dims[0]);
+                            const uint8_t* pbase = gguf.tensor_data("per_layer_token_embd.weight");
+                            dequant_row_fp32(pti.type, pbase + (size_t)row_ids[(size_t)h] * pstride, dst, (size_t)cfg.ple_head_dim);
+                        }
                     }
                 }
             }
         }
     }
 
+    if (profile_stages) {
+        impl_->prof.emb_engram_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_fwd0).count();
+    }
     id<MTLCommandBuffer> cb = [impl_->queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
     {
@@ -1497,6 +1607,8 @@ int32_t DeepSeekV41Model::forward_and_greedy(const int32_t* h_tokens, int T, int
         const auto& lw = impl_->layers[(size_t)l];
         auto& kv = impl_->kv_caches[(size_t)l];
 
+        auto t_l0 = std::chrono::steady_clock::now();
+        auto t_m0 = t_l0;
         int e_idx = cfg.engram_index(l);
         if (e_idx >= 0 && (engram.is_open() || impl_->engram_in_main_gguf) && cfg.ple_n_heads > 0 && cfg.ple_head_dim > 0) {
             impl_->encode_gemv(enc, impl_->b_engram_rows[(size_t)e_idx], lw.engram_kv, impl_->b_engram_kv, (uint32_t)T);
@@ -1739,11 +1851,6 @@ int32_t DeepSeekV41Model::forward_and_greedy(const int32_t* h_tokens, int T, int
 
         impl_->encode_rmsnorm(enc, impl_->b_hidden, lw.ffn_norm, impl_->b_norm, (uint32_t)T, (uint32_t)D, cfg.rms_norm_eps);
 
-        impl_->encode_gemv(enc, impl_->b_norm, lw.ffn_gate_shexp, impl_->b_ffn_gate, (uint32_t)T);
-        impl_->encode_gemv(enc, impl_->b_norm, lw.ffn_up_shexp, impl_->b_ffn_up, (uint32_t)T);
-        impl_->encode_swiglu(enc, impl_->b_ffn_gate, impl_->b_ffn_up, impl_->b_ffn_act, (uint32_t)((size_t)T * lw.ffn_gate_shexp.rows), cfg.swiglu_clamp_shexp);
-        impl_->encode_gemv(enc, impl_->b_ffn_act, lw.ffn_down_shexp, impl_->b_sub_out, (uint32_t)T);
-
         impl_->encode_gemv(enc, impl_->b_norm, lw.router, impl_->b_router_logits, (uint32_t)T);
         DsRouterParams rp{
             (uint32_t)T, (uint32_t)cfg.n_routed_experts, (uint32_t)cfg.num_experts_per_tok,
@@ -1757,6 +1864,14 @@ int32_t DeepSeekV41Model::forward_and_greedy(const int32_t* h_tokens, int T, int
         [enc setBytes:&rp length:sizeof(rp) atIndex:4];
         [enc dispatchThreadgroups:MTLSizeMake((uint32_t)T, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 
+        bool overlap_shexp = (cfg.num_experts_per_tok > 0 && lw.ffn_gate_exps.groups > 0 && lw.ffn_gate_exps.is_streamed());
+        if (!overlap_shexp) {
+            impl_->encode_gemv(enc, impl_->b_norm, lw.ffn_gate_shexp, impl_->b_ffn_gate, (uint32_t)T);
+            impl_->encode_gemv(enc, impl_->b_norm, lw.ffn_up_shexp, impl_->b_ffn_up, (uint32_t)T);
+            impl_->encode_swiglu(enc, impl_->b_ffn_gate, impl_->b_ffn_up, impl_->b_ffn_act, (uint32_t)((size_t)T * lw.ffn_gate_shexp.rows), cfg.swiglu_clamp_shexp);
+            impl_->encode_gemv(enc, impl_->b_ffn_act, lw.ffn_down_shexp, impl_->b_sub_out, (uint32_t)T);
+        }
+
         uint32_t top_k_u = (uint32_t)cfg.num_experts_per_tok;
         if (top_k_u > 0 && lw.ffn_gate_exps.groups > 0) {
             WeightBuf gate_w = lw.ffn_gate_exps;
@@ -1767,6 +1882,18 @@ int32_t DeepSeekV41Model::forward_and_greedy(const int32_t* h_tokens, int T, int
                 [enc endEncoding];
                 [cb commit];
                 [cb waitUntilCompleted];
+                auto t_l_ar = std::chrono::steady_clock::now();
+                if (profile_stages) {
+                    impl_->prof.attn_router_ms += std::chrono::duration<double, std::milli>(t_l_ar - t_l0).count();
+                }
+                id<MTLCommandBuffer> cb_sh = [impl_->queue commandBuffer];
+                id<MTLComputeCommandEncoder> enc_sh = [cb_sh computeCommandEncoder];
+                impl_->encode_gemv(enc_sh, impl_->b_norm, lw.ffn_gate_shexp, impl_->b_ffn_gate, (uint32_t)T);
+                impl_->encode_gemv(enc_sh, impl_->b_norm, lw.ffn_up_shexp, impl_->b_ffn_up, (uint32_t)T);
+                impl_->encode_swiglu(enc_sh, impl_->b_ffn_gate, impl_->b_ffn_up, impl_->b_ffn_act, (uint32_t)((size_t)T * lw.ffn_gate_shexp.rows), cfg.swiglu_clamp_shexp);
+                impl_->encode_gemv(enc_sh, impl_->b_ffn_act, lw.ffn_down_shexp, impl_->b_sub_out, (uint32_t)T);
+                [enc_sh endEncoding];
+                [cb_sh commit];
 
                 const int32_t* raw_ids = static_cast<const int32_t*>(impl_->b_topk_ids.contents);
                 int32_t* st_ids = static_cast<int32_t*>(impl_->b_stage_topk_ids.contents);
@@ -1778,6 +1905,7 @@ int32_t DeepSeekV41Model::forward_and_greedy(const int32_t* h_tokens, int T, int
                 for (uint32_t i = 0; i < n_sel; ++i) {
                     int32_t eid = raw_ids[i];
                     if (eid < 0 || eid >= cfg.n_routed_experts) eid = 0;
+                    if (impl_->save_expert_profile) impl_->usage_prof.record(l, eid);
                     int32_t loc = remap[(size_t)eid];
                     if (loc < 0) {
                         loc = (int32_t)uniq_ids.size();
@@ -1804,6 +1932,12 @@ int32_t DeepSeekV41Model::forward_and_greedy(const int32_t* h_tokens, int T, int
                     std::vector<int32_t> slot_for_u;
                     std::vector<std::pair<int32_t, int32_t>> miss_list;
                     impl_->exp_cache.pin_and_resolve(l, uniq_ids.data(), U, slot_for_u, miss_list);
+                    if (profile_stages) {
+                        impl_->prof.exp_unique_total += (uint64_t)U;
+                        impl_->prof.exp_misses += (uint64_t)miss_list.size();
+                        impl_->prof.exp_hits += (uint64_t)(U - miss_list.size());
+                    }
+                    auto t_p0 = std::chrono::steady_clock::now();
                     for (uint32_t i = 0; i < n_sel; ++i) {
                         st_ids[i] = slot_for_u[(size_t)full_loc[i]];
                     }
@@ -1832,6 +1966,10 @@ int32_t DeepSeekV41Model::forward_and_greedy(const int32_t* h_tokens, int T, int
                             throw std::runtime_error("pread failed on GGUF shard");
                         }
                     }
+                    if (profile_stages) {
+                        impl_->prof.exp_pread_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_p0).count();
+                    }
+                    t_m0 = std::chrono::steady_clock::now();
                     gate_w.buf = impl_->exp_cache.buf_g;
                     gate_w.base_offset = 0;
                     gate_w.groups = (uint32_t)impl_->exp_cache.num_slots;
@@ -1955,11 +2093,22 @@ int32_t DeepSeekV41Model::forward_and_greedy(const int32_t* h_tokens, int T, int
         if (lw.ffn_gate_exps.is_streamed() || ((l + 1) % 8 == 0)) {
             [enc endEncoding];
             [cb commit];
+            if (profile_stages) {
+                [cb waitUntilCompleted];
+                auto t_m1 = std::chrono::steady_clock::now();
+                impl_->prof.moe_gpu_ms += std::chrono::duration<double, std::milli>(t_m1 - t_m0).count();
+            }
             cb = [impl_->queue commandBuffer];
             enc = [cb computeCommandEncoder];
         }
     }
 
+    if (impl_->save_expert_profile && !impl_->expert_profile_path.empty()) {
+        if ((++impl_->usage_flush_steps & 63ull) == 0ull) {
+            impl_->usage_prof.save_tsv(impl_->expert_profile_path);
+        }
+    }
+    auto t_h0 = std::chrono::steady_clock::now();
     if (cfg.num_hidden_layers > 0) {
         impl_->encode_hc_pre(enc, impl_->b_streams_a, pre_ffn, impl_->b_hidden, (uint32_t)T, (uint32_t)D, hc);
     }
@@ -1977,6 +2126,9 @@ int32_t DeepSeekV41Model::forward_and_greedy(const int32_t* h_tokens, int T, int
         [enc endEncoding];
         [cb commit];
         [cb waitUntilCompleted];
+        if (profile_stages) {
+            impl_->prof.head_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_h0).count();
+        }
         const int32_t* argp = static_cast<const int32_t*>(impl_->b_argmax.contents);
         memcpy(impl_->verify_out_buf, argp, (size_t)T * sizeof(int32_t));
         return argp[T - 1];
@@ -1991,6 +2143,9 @@ int32_t DeepSeekV41Model::forward_and_greedy(const int32_t* h_tokens, int T, int
     [enc endEncoding];
     [cb commit];
     [cb waitUntilCompleted];
+    if (profile_stages) {
+        impl_->prof.head_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_h0).count();
+    }
     return *static_cast<const int32_t*>(impl_->b_argmax.contents);
     }
 }
@@ -2025,6 +2180,7 @@ int DeepSeekV41Model::max_dspark_slots() const {
 
 void DeepSeekV41Model::commit_dspark_context(int count, int start_pos, int slot_id, int aux_tok_offset) {
     if (!impl_->dspark.loaded || count <= 0 || slot_id < 0 || slot_id >= max_slots) return;
+    auto t_dc0 = std::chrono::steady_clock::now();
     @autoreleasepool {
     auto& ds = impl_->dspark;
     if (ds.n_swa > 0 && count > ds.n_swa) {
@@ -2071,10 +2227,14 @@ void DeepSeekV41Model::commit_dspark_context(int count, int start_pos, int slot_
     [cb commit];
     [cb waitUntilCompleted];
     }
+    if (profile_stages) {
+        impl_->prof.dspark_commit_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_dc0).count();
+    }
 }
 
 void DeepSeekV41Model::draft_tokens(int32_t anchor_tok, int anchor_pos, int num_draft, int32_t* h_out_drafts, int slot_id) {
     if (!impl_->dspark.loaded || num_draft <= 0 || slot_id < 0 || slot_id >= max_slots) return;
+    auto t_dd0 = std::chrono::steady_clock::now();
     @autoreleasepool {
     auto& ds = impl_->dspark;
     int B = std::clamp(num_draft, 1, ds.block_size);
@@ -2298,6 +2458,17 @@ void DeepSeekV41Model::draft_tokens(int32_t anchor_tok, int anchor_pos, int num_
     [cb waitUntilCompleted];
     for (int i = 0; i < B; ++i) h_out_drafts[i] = markov_toks[i + 1];
     }
+    if (profile_stages) {
+        impl_->prof.dspark_draft_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_dd0).count();
+    }
+}
+
+void DeepSeekV41Model::reset_profile() {
+    impl_->prof.reset();
+}
+
+void DeepSeekV41Model::print_profile() const {
+    fprintf(stderr, "%s\n", impl_->prof.format_summary().c_str());
 }
 
 void DeepSeekV41Model::forward_batch_decode_greedy(

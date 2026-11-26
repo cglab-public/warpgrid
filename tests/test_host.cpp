@@ -2,6 +2,7 @@
 #include "../src/cli.hpp"
 #include "../src/config.hpp"
 #include "../src/deepseek_config.hpp"
+#include "../src/deepseek_profile.hpp"
 #include "../src/engram.hpp"
 #include "../src/gguf.hpp"
 #include "../src/json.hpp"
@@ -938,6 +939,57 @@ static void test_deepseek_config_from_gguf() {
     EXPECT_TRUE(!cfg.is_encoder_layer(20));
 }
 
+static void test_deepseek_stage_profile_and_expert_usage_roundtrip() {
+    ink::DsStageProfile prof;
+    prof.reset();
+    prof.calls = 10;
+    prof.tokens = 40;
+    prof.emb_engram_ms = 2.0;
+    prof.attn_router_ms = 200.0;
+    prof.exp_pread_ms = 150.0;
+    prof.moe_gpu_ms = 400.0;
+    prof.head_ms = 30.0;
+    prof.dspark_commit_ms = 10.0;
+    prof.dspark_draft_ms = 80.0;
+    prof.exp_hits = 900;
+    prof.exp_misses = 100;
+    prof.exp_unique_total = 1000;
+    EXPECT_TRUE(std::abs(prof.hit_rate_pct() - 90.0) < 1e-6);
+    std::string summary = prof.format_summary();
+    EXPECT_TRUE(summary.find("attn_router=") != std::string::npos);
+    EXPECT_TRUE(summary.find("exp_pread=") != std::string::npos);
+    EXPECT_TRUE(summary.find("moe_gpu=") != std::string::npos);
+    EXPECT_TRUE(summary.find("90.0%") != std::string::npos);
+
+    ink::ExpertUsageProfile u;
+    u.init(2, 4);
+    u.record(0, 2);
+    u.record(0, 2);
+    u.record(1, 3);
+    u.record(1, 3);
+    u.record(1, 3);
+    u.record(0, 1);
+    auto top2 = u.top_experts(2);
+    EXPECT_EQ(top2.size(), (size_t)2);
+    EXPECT_EQ(top2[0].first, 1);
+    EXPECT_EQ(top2[0].second, 3);
+    EXPECT_EQ(top2[1].first, 0);
+    EXPECT_EQ(top2[1].second, 2);
+
+    std::string tmp = "/tmp/warpgrid_exp_usage_test.tsv";
+    EXPECT_TRUE(u.save_tsv(tmp));
+    ink::ExpertUsageProfile u2;
+    u2.init(2, 4);
+    EXPECT_TRUE(u2.load_tsv(tmp));
+    ::unlink(tmp.c_str());
+    auto top2b = u2.top_experts(2);
+    EXPECT_EQ(top2b.size(), (size_t)2);
+    EXPECT_EQ(top2b[0].first, 1);
+    EXPECT_EQ(top2b[0].second, 3);
+    EXPECT_EQ(top2b[1].first, 0);
+    EXPECT_EQ(top2b[1].second, 2);
+}
+
 int main() {
     run_test("test_json_roundtrip_and_escaping", test_json_roundtrip_and_escaping);
     run_test("test_config_inkling2_parse", test_config_inkling2_parse);
@@ -954,6 +1006,7 @@ int main() {
     run_test("test_gguf_v3_single_and_multishard_reader", test_gguf_v3_single_and_multishard_reader);
     run_test("test_engram_nvme_mmap_dequant_and_cache", test_engram_nvme_mmap_dequant_and_cache);
     run_test("test_deepseek_config_from_gguf", test_deepseek_config_from_gguf);
+    run_test("test_deepseek_stage_profile_and_expert_usage_roundtrip", test_deepseek_stage_profile_and_expert_usage_roundtrip);
     printf("Host tests: %d passed, %d failed\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;
 }
