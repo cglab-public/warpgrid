@@ -3994,3 +3994,107 @@ kernel void gguf_moe_down_accum_mxfp4_4r(
     }
 }
 
+
+
+kernel void gguf_gemv_f32_fast(
+    device const float* X [[buffer(0)]],
+    device const float* W [[buffer(1)]],
+    device float* Y [[buffer(2)]],
+    constant GgufGemvParams& p [[buffer(3)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    uint sg = tid >> 5;
+    uint lane = tid & 31u;
+    uint n = tgid * 2u + sg;
+    if (n >= p.N || p.M == 0u || p.M > 6u) return;
+    uint k4 = p.K >> 2;
+    device const float4* w4 = reinterpret_cast<device const float4*>(W + ulong(n) * p.K);
+    float4 acc[6] = {float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f)};
+    for (uint k = lane; k < k4; k += 32u) {
+        float4 wv = w4[k];
+        for (uint m = 0u; m < p.M; ++m) {
+            device const float4* x4 = reinterpret_cast<device const float4*>(X + ulong(m) * p.K);
+            acc[m] = fma(x4[k], wv, acc[m]);
+        }
+    }
+    for (uint m = 0u; m < p.M; ++m) {
+        float s = simd_sum(acc[m].x + acc[m].y + acc[m].z + acc[m].w);
+        if (lane == 0u) Y[ulong(m) * p.N + n] = s;
+    }
+}
+
+kernel void gguf_grouped_gemv_q6_k_multi(
+    device const float* X [[buffer(0)]],
+    device const uchar* W [[buffer(1)]],
+    device float* Y [[buffer(2)]],
+    constant GgufGroupedGemvParams& p [[buffer(3)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    uint g = tgid.y;
+    uint sg = tid >> 5;
+    uint lane = tid & 31u;
+    uint n = tgid.x * 2u + sg;
+    if (g >= p.G || n >= p.N || p.T == 0u || p.T > 6u) return;
+    uint nb = p.K >> 8;
+    ulong row_bytes = ulong(nb) * 210ul;
+    device const uchar* w0 = W + ulong(g) * ulong(p.group_stride_bytes) + ulong(n) * row_bytes;
+    float acc[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint b = 0u; b < nb; ++b) {
+        device const uchar* blk = w0 + ulong(b) * 210ul;
+        float d = gguf_load_f16(blk + 208u);
+        device const uchar* ql = blk;
+        device const uchar* qh = blk + 128u;
+        device const char* sc = reinterpret_cast<device const char*>(blk + 192u);
+        uint l = lane;
+        uint is = l >> 4;
+        for (uint half_idx = 0u; half_idx < 2u; ++half_idx) {
+            device const uchar* qlh = ql + (half_idx << 6);
+            device const uchar* qhh = qh + (half_idx << 5);
+            device const char* sch = sc + (half_idx << 3);
+            uchar ql0 = qlh[l];
+            uchar ql1 = qlh[l + 32u];
+            uchar qhv = qhh[l];
+            float w_0 = d * float(sch[is + 0u]) * float(int((ql0 & 0x0Fu) | ((qhv & 0x03u) << 4)) - 32);
+            float w_1 = d * float(sch[is + 2u]) * float(int((ql1 & 0x0Fu) | (((qhv >> 2) & 0x03u) << 4)) - 32);
+            float w_2 = d * float(sch[is + 4u]) * float(int((ql0 >> 4) | (((qhv >> 4) & 0x03u) << 4)) - 32);
+            float w_3 = d * float(sch[is + 6u]) * float(int((ql1 >> 4) | (((qhv >> 6) & 0x03u) << 4)) - 32);
+            uint x_base = (b << 8) + (half_idx << 7) + l;
+            for (uint t = 0u; t < p.T; ++t) {
+                device const float* xt = X + ulong(t * p.G + g) * p.K + x_base;
+                acc[t] = fma(xt[0], w_0, fma(xt[32], w_1, fma(xt[64], w_2, fma(xt[96], w_3, acc[t]))));
+            }
+        }
+    }
+    for (uint t = 0u; t < p.T; ++t) {
+        float out = simd_sum(acc[t]);
+        if (lane == 0u) Y[ulong(t * p.G + g) * p.N + n] = out;
+    }
+}
+
+struct DsKvWriteParams {
+    uint T;
+    uint head_dim;
+    uint start_pos;
+    uint write_comp;
+};
+
+kernel void ds_kv_write_f32(
+    device const float* kv_in [[buffer(0)]],
+    device float* kv_dst [[buffer(1)]],
+    device const float* ckv_in [[buffer(2)]],
+    device float* ckv_dst [[buffer(3)]],
+    device const float* csc_in [[buffer(4)]],
+    device float* csc_dst [[buffer(5)]],
+    constant DsKvWriteParams& p [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    uint d = gid.x;
+    uint t = gid.y;
+    if (d >= p.head_dim || t >= p.T) return;
+    ulong src = ulong(t) * p.head_dim + d;
+    ulong dst = ulong(p.start_pos + t) * p.head_dim + d;
+    kv_dst[dst] = kv_in[src];
+    if (p.write_comp != 0u) {
+        ckv_dst[dst] = ckv_in[src];
+        csc_dst[dst] = csc_in[src];
+    }
+}

@@ -168,6 +168,13 @@ struct DsMarkovBiasParams {
     uint32_t R;
 };
 
+struct DsKvWriteParams {
+    uint32_t T;
+    uint32_t head_dim;
+    uint32_t start_pos;
+    uint32_t write_comp;
+};
+
 struct WeightBuf {
     id<MTLBuffer> buf = nil;
     size_t base_offset = 0;
@@ -783,6 +790,15 @@ struct DeepSeekV41Model::Impl {
             [enc setBuffer:y offset:y_offset atIndex:2];
             [enc setBytes:&p length:sizeof(p) atIndex:3];
             [enc dispatchThreadgroups:MTLSizeMake(w.rows, M, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            return;
+        }
+        if (w.type == GgmlType::F32 && M >= 1u && M <= 6u && (w.cols & 3u) == 0u && ((w.base_offset + w_offset) & 15u) == 0u && (x_offset & 15u) == 0u) {
+            [enc setComputePipelineState:pso("gguf_gemv_f32_fast")];
+            [enc setBuffer:x offset:x_offset atIndex:0];
+            [enc setBuffer:w.buf offset:w.base_offset + w_offset atIndex:1];
+            [enc setBuffer:y offset:y_offset atIndex:2];
+            [enc setBytes:&p length:sizeof(p) atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake((w.rows + 1u) / 2u, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
             return;
         }
         if (!force_fp32_x && M >= 8u && (w.type == GgmlType::Q6_K || w.type == GgmlType::Q5_K || w.type == GgmlType::Q8_0)) {
@@ -1689,19 +1705,20 @@ int32_t DeepSeekV41Model::forward_and_greedy(const int32_t* h_tokens, int T, int
             }
         }
 
-        [enc endEncoding];
-
-        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
-        size_t kv_copy_bytes = (size_t)T * (size_t)cfg.head_dim * sizeof(float);
-        size_t kv_dst_off = slot_kv_off + (size_t)start_pos * (size_t)cfg.head_dim * sizeof(float);
-        [blit copyFromBuffer:impl_->b_kv_norm sourceOffset:0 toBuffer:kv.kv_cache destinationOffset:kv_dst_off size:kv_copy_bytes];
-        if (ratio > 0 && cfg.kv_src[(size_t)l] == l) {
-            [blit copyFromBuffer:impl_->b_comp_tmp_kv sourceOffset:0 toBuffer:kv.comp_raw_kv destinationOffset:kv_dst_off size:kv_copy_bytes];
-            [blit copyFromBuffer:impl_->b_comp_tmp_score sourceOffset:0 toBuffer:kv.comp_raw_score destinationOffset:kv_dst_off size:kv_copy_bytes];
+        {
+            bool wcomp = (ratio > 0 && cfg.kv_src[(size_t)l] == l);
+            DsKvWriteParams kwp{(uint32_t)T, (uint32_t)cfg.head_dim, (uint32_t)start_pos, wcomp ? 1u : 0u};
+            [enc setComputePipelineState:impl_->pso("ds_kv_write_f32")];
+            [enc setBuffer:impl_->b_kv_norm offset:0 atIndex:0];
+            [enc setBuffer:kv.kv_cache offset:slot_kv_off atIndex:1];
+            [enc setBuffer:impl_->b_comp_tmp_kv offset:0 atIndex:2];
+            [enc setBuffer:(wcomp ? kv.comp_raw_kv : kv.kv_cache) offset:slot_kv_off atIndex:3];
+            [enc setBuffer:impl_->b_comp_tmp_score offset:0 atIndex:4];
+            [enc setBuffer:(wcomp ? kv.comp_raw_score : kv.kv_cache) offset:slot_kv_off atIndex:5];
+            [enc setBytes:&kwp length:sizeof(kwp) atIndex:6];
+            [enc dispatchThreads:MTLSizeMake((uint32_t)cfg.head_dim, (uint32_t)T, 1)
+                threadsPerThreadgroup:MTLSizeMake(std::min<uint32_t>(64u, (uint32_t)cfg.head_dim), 1, 1)];
         }
-        [blit endEncoding];
-
-        enc = [cb computeCommandEncoder];
 
         uint32_t total_comp_blocks = (ratio > 0) ? (uint32_t)((start_pos + T) / ratio) : 0u;
         if (ratio > 0 && cfg.kv_src[(size_t)l] == l && total_comp_blocks > 0) {
@@ -1822,12 +1839,21 @@ int32_t DeepSeekV41Model::forward_and_greedy(const int32_t* h_tokens, int T, int
         uint32_t o_groups = lw.wo_a.groups;
         if (lw.wo_a.type == GgmlType::Q6_K && (lw.wo_a.cols & 255u) == 0u) {
             GgufGroupedGemvParams gp{(uint32_t)T, o_groups, lw.wo_a.rows, lw.wo_a.cols, lw.wo_a.group_stride_bytes};
-            [enc setComputePipelineState:impl_->pso("gguf_grouped_gemv_q6_k_fast")];
-            [enc setBuffer:impl_->b_attn_out offset:0 atIndex:0];
-            [enc setBuffer:lw.wo_a.buf offset:lw.wo_a.base_offset atIndex:1];
-            [enc setBuffer:impl_->b_oa offset:0 atIndex:2];
-            [enc setBytes:&gp length:sizeof(gp) atIndex:3];
-            [enc dispatchThreadgroups:MTLSizeMake((lw.wo_a.rows + 3u) / 4u, (uint32_t)T * o_groups, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            if (T >= 2 && T <= 6) {
+                [enc setComputePipelineState:impl_->pso("gguf_grouped_gemv_q6_k_multi")];
+                [enc setBuffer:impl_->b_attn_out offset:0 atIndex:0];
+                [enc setBuffer:lw.wo_a.buf offset:lw.wo_a.base_offset atIndex:1];
+                [enc setBuffer:impl_->b_oa offset:0 atIndex:2];
+                [enc setBytes:&gp length:sizeof(gp) atIndex:3];
+                [enc dispatchThreadgroups:MTLSizeMake((lw.wo_a.rows + 1u) / 2u, o_groups, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            } else {
+                [enc setComputePipelineState:impl_->pso("gguf_grouped_gemv_q6_k_fast")];
+                [enc setBuffer:impl_->b_attn_out offset:0 atIndex:0];
+                [enc setBuffer:lw.wo_a.buf offset:lw.wo_a.base_offset atIndex:1];
+                [enc setBuffer:impl_->b_oa offset:0 atIndex:2];
+                [enc setBytes:&gp length:sizeof(gp) atIndex:3];
+                [enc dispatchThreadgroups:MTLSizeMake((lw.wo_a.rows + 3u) / 4u, (uint32_t)T * o_groups, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            }
         } else {
             for (int t = 0; t < T; ++t) {
                 for (uint32_t g = 0; g < o_groups; ++g) {
