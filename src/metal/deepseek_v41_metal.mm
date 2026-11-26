@@ -2181,12 +2181,23 @@ void DeepSeekV41Model::draft_tokens(int32_t anchor_tok, int anchor_pos, int num_
         }
 
         uint32_t o_groups = dl.wo_a.groups;
-        for (int b = 0; b < B; ++b) {
-            for (uint32_t g = 0; g < o_groups; ++g) {
-                size_t x_off = ((size_t)b * o_groups + g) * dl.wo_a.cols * sizeof(float);
-                size_t w_off = (size_t)g * dl.wo_a.group_stride_bytes;
-                size_t y_off = ((size_t)b * o_groups + g) * dl.wo_a.rows * sizeof(float);
-                impl_->encode_gemv(enc, impl_->b_attn_out, dl.wo_a, impl_->b_oa, 1u, x_off, w_off, y_off);
+        if (dl.wo_a.type == GgmlType::Q8_0 && (dl.wo_a.cols & 31u) == 0u) {
+            GgufGroupedGemvParams gp{(uint32_t)B, o_groups, dl.wo_a.rows, dl.wo_a.cols, dl.wo_a.group_stride_bytes};
+            [enc setComputePipelineState:impl_->pso("gguf_grouped_gemv_q8_0_fast")];
+            [enc setBuffer:impl_->b_attn_out offset:0 atIndex:0];
+            [enc setBuffer:dl.wo_a.buf offset:dl.wo_a.base_offset atIndex:1];
+            [enc setBuffer:impl_->b_oa offset:0 atIndex:2];
+            [enc setBytes:&gp length:sizeof(gp) atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake((dl.wo_a.rows + 3u) / 4u, (uint32_t)B * o_groups, 1)
+                threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        } else {
+            for (int b = 0; b < B; ++b) {
+                for (uint32_t g = 0; g < o_groups; ++g) {
+                    size_t x_off = ((size_t)b * o_groups + g) * dl.wo_a.cols * sizeof(float);
+                    size_t w_off = (size_t)g * dl.wo_a.group_stride_bytes;
+                    size_t y_off = ((size_t)b * o_groups + g) * dl.wo_a.rows * sizeof(float);
+                    impl_->encode_gemv(enc, impl_->b_attn_out, dl.wo_a, impl_->b_oa, 1u, x_off, w_off, y_off);
+                }
             }
         }
         impl_->encode_gemv(enc, impl_->b_oa, dl.wo_b, impl_->b_sub_out, (uint32_t)B);
@@ -2217,12 +2228,41 @@ void DeepSeekV41Model::draft_tokens(int32_t anchor_tok, int anchor_pos, int num_
             [enc setBytes:&rp length:sizeof(rp) atIndex:4];
             [enc dispatchThreadgroups:MTLSizeMake((uint32_t)B, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         }
-        impl_->encode_moe_indexed(enc, impl_->b_norm, dl.ffn_gate_exps, impl_->b_topk_ids, impl_->b_ffn_gate, (uint32_t)B, (uint32_t)ds.top_k);
-        impl_->encode_moe_indexed(enc, impl_->b_norm, dl.ffn_up_exps, impl_->b_topk_ids, impl_->b_ffn_up, (uint32_t)B, (uint32_t)ds.top_k);
-        impl_->encode_swiglu(enc, impl_->b_ffn_gate, impl_->b_ffn_up, impl_->b_ffn_act,
-                             (uint32_t)((size_t)B * (size_t)ds.top_k * dl.ffn_gate_exps.rows), ds.swiglu_clamp_exp);
-        impl_->encode_moe_down_accum(enc, impl_->b_ffn_act, dl.ffn_down_exps, impl_->b_topk_ids, impl_->b_topk_w,
-                                     impl_->b_sub_out, (uint32_t)B, (uint32_t)ds.top_k);
+        if (dl.ffn_gate_exps.type == GgmlType::MXFP4 && dl.ffn_up_exps.type == GgmlType::MXFP4 &&
+            dl.ffn_gate_exps.group_stride_bytes == dl.ffn_up_exps.group_stride_bytes) {
+            GgufMoeSwigluParams sp{(uint32_t)B, dl.ffn_gate_exps.rows, dl.ffn_gate_exps.cols,
+                                   (uint32_t)ds.top_k, dl.ffn_gate_exps.group_stride_bytes, ds.swiglu_clamp_exp};
+            [enc setComputePipelineState:impl_->pso("gguf_moe_gate_up_swiglu_mxfp4")];
+            [enc setBuffer:impl_->b_norm offset:0 atIndex:0];
+            [enc setBuffer:dl.ffn_gate_exps.buf offset:dl.ffn_gate_exps.base_offset atIndex:1];
+            [enc setBuffer:dl.ffn_up_exps.buf offset:dl.ffn_up_exps.base_offset atIndex:2];
+            [enc setBuffer:impl_->b_topk_ids offset:0 atIndex:3];
+            [enc setBuffer:impl_->b_ffn_act offset:0 atIndex:4];
+            [enc setBytes:&sp length:sizeof(sp) atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake((dl.ffn_gate_exps.rows + 3u) / 4u, (uint32_t)B * (uint32_t)ds.top_k, 1)
+                threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        } else {
+            impl_->encode_moe_indexed(enc, impl_->b_norm, dl.ffn_gate_exps, impl_->b_topk_ids, impl_->b_ffn_gate, (uint32_t)B, (uint32_t)ds.top_k);
+            impl_->encode_moe_indexed(enc, impl_->b_norm, dl.ffn_up_exps, impl_->b_topk_ids, impl_->b_ffn_up, (uint32_t)B, (uint32_t)ds.top_k);
+            impl_->encode_swiglu(enc, impl_->b_ffn_gate, impl_->b_ffn_up, impl_->b_ffn_act,
+                                 (uint32_t)((size_t)B * (size_t)ds.top_k * dl.ffn_gate_exps.rows), ds.swiglu_clamp_exp);
+        }
+        if (dl.ffn_down_exps.type == GgmlType::MXFP4) {
+            GgufMoeParams mp{(uint32_t)B, dl.ffn_down_exps.rows, dl.ffn_down_exps.cols,
+                             (uint32_t)ds.top_k, dl.ffn_down_exps.group_stride_bytes};
+            [enc setComputePipelineState:impl_->pso("gguf_moe_down_accum_mxfp4_4r")];
+            [enc setBuffer:impl_->b_ffn_act offset:0 atIndex:0];
+            [enc setBuffer:dl.ffn_down_exps.buf offset:dl.ffn_down_exps.base_offset atIndex:1];
+            [enc setBuffer:impl_->b_topk_ids offset:0 atIndex:2];
+            [enc setBuffer:impl_->b_topk_w offset:0 atIndex:3];
+            [enc setBuffer:impl_->b_sub_out offset:0 atIndex:4];
+            [enc setBytes:&mp length:sizeof(mp) atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake((dl.ffn_down_exps.rows + 7u) / 8u, (uint32_t)B, 1)
+                threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        } else {
+            impl_->encode_moe_down_accum(enc, impl_->b_ffn_act, dl.ffn_down_exps, impl_->b_topk_ids, impl_->b_topk_w,
+                                         impl_->b_sub_out, (uint32_t)B, (uint32_t)ds.top_k);
+        }
 
         impl_->encode_hc_post(enc, impl_->b_sub_out, impl_->b_streams_a, impl_->b_hc_post, impl_->b_hc_comb,
                               impl_->b_streams_b, (uint32_t)B, (uint32_t)D, hc);

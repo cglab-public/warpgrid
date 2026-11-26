@@ -2847,20 +2847,20 @@ inline float gguf_iq1s_sub32_h(device const uchar* blk, uint ib, half4 v0, half4
     float dl = d * float(2u * ((uint(qh) >> 12) & 7u) + 1u);
     float delta = (qh & 0x8000u) ? (-1.0f - 0.125f) : (-1.0f + 0.125f);
     uchar4 qs4 = uchar4(*reinterpret_cast<device const packed_uchar4*>(blk + 2u + ib * 4u));
-    half s = half(0.0h);
+    float s = 0.0f;
     #define IQ1S_GH(L, QBYTE, VA, VB) do { \
         uint idx = uint(QBYTE) | (((uint(qh) >> (3u * (L))) & 7u) << 8); \
         uint pk = kGgufIq1sGridGpu[idx]; \
         uint b0 = pk & 0xFFu, b1 = (pk >> 8) & 0xFFu, b2 = (pk >> 16) & 0xFFu, b3 = (pk >> 24) & 0xFFu; \
-        s += dot((VA), half4(half(b0 & 0x0Fu), half(b1 & 0x0Fu), half(b2 & 0x0Fu), half(b3 & 0x0Fu))) \
-           + dot((VB), half4(half(b0 >> 4), half(b1 >> 4), half(b2 >> 4), half(b3 >> 4))); \
+        s += float(dot((VA), half4(half(b0 & 0x0Fu), half(b1 & 0x0Fu), half(b2 & 0x0Fu), half(b3 & 0x0Fu)))) \
+           + float(dot((VB), half4(half(b0 >> 4), half(b1 >> 4), half(b2 >> 4), half(b3 >> 4)))); \
     } while (0)
     IQ1S_GH(0u, qs4.x, v0, v1);
     IQ1S_GH(1u, qs4.y, v2, v3);
     IQ1S_GH(2u, qs4.z, v4, v5);
     IQ1S_GH(3u, qs4.w, v6, v7);
     #undef IQ1S_GH
-    return dl * fma(delta, sumy, float(s));
+    return dl * fma(delta, sumy, s);
 }
 
 kernel void gguf_moe_gate_up_swiglu_iq1_s(
@@ -3810,3 +3810,187 @@ kernel void gguf_gemv_q6_k_multi(
         if (lane == 0u) Y[ulong(m) * p.N + n] = out;
     }
 }
+
+
+kernel void gguf_grouped_gemv_q8_0_fast(
+    device const float* X [[buffer(0)]],
+    device const uchar* W [[buffer(1)]],
+    device float* Y [[buffer(2)]],
+    constant GgufGroupedGemvParams& p [[buffer(3)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    uint tg_idx = tgid.y;
+    uint sg = tid >> 5;
+    uint lane = tid & 31u;
+    uint n0 = tgid.x * 4u + sg * 2u;
+    if (tg_idx >= p.T * p.G || n0 >= p.N) return;
+    uint g = tg_idx % p.G;
+    uint nb = p.K >> 5;
+    ulong row_bytes = ulong(nb) * 34ul;
+    bool has_r1 = (n0 + 1u < p.N);
+    device const float* x_row = X + ulong(tg_idx) * p.K;
+    device const uchar* w0 = W + ulong(g) * ulong(p.group_stride_bytes) + ulong(n0) * row_bytes;
+    device const uchar* w1 = has_r1 ? (w0 + row_bytes) : w0;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    for (uint b = lane; b < nb; b += 32u) {
+        device const float4* xp4 = reinterpret_cast<device const float4*>(x_row + (b << 5));
+        float4 v0 = xp4[0], v1 = xp4[1], v2 = xp4[2], v3 = xp4[3];
+        float4 v4 = xp4[4], v5 = xp4[5], v6 = xp4[6], v7 = xp4[7];
+        ulong boff = ulong(b) * 34ul;
+        {
+            device const uchar* blk = w0 + boff;
+            float d = gguf_load_f16(blk);
+            device const char* q = reinterpret_cast<device const char*>(blk + 2u);
+            float s = dot(v0, float4(q[0], q[1], q[2], q[3]))
+                    + dot(v1, float4(q[4], q[5], q[6], q[7]))
+                    + dot(v2, float4(q[8], q[9], q[10], q[11]))
+                    + dot(v3, float4(q[12], q[13], q[14], q[15]))
+                    + dot(v4, float4(q[16], q[17], q[18], q[19]))
+                    + dot(v5, float4(q[20], q[21], q[22], q[23]))
+                    + dot(v6, float4(q[24], q[25], q[26], q[27]))
+                    + dot(v7, float4(q[28], q[29], q[30], q[31]));
+            acc0 = fma(d, s, acc0);
+        }
+        if (has_r1) {
+            device const uchar* blk = w1 + boff;
+            float d = gguf_load_f16(blk);
+            device const char* q = reinterpret_cast<device const char*>(blk + 2u);
+            float s = dot(v0, float4(q[0], q[1], q[2], q[3]))
+                    + dot(v1, float4(q[4], q[5], q[6], q[7]))
+                    + dot(v2, float4(q[8], q[9], q[10], q[11]))
+                    + dot(v3, float4(q[12], q[13], q[14], q[15]))
+                    + dot(v4, float4(q[16], q[17], q[18], q[19]))
+                    + dot(v5, float4(q[20], q[21], q[22], q[23]))
+                    + dot(v6, float4(q[24], q[25], q[26], q[27]))
+                    + dot(v7, float4(q[28], q[29], q[30], q[31]));
+            acc1 = fma(d, s, acc1);
+        }
+    }
+    float out0 = simd_sum(acc0);
+    float out1 = simd_sum(acc1);
+    if (lane == 0u) {
+        ulong yb = ulong(tg_idx) * p.N;
+        Y[yb + n0] = out0;
+        if (has_r1) Y[yb + n0 + 1u] = out1;
+    }
+}
+
+inline float gguf_mxfp4_sub32(device const uchar* blk, float4 v0, float4 v1, float4 v2, float4 v3, float4 v4, float4 v5, float4 v6, float4 v7) {
+    float sc = gguf_e8m0_to_f32(blk[0]);
+    device const uchar* qs = blk + 1u;
+    float s = 0.0f;
+    uchar q0 = qs[0], q1 = qs[1], q2 = qs[2], q3 = qs[3];
+    s += dot(v0, float4(kGgufE2M1Lut[q0 & 0x0Fu], kGgufE2M1Lut[q1 & 0x0Fu], kGgufE2M1Lut[q2 & 0x0Fu], kGgufE2M1Lut[q3 & 0x0Fu]));
+    s += dot(v4, float4(kGgufE2M1Lut[q0 >> 4], kGgufE2M1Lut[q1 >> 4], kGgufE2M1Lut[q2 >> 4], kGgufE2M1Lut[q3 >> 4]));
+    uchar q4 = qs[4], q5 = qs[5], q6 = qs[6], q7 = qs[7];
+    s += dot(v1, float4(kGgufE2M1Lut[q4 & 0x0Fu], kGgufE2M1Lut[q5 & 0x0Fu], kGgufE2M1Lut[q6 & 0x0Fu], kGgufE2M1Lut[q7 & 0x0Fu]));
+    s += dot(v5, float4(kGgufE2M1Lut[q4 >> 4], kGgufE2M1Lut[q5 >> 4], kGgufE2M1Lut[q6 >> 4], kGgufE2M1Lut[q7 >> 4]));
+    uchar q8 = qs[8], q9 = qs[9], q10 = qs[10], q11 = qs[11];
+    s += dot(v2, float4(kGgufE2M1Lut[q8 & 0x0Fu], kGgufE2M1Lut[q9 & 0x0Fu], kGgufE2M1Lut[q10 & 0x0Fu], kGgufE2M1Lut[q11 & 0x0Fu]));
+    s += dot(v6, float4(kGgufE2M1Lut[q8 >> 4], kGgufE2M1Lut[q9 >> 4], kGgufE2M1Lut[q10 >> 4], kGgufE2M1Lut[q11 >> 4]));
+    uchar q12 = qs[12], q13 = qs[13], q14 = qs[14], q15 = qs[15];
+    s += dot(v3, float4(kGgufE2M1Lut[q12 & 0x0Fu], kGgufE2M1Lut[q13 & 0x0Fu], kGgufE2M1Lut[q14 & 0x0Fu], kGgufE2M1Lut[q15 & 0x0Fu]));
+    s += dot(v7, float4(kGgufE2M1Lut[q12 >> 4], kGgufE2M1Lut[q13 >> 4], kGgufE2M1Lut[q14 >> 4], kGgufE2M1Lut[q15 >> 4]));
+    return sc * s;
+}
+
+kernel void gguf_moe_gate_up_swiglu_mxfp4(
+    device const float* X [[buffer(0)]],
+    device const uchar* Wg [[buffer(1)]],
+    device const uchar* Wu [[buffer(2)]],
+    device const int* topk_ids [[buffer(3)]],
+    device float* Y [[buffer(4)]],
+    constant GgufMoeSwigluParams& p [[buffer(5)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    uint tr = tgid.y;
+    uint sg = tid >> 5;
+    uint lane = tid & 31u;
+    uint n0 = tgid.x * 4u + sg * 2u;
+    if (tr >= p.T * p.top_k || n0 >= p.N) return;
+    bool has_r1 = (n0 + 1u < p.N);
+    int e_id = topk_ids[tr];
+    if (e_id < 0) {
+        if (lane == 0u) {
+            Y[ulong(tr) * p.N + n0] = 0.0f;
+            if (has_r1) Y[ulong(tr) * p.N + n0 + 1u] = 0.0f;
+        }
+        return;
+    }
+    uint t = tr / p.top_k;
+    uint nb = p.K >> 5;
+    ulong row_bytes = ulong(nb) * 17ul;
+    ulong e_off = ulong(uint(e_id)) * ulong(p.expert_stride_bytes) + ulong(n0) * row_bytes;
+    device const float* x_row = X + ulong(t) * p.K;
+    float ga0 = 0.0f, ga1 = 0.0f;
+    float ua0 = 0.0f, ua1 = 0.0f;
+    for (uint b = lane; b < nb; b += 32u) {
+        device const float4* xp4 = reinterpret_cast<device const float4*>(x_row + (b << 5));
+        float4 v0 = xp4[0], v1 = xp4[1], v2 = xp4[2], v3 = xp4[3];
+        float4 v4 = xp4[4], v5 = xp4[5], v6 = xp4[6], v7 = xp4[7];
+        ulong boff = e_off + ulong(b) * 17ul;
+        ga0 += gguf_mxfp4_sub32(Wg + boff, v0, v1, v2, v3, v4, v5, v6, v7);
+        ua0 += gguf_mxfp4_sub32(Wu + boff, v0, v1, v2, v3, v4, v5, v6, v7);
+        if (has_r1) {
+            ga1 += gguf_mxfp4_sub32(Wg + boff + row_bytes, v0, v1, v2, v3, v4, v5, v6, v7);
+            ua1 += gguf_mxfp4_sub32(Wu + boff + row_bytes, v0, v1, v2, v3, v4, v5, v6, v7);
+        }
+    }
+    float gv0 = simd_sum(ga0), uv0 = simd_sum(ua0);
+    float gv1 = simd_sum(ga1), uv1 = simd_sum(ua1);
+    if (lane == 0u) {
+        if (p.clamp_val > 0.0f) {
+            gv0 = clamp(gv0, -p.clamp_val, p.clamp_val);
+            uv0 = clamp(uv0, -p.clamp_val, p.clamp_val);
+            gv1 = clamp(gv1, -p.clamp_val, p.clamp_val);
+            uv1 = clamp(uv1, -p.clamp_val, p.clamp_val);
+        }
+        Y[ulong(tr) * p.N + n0] = (gv0 / (1.0f + exp(-gv0))) * uv0;
+        if (has_r1) Y[ulong(tr) * p.N + n0 + 1u] = (gv1 / (1.0f + exp(-gv1))) * uv1;
+    }
+}
+
+kernel void gguf_moe_down_accum_mxfp4_4r(
+    device const float* X [[buffer(0)]],
+    device const uchar* W [[buffer(1)]],
+    device const int* topk_ids [[buffer(2)]],
+    device const float* topk_w [[buffer(3)]],
+    device float* Y [[buffer(4)]],
+    constant GgufMoeParams& p [[buffer(5)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    uint t = tgid.y;
+    uint sg = tid >> 5;
+    uint lane = tid & 31u;
+    uint n0 = tgid.x * 8u + sg * 4u;
+    if (t >= p.T || n0 >= p.N) return;
+    uint nb = p.K >> 5;
+    ulong row_bytes = ulong(nb) * 17ul;
+    uint cnt = min(4u, p.N - n0);
+    float tot[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint r_exp = 0u; r_exp < p.top_k; ++r_exp) {
+        uint tr = t * p.top_k + r_exp;
+        int e_id = topk_ids[tr];
+        if (e_id < 0) continue;
+        float gw = topk_w[tr];
+        ulong e_off = ulong(uint(e_id)) * ulong(p.expert_stride_bytes) + ulong(n0) * row_bytes;
+        device const float* x_row = X + ulong(tr) * p.K;
+        float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (uint b = lane; b < nb; b += 32u) {
+            device const float4* xp4 = reinterpret_cast<device const float4*>(x_row + (b << 5));
+            float4 v0 = xp4[0], v1 = xp4[1], v2 = xp4[2], v3 = xp4[3];
+            float4 v4 = xp4[4], v5 = xp4[5], v6 = xp4[6], v7 = xp4[7];
+            ulong boff = e_off + ulong(b) * 17ul;
+            for (uint r = 0u; r < cnt; ++r) {
+                acc[r] += gguf_mxfp4_sub32(W + boff + ulong(r) * row_bytes, v0, v1, v2, v3, v4, v5, v6, v7);
+            }
+        }
+        for (uint r = 0u; r < cnt; ++r) tot[r] = fma(gw, acc[r], tot[r]);
+    }
+    for (uint r = 0u; r < cnt; ++r) {
+        float s = simd_sum(tot[r]);
+        if (lane == 0u) Y[ulong(t) * p.N + n0 + r] += s;
+    }
+}
+

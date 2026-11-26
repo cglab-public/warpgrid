@@ -1298,6 +1298,159 @@ static void test_ds_dspark_and_multi_gemv_parity() {
     }
 }
 
+static void test_ds_grouped_moe_and_mxfp4_fused_parity() {
+    {
+        struct GgufGroupedGemvParams { uint32_t T; uint32_t G; uint32_t N; uint32_t K; uint32_t group_stride_bytes; };
+        const uint32_t T = 3, G = 4, N = 14, K = 256;
+        const uint32_t nb = K / 32;
+        const uint32_t g_stride = N * nb * 34;
+        std::vector<float> x((size_t)T * G * K);
+        for (size_t i = 0; i < x.size(); ++i) x[i] = std::sin((float)(i + 1) * 0.041f);
+        std::vector<uint8_t> w((size_t)G * g_stride, 0);
+        for (uint32_t g = 0; g < G; ++g) {
+            for (uint32_t n = 0; n < N; ++n) {
+                for (uint32_t b = 0; b < nb; ++b) {
+                    uint8_t* blk = w.data() + (size_t)g * g_stride + ((size_t)n * nb + b) * 34;
+                    uint16_t d = f32_to_f16_bits(0.025f);
+                    memcpy(blk, &d, 2);
+                    for (int i = 0; i < 32; ++i) ((int8_t*)(blk + 2))[i] = (int8_t)((int)((g * 11 + n * 5 + b * 7 + i * 3) % 63) - 31);
+                }
+            }
+        }
+        id<MTLComputePipelineState> pso = g_ctx.pso("gguf_grouped_gemv_q8_0_fast");
+        EXPECT_TRUE(pso != nil);
+        if (pso == nil) return;
+        id<MTLBuffer> bx = [g_ctx.dev newBufferWithBytes:x.data() length:x.size() * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bw = [g_ctx.dev newBufferWithBytes:w.data() length:w.size() options:MTLResourceStorageModeShared];
+        id<MTLBuffer> by = [g_ctx.dev newBufferWithLength:(size_t)T * G * N * sizeof(float) options:MTLResourceStorageModeShared];
+        GgufGroupedGemvParams gp{T, G, N, K, g_stride};
+        id<MTLCommandBuffer> cb = [g_ctx.q commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:bx offset:0 atIndex:0];
+        [enc setBuffer:bw offset:0 atIndex:1];
+        [enc setBuffer:by offset:0 atIndex:2];
+        [enc setBytes:&gp length:sizeof(gp) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake((N + 3u) / 4u, T * G, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        const float* Y = static_cast<const float*>(by.contents);
+        for (uint32_t t = 0; t < T; ++t) {
+            for (uint32_t g = 0; g < G; ++g) {
+                std::vector<float> xg(x.begin() + ((size_t)t * G + g) * K, x.begin() + ((size_t)t * G + g + 1) * K);
+                std::vector<uint8_t> wg(w.begin() + (size_t)g * g_stride, w.begin() + (size_t)(g + 1) * g_stride);
+                std::vector<float> yref;
+                dispatch_gguf_gemv("gguf_gemv_q8_0", xg, wg, 1, N, K, yref);
+                for (uint32_t n = 0; n < N; ++n) {
+                    EXPECT_TRUE(std::abs(Y[((size_t)t * G + g) * N + n] - yref[n]) < 1e-3f);
+                }
+            }
+        }
+    }
+    {
+        struct GgufMoeParams { uint32_t T; uint32_t N; uint32_t K; uint32_t top_k; uint32_t expert_stride_bytes; };
+        struct GgufMoeSwigluParams { uint32_t T; uint32_t N; uint32_t K; uint32_t top_k; uint32_t expert_stride_bytes; float clamp_val; };
+        const uint32_t T = 3, E = 4, top_k = 2, D = 256, I = 128;
+        const uint32_t gu_stride = I * (D / 32) * 17;
+        const uint32_t d_stride = D * (I / 32) * 17;
+        std::vector<float> x((size_t)T * D);
+        for (size_t i = 0; i < x.size(); ++i) x[i] = std::cos((float)(i + 2) * 0.037f);
+        std::vector<uint8_t> wg((size_t)E * gu_stride), wu((size_t)E * gu_stride), wd((size_t)E * d_stride);
+        for (size_t i = 0; i < wg.size(); ++i) { wg[i] = (uint8_t)((i * 37 + 13) & 0xFFu); wu[i] = (uint8_t)((i * 53 + 7) & 0xFFu); }
+        for (size_t i = 0; i < wd.size(); ++i) wd[i] = (uint8_t)((i * 29 + 19) & 0xFFu);
+        for (uint32_t e = 0; e < E; ++e) {
+            for (uint32_t r = 0; r < I; ++r) {
+                for (uint32_t b = 0; b < D / 32; ++b) {
+                    wg[(size_t)e * gu_stride + ((size_t)r * (D / 32) + b) * 17] = 125;
+                    wu[(size_t)e * gu_stride + ((size_t)r * (D / 32) + b) * 17] = 125;
+                }
+            }
+            for (uint32_t r = 0; r < D; ++r) {
+                for (uint32_t b = 0; b < I / 32; ++b) {
+                    wd[(size_t)e * d_stride + ((size_t)r * (I / 32) + b) * 17] = 125;
+                }
+            }
+        }
+        std::vector<int32_t> tids = {0, 2, 2, 1, 0, 3};
+        std::vector<float> tw = {0.6f, 0.4f, 0.7f, 0.3f, 0.55f, 0.45f};
+        id<MTLComputePipelineState> p_gu = g_ctx.pso("gguf_moe_gate_up_swiglu_mxfp4");
+        id<MTLComputePipelineState> p_dn = g_ctx.pso("gguf_moe_down_accum_mxfp4_4r");
+        EXPECT_TRUE(p_gu != nil && p_dn != nil);
+        if (p_gu == nil || p_dn == nil) return;
+        id<MTLBuffer> bx = [g_ctx.dev newBufferWithBytes:x.data() length:x.size() * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bwg = [g_ctx.dev newBufferWithBytes:wg.data() length:wg.size() options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bwu = [g_ctx.dev newBufferWithBytes:wu.data() length:wu.size() options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bwd = [g_ctx.dev newBufferWithBytes:wd.data() length:wd.size() options:MTLResourceStorageModeShared];
+        id<MTLBuffer> btids = [g_ctx.dev newBufferWithBytes:tids.data() length:tids.size() * sizeof(int32_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> btw = [g_ctx.dev newBufferWithBytes:tw.data() length:tw.size() * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bact = [g_ctx.dev newBufferWithLength:(size_t)T * top_k * I * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> by_new = [g_ctx.dev newBufferWithLength:(size_t)T * D * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> by_ref = [g_ctx.dev newBufferWithLength:(size_t)T * D * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bg_ref = [g_ctx.dev newBufferWithLength:(size_t)T * top_k * I * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bu_ref = [g_ctx.dev newBufferWithLength:(size_t)T * top_k * I * sizeof(float) options:MTLResourceStorageModeShared];
+        memset(by_new.contents, 0, by_new.length);
+        memset(by_ref.contents, 0, by_ref.length);
+        GgufMoeSwigluParams sp{T, I, D, top_k, gu_stride, 10.0f};
+        GgufMoeParams mp_gu{T, I, D, top_k, gu_stride};
+        GgufMoeParams mp_dn{T, D, I, top_k, d_stride};
+        id<MTLCommandBuffer> cb = [g_ctx.q commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:p_gu];
+        [enc setBuffer:bx offset:0 atIndex:0];
+        [enc setBuffer:bwg offset:0 atIndex:1];
+        [enc setBuffer:bwu offset:0 atIndex:2];
+        [enc setBuffer:btids offset:0 atIndex:3];
+        [enc setBuffer:bact offset:0 atIndex:4];
+        [enc setBytes:&sp length:sizeof(sp) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake((I + 3u) / 4u, T * top_k, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        [enc setComputePipelineState:p_dn];
+        [enc setBuffer:bact offset:0 atIndex:0];
+        [enc setBuffer:bwd offset:0 atIndex:1];
+        [enc setBuffer:btids offset:0 atIndex:2];
+        [enc setBuffer:btw offset:0 atIndex:3];
+        [enc setBuffer:by_new offset:0 atIndex:4];
+        [enc setBytes:&mp_dn length:sizeof(mp_dn) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake((D + 7u) / 8u, T, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        [enc setComputePipelineState:g_ctx.pso("gguf_moe_indexed_mxfp4")];
+        [enc setBuffer:bx offset:0 atIndex:0];
+        [enc setBuffer:bwg offset:0 atIndex:1];
+        [enc setBuffer:btids offset:0 atIndex:2];
+        [enc setBuffer:bg_ref offset:0 atIndex:3];
+        [enc setBytes:&mp_gu length:sizeof(mp_gu) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake((I + 3u) / 4u, T * top_k, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [enc setBuffer:bwu offset:0 atIndex:1];
+        [enc setBuffer:bu_ref offset:0 atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake((I + 3u) / 4u, T * top_k, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        float* gr = static_cast<float*>(bg_ref.contents);
+        const float* ur = static_cast<const float*>(bu_ref.contents);
+        for (size_t i = 0; i < (size_t)T * top_k * I; ++i) {
+            float gv = std::clamp(gr[i], -10.0f, 10.0f);
+            float uv = std::clamp(ur[i], -10.0f, 10.0f);
+            gr[i] = (gv / (1.0f + std::exp(-gv))) * uv;
+        }
+        cb = [g_ctx.q commandBuffer];
+        enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:g_ctx.pso("gguf_moe_down_accum_mxfp4")];
+        [enc setBuffer:bg_ref offset:0 atIndex:0];
+        [enc setBuffer:bwd offset:0 atIndex:1];
+        [enc setBuffer:btids offset:0 atIndex:2];
+        [enc setBuffer:btw offset:0 atIndex:3];
+        [enc setBuffer:by_ref offset:0 atIndex:4];
+        [enc setBytes:&mp_dn length:sizeof(mp_dn) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake((D + 3u) / 4u, T, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        const float* yn = static_cast<const float*>(by_new.contents);
+        const float* yr = static_cast<const float*>(by_ref.contents);
+        for (size_t i = 0; i < (size_t)T * D; ++i) EXPECT_TRUE(std::abs(yn[i] - yr[i]) <= 2e-3f + 5e-3f * std::abs(yr[i]));
+    }
+}
+
 int main() {
     @autoreleasepool {
         if (!g_ctx.init()) {
@@ -1322,6 +1475,7 @@ int main() {
         run_test("test_ds_csa_hca_causal_attention", test_ds_csa_hca_causal_attention);
         run_test("test_gguf_gemm_tiled_and_smallk_parity", test_gguf_gemm_tiled_and_smallk_parity);
         run_test("test_ds_dspark_and_multi_gemv_parity", test_ds_dspark_and_multi_gemv_parity);
+        run_test("test_ds_grouped_moe_and_mxfp4_fused_parity", test_ds_grouped_moe_and_mxfp4_fused_parity);
         printf("GGUF Metal kernel tests: %d passed, %d failed\n", g_passed, g_failed);
         return g_failed == 0 ? 0 : 1;
     }
