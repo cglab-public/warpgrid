@@ -93,6 +93,11 @@ public:
         (void)slot_id;
     }
 
+    virtual int draft_tokens_adaptive(int32_t anchor_tok, int anchor_pos, int max_draft, int32_t* h_out_drafts, int slot_id = 0) {
+        draft_tokens(anchor_tok, anchor_pos, max_draft, h_out_drafts, slot_id);
+        return max_draft;
+    }
+
     virtual void forward_logits(const int32_t* h_tokens, int T, int start_pos, std::vector<float>& h_logits, int slot_id = 0) = 0;
 
     virtual void reset_profile() {}

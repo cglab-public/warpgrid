@@ -4098,3 +4098,47 @@ kernel void ds_kv_write_f32(
         csc_dst[dst] = csc_in[src];
     }
 }
+
+
+struct DsDsparkConfParams {
+    uint B;
+    uint D;
+    uint R;
+    uint V;
+};
+
+kernel void ds_dspark_conf_f32(
+    device const float* hc_out [[buffer(0)]],
+    device const ushort* W1 [[buffer(1)]],
+    device const float* conf_proj [[buffer(2)]],
+    device const int* prev_toks [[buffer(3)]],
+    device float* out_conf [[buffer(4)]],
+    constant DsDsparkConfParams& p [[buffer(5)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tptg [[threads_per_threadgroup]]) {
+    uint b = tgid;
+    if (b >= p.B) return;
+    int prev = prev_toks[b];
+    uint pt = (prev >= 0 && uint(prev) < p.V) ? uint(prev) : 0u;
+    device const float* hp = hc_out + ulong(b) * p.D;
+    device const ushort* w1p = W1 + ulong(pt) * p.R;
+    float acc = 0.0f;
+    for (uint d = tid; d < p.D; d += tptg) {
+        acc = fma(hp[d], conf_proj[d], acc);
+    }
+    for (uint r = tid; r < p.R; r += tptg) {
+        float wv = as_type<float>(uint(w1p[r]) << 16);
+        acc = fma(wv, conf_proj[p.D + r], acc);
+    }
+    threadgroup float s_sum[256];
+    s_sum[tid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tptg >> 1; stride > 0u; stride >>= 1) {
+        if (tid < stride) s_sum[tid] += s_sum[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) {
+        out_conf[b] = 1.0f / (1.0f + exp(-s_sum[0]));
+    }
+}

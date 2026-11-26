@@ -466,7 +466,7 @@ class OpenAIServer {
                     active.clear();
                     continue;
                 }
-                model_.draft_tokens(r->last_tok, r->pos, cur_k, drafts, 0);
+                cur_k = model_.draft_tokens_adaptive(r->last_tok, r->pos, cur_k, drafts, 0);
                 verify_in[0] = r->last_tok;
                 for (int j = 0; j < cur_k; ++j) verify_in[j + 1] = drafts[j];
                 model_.forward_verify_greedy(verify_in, cur_k + 1, r->pos, verify_out);

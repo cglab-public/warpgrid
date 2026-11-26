@@ -1576,6 +1576,49 @@ static void test_ds_attn_router_fast_kernels_parity() {
     }
 }
 
+static void test_ds_dspark_conf_head_parity() {
+    struct DsDsparkConfParams { uint32_t B; uint32_t D; uint32_t R; uint32_t V; };
+    const uint32_t B = 4, D = 64, R = 16, V = 32;
+    auto f32_to_bf16 = [](float f) -> uint16_t { uint32_t u; memcpy(&u, &f, 4); return (uint16_t)(u >> 16); };
+    auto bf16_to_f32 = [](uint16_t b) -> float { uint32_t u = (uint32_t)b << 16; float f; memcpy(&f, &u, 4); return f; };
+    std::vector<float> h((size_t)B * D), proj((size_t)(D + R));
+    std::vector<uint16_t> w1((size_t)V * R);
+    std::vector<int32_t> toks = {3, 11, 0, 27};
+    for (size_t i = 0; i < h.size(); ++i) h[i] = std::sin((float)(i + 1) * 0.09f);
+    for (size_t i = 0; i < proj.size(); ++i) proj[i] = std::cos((float)(i + 2) * 0.07f) * 0.2f;
+    for (size_t i = 0; i < w1.size(); ++i) w1[i] = f32_to_bf16(std::sin((float)(i + 5) * 0.11f));
+    id<MTLComputePipelineState> pso = g_ctx.pso("ds_dspark_conf_f32");
+    EXPECT_TRUE(pso != nil);
+    if (pso == nil) return;
+    id<MTLBuffer> bh = [g_ctx.dev newBufferWithBytes:h.data() length:h.size() * sizeof(float) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> bw1 = [g_ctx.dev newBufferWithBytes:w1.data() length:w1.size() * sizeof(uint16_t) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> bproj = [g_ctx.dev newBufferWithBytes:proj.data() length:proj.size() * sizeof(float) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> btok = [g_ctx.dev newBufferWithBytes:toks.data() length:toks.size() * sizeof(int32_t) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> bout = [g_ctx.dev newBufferWithLength:B * sizeof(float) options:MTLResourceStorageModeShared];
+    DsDsparkConfParams cp{B, D, R, V};
+    id<MTLCommandBuffer> cb = [g_ctx.q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:bh offset:0 atIndex:0];
+    [enc setBuffer:bw1 offset:0 atIndex:1];
+    [enc setBuffer:bproj offset:0 atIndex:2];
+    [enc setBuffer:btok offset:0 atIndex:3];
+    [enc setBuffer:bout offset:0 atIndex:4];
+    [enc setBytes:&cp length:sizeof(cp) atIndex:5];
+    [enc dispatchThreadgroups:MTLSizeMake(B, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [enc endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    const float* out = static_cast<const float*>(bout.contents);
+    for (uint32_t b = 0; b < B; ++b) {
+        float acc = 0.0f;
+        for (uint32_t d = 0; d < D; ++d) acc += h[(size_t)b * D + d] * proj[d];
+        for (uint32_t r = 0; r < R; ++r) acc += bf16_to_f32(w1[(size_t)toks[b] * R + r]) * proj[D + r];
+        float ref = 1.0f / (1.0f + std::exp(-acc));
+        EXPECT_TRUE(std::abs(out[b] - ref) < 1e-5f);
+    }
+}
+
 int main() {
     @autoreleasepool {
         if (!g_ctx.init()) {
@@ -1602,6 +1645,7 @@ int main() {
         run_test("test_ds_dspark_and_multi_gemv_parity", test_ds_dspark_and_multi_gemv_parity);
         run_test("test_ds_grouped_moe_and_mxfp4_fused_parity", test_ds_grouped_moe_and_mxfp4_fused_parity);
         run_test("test_ds_attn_router_fast_kernels_parity", test_ds_attn_router_fast_kernels_parity);
+        run_test("test_ds_dspark_conf_head_parity", test_ds_dspark_conf_head_parity);
         printf("GGUF Metal kernel tests: %d passed, %d failed\n", g_passed, g_failed);
         return g_failed == 0 ? 0 : 1;
     }

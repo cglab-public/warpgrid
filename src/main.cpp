@@ -44,7 +44,7 @@ int main(int argc, char** argv) {
             auto ds = std::make_unique<ink::DeepSeekV41Model>();
             ds->engram_path = opts.engram_path;
             ds->dspark_path = opts.dspark_path;
-            ds->draft_k = opts.dspark_path.empty() ? 0 : (opts.draft_k > 0 ? opts.draft_k : 3);
+            ds->draft_k = opts.dspark_path.empty() ? 0 : (opts.draft_k > 0 ? opts.draft_k : 5);
             ds->load(opts.model_dir, opts.max_seq, opts.max_chunk, opts.max_slots);
             ds->load_tokenizer(tok);
             model = std::move(ds);
@@ -148,7 +148,7 @@ int main(int argc, char** argv) {
                     if (cur_k <= 0) break;
 
                     auto s0 = std::chrono::steady_clock::now();
-                    model->draft_tokens(next_tok, pos, cur_k, drafts, 0);
+                    cur_k = model->draft_tokens_adaptive(next_tok, pos, cur_k, drafts, 0);
                     auto s1 = std::chrono::steady_clock::now();
                     verify_in[0] = next_tok;
                     for (int j = 0; j < cur_k; ++j) verify_in[j + 1] = drafts[j];

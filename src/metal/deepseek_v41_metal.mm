@@ -175,6 +175,13 @@ struct DsKvWriteParams {
     uint32_t write_comp;
 };
 
+struct DsDsparkConfParams {
+    uint32_t B;
+    uint32_t D;
+    uint32_t R;
+    uint32_t V;
+};
+
 struct WeightBuf {
     id<MTLBuffer> buf = nil;
     size_t base_offset = 0;
@@ -476,6 +483,8 @@ struct DeepSeekV41Model::Impl {
         id<MTLBuffer> output_norm = nil;
         WeightBuf markov_w1;
         WeightBuf markov_w2;
+        id<MTLBuffer> conf_proj = nil;
+        float conf_thresh = 0.45f;
         std::vector<DsparkLayer> layers;
         std::vector<id<MTLBuffer>> kv_rings;
         id<MTLBuffer> b_taps = nil;
@@ -483,6 +492,7 @@ struct DeepSeekV41Model::Impl {
         id<MTLBuffer> b_logits_blk = nil;
         id<MTLBuffer> b_markov_logits = nil;
         id<MTLBuffer> b_markov_toks = nil;
+        id<MTLBuffer> b_conf = nil;
 
         void reset() {
             loaded = false;
@@ -495,11 +505,13 @@ struct DeepSeekV41Model::Impl {
             output_norm = nil;
             markov_w1 = WeightBuf{};
             markov_w2 = WeightBuf{};
+            conf_proj = nil;
             b_taps = nil;
             b_inp_g = nil;
             b_logits_blk = nil;
             b_markov_logits = nil;
             b_markov_toks = nil;
+            b_conf = nil;
             gguf.close();
         }
     } dspark;
@@ -1355,6 +1367,13 @@ void DeepSeekV41Model::load(const std::string& model_path, int max_seq, int max_
         ds.markov_w1 = impl_->load_weight_required(ds.gguf, "markov_w1.weight");
         ds.markov_w2 = impl_->load_weight_required(ds.gguf, "markov_w2.weight");
         ds.markov_rank = (int)ds.markov_w1.cols;
+        if (ds.gguf.has_tensor("conf_proj.weight")) {
+            ds.conf_proj = impl_->load_f32_required(ds.gguf, "conf_proj.weight");
+        }
+        ds.conf_thresh = 0.45f;
+        if (const char* ct = std::getenv("WARPGRID_DSPARK_CONF_THRESH")) {
+            ds.conf_thresh = (float)std::atof(ct);
+        }
         ds.layers.resize((size_t)ds.num_layers);
         ds.kv_rings.resize((size_t)ds.num_layers);
         size_t ring_bytes = (size_t)max_slots * (size_t)ds.n_swa * (size_t)ds.head_dim * sizeof(float);
@@ -1393,7 +1412,8 @@ void DeepSeekV41Model::load(const std::string& model_path, int max_seq, int max_
         ds.b_logits_blk = impl_->alloc_buf(max_blk * (size_t)cfg.vocab_size * sizeof(float));
         ds.b_markov_logits = impl_->alloc_buf((size_t)cfg.vocab_size * sizeof(float));
         ds.b_markov_toks = impl_->alloc_buf((max_blk + 1) * sizeof(int32_t));
-        if (draft_k <= 0) draft_k = 3;
+        ds.b_conf = impl_->alloc_buf(max_blk * sizeof(float));
+        if (draft_k <= 0) draft_k = ds.block_size;
         if (draft_k > ds.block_size) draft_k = ds.block_size;
         ds.loaded = true;
         fprintf(stderr, "[warpgrid] Loaded DeepSeek DSpark: %d layers, E=%d (top-%d MXFP4), swa=%d, block=%d, draft_k=%d, taps=%zu, mask=%d\n",
@@ -2487,6 +2507,18 @@ void DeepSeekV41Model::draft_tokens(int32_t anchor_tok, int anchor_pos, int num_
         [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     }
 
+    if (ds.conf_proj != nil) {
+        DsDsparkConfParams cp{(uint32_t)B, (uint32_t)D, (uint32_t)ds.markov_rank, v_sz};
+        [enc setComputePipelineState:impl_->pso("ds_dspark_conf_f32")];
+        [enc setBuffer:impl_->b_hidden offset:0 atIndex:0];
+        [enc setBuffer:ds.markov_w1.buf offset:ds.markov_w1.base_offset atIndex:1];
+        [enc setBuffer:ds.conf_proj offset:0 atIndex:2];
+        [enc setBuffer:ds.b_markov_toks offset:0 atIndex:3];
+        [enc setBuffer:ds.b_conf offset:0 atIndex:4];
+        [enc setBytes:&cp length:sizeof(cp) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake((uint32_t)B, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    }
+
     [enc endEncoding];
     [cb commit];
     [cb waitUntilCompleted];
@@ -2495,6 +2527,21 @@ void DeepSeekV41Model::draft_tokens(int32_t anchor_tok, int anchor_pos, int num_
     if (profile_stages) {
         impl_->prof.dspark_draft_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_dd0).count();
     }
+}
+
+int DeepSeekV41Model::draft_tokens_adaptive(int32_t anchor_tok, int anchor_pos, int max_draft, int32_t* h_out_drafts, int slot_id) {
+    if (!impl_->dspark.loaded || max_draft <= 0 || slot_id < 0 || slot_id >= max_slots) return 0;
+    auto& ds = impl_->dspark;
+    int B = std::clamp(max_draft, 1, ds.block_size);
+    draft_tokens(anchor_tok, anchor_pos, B, h_out_drafts, slot_id);
+    if (ds.conf_proj == nil || ds.conf_thresh <= 0.0f) return B;
+    const float* conf = static_cast<const float*>(ds.b_conf.contents);
+    int keep = 1;
+    for (int i = 1; i < B; ++i) {
+        if (conf[i] >= ds.conf_thresh) keep = i + 1;
+        else break;
+    }
+    return keep;
 }
 
 void DeepSeekV41Model::reset_profile() {

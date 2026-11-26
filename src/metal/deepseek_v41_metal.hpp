@@ -37,6 +37,7 @@ public:
     void commit_dspark_context(int count, int start_pos, int slot_id = 0, int aux_tok_offset = 0) override;
     int max_dspark_slots() const override;
     void draft_tokens(int32_t anchor_tok, int anchor_pos, int num_draft, int32_t* h_out_drafts, int slot_id = 0) override;
+    int draft_tokens_adaptive(int32_t anchor_tok, int anchor_pos, int max_draft, int32_t* h_out_drafts, int slot_id = 0) override;
 
     void forward_batch_decode_greedy(
         const int32_t* h_tokens, const int32_t* h_slots, const int32_t* h_positions,
