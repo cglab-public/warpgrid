@@ -82,6 +82,7 @@ public:
     }
 
     virtual int max_dspark_slots() const { return 0; }
+    virtual bool in_place_prefix_cache() const { return false; }
 
     virtual void draft_tokens(int32_t anchor_tok, int anchor_pos, int num_draft, int32_t* h_out_drafts, int slot_id = 0) {
         (void)anchor_tok;

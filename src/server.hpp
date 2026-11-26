@@ -321,6 +321,9 @@ class OpenAIServer {
                     if (r->max_tokens > model_.max_seq_len - plen) {
                         r->max_tokens = model_.max_seq_len - plen;
                     }
+                    if (r->cached_tokens == 0 && model_.in_place_prefix_cache()) {
+                        prefix_cache.init(model_.num_kv_blocks, model_.num_snapshots);
+                    }
                     if (!ensure_blocks(r->slot_id, plen)) {
                         if (r->hit_snap_id >= 0) {
                             prefix_cache.release_snapshot_pin(r->hit_snap_id);

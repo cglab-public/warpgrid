@@ -25,6 +25,7 @@ public:
     DeepSeekV41Model& operator=(const DeepSeekV41Model&) = delete;
 
     std::string arch_name() const override { return cfg.arch; }
+    bool in_place_prefix_cache() const override { return max_slots == 1 && num_snapshots > 0; }
 
     void load(const std::string& model_path, int max_seq = 32768, int max_chunk = 512, int n_slots = 1) override;
     void load_tokenizer(Tokenizer& tok) const;

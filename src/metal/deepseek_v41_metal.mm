@@ -919,7 +919,7 @@ void DeepSeekV41Model::load(const std::string& model_path, int max_seq, int max_
     impl_->b_dummy_bias = impl_->alloc_buf((size_t)std::max(1, cfg.n_routed_experts) * sizeof(float));
 
     if (max_slots == 1) {
-        num_kv_blocks = std::max(1, max_seq_len / 64);
+        num_kv_blocks = std::max(1, (max_seq_len + 63) / 64);
         num_snapshots = 1;
     }
 
