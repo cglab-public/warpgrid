@@ -990,6 +990,56 @@ static void test_deepseek_stage_profile_and_expert_usage_roundtrip() {
     EXPECT_EQ(top2b[1].second, 2);
 }
 
+static void test_deepseek_async_prewarm_state_and_yield() {
+    ink::AsyncPrewarmState st;
+    EXPECT_TRUE(!st.should_stop());
+    EXPECT_TRUE(!st.should_yield());
+    {
+        ink::AsyncPrewarmState::InferScope g1(st);
+        EXPECT_TRUE(st.should_yield());
+        {
+            ink::AsyncPrewarmState::InferScope g2(st);
+            EXPECT_TRUE(st.should_yield());
+        }
+        EXPECT_TRUE(st.should_yield());
+    }
+    EXPECT_TRUE(!st.should_yield());
+
+    std::atomic<int> work_units{0};
+    std::atomic<bool> saw_yield{false};
+    st.start([&]() {
+        while (!st.should_stop()) {
+            if (st.should_yield()) {
+                saw_yield.store(true, std::memory_order_relaxed);
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
+            }
+            {
+                std::lock_guard<std::mutex> lk(st.cache_mtx);
+                work_units.fetch_add(1, std::memory_order_relaxed);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    });
+    auto wait_until = [](auto pred, int timeout_ms) {
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        while (!pred() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return pred();
+    };
+    EXPECT_TRUE(wait_until([&]() { return work_units.load(std::memory_order_relaxed) > 0; }, 500));
+    {
+        ink::AsyncPrewarmState::InferScope g(st);
+        EXPECT_TRUE(wait_until([&]() { return saw_yield.load(std::memory_order_relaxed); }, 500));
+    }
+    st.stop_and_join();
+    EXPECT_TRUE(st.should_stop());
+    int after_stop = work_units.load();
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    EXPECT_EQ(work_units.load(), after_stop);
+}
+
 int main() {
     run_test("test_json_roundtrip_and_escaping", test_json_roundtrip_and_escaping);
     run_test("test_config_inkling2_parse", test_config_inkling2_parse);
@@ -1007,6 +1057,7 @@ int main() {
     run_test("test_engram_nvme_mmap_dequant_and_cache", test_engram_nvme_mmap_dequant_and_cache);
     run_test("test_deepseek_config_from_gguf", test_deepseek_config_from_gguf);
     run_test("test_deepseek_stage_profile_and_expert_usage_roundtrip", test_deepseek_stage_profile_and_expert_usage_roundtrip);
+    run_test("test_deepseek_async_prewarm_state_and_yield", test_deepseek_async_prewarm_state_and_yield);
     printf("Host tests: %d passed, %d failed\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;
 }

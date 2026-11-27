@@ -1,9 +1,13 @@
 #pragma once
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -133,6 +137,49 @@ struct ExpertUsageProfile {
             }
         }
         return true;
+    }
+};
+
+struct AsyncPrewarmState {
+    std::atomic<bool> stop_flag{false};
+    std::atomic<int> infer_depth{0};
+    std::mutex cache_mtx;
+    std::thread worker;
+
+    struct InferScope {
+        AsyncPrewarmState& st;
+        explicit InferScope(AsyncPrewarmState& s) : st(s) {
+            st.infer_depth.fetch_add(1, std::memory_order_acq_rel);
+        }
+        ~InferScope() {
+            st.infer_depth.fetch_sub(1, std::memory_order_acq_rel);
+        }
+        InferScope(const InferScope&) = delete;
+        InferScope& operator=(const InferScope&) = delete;
+    };
+
+    ~AsyncPrewarmState() {
+        stop_and_join();
+    }
+
+    bool should_stop() const {
+        return stop_flag.load(std::memory_order_acquire);
+    }
+
+    bool should_yield() const {
+        return infer_depth.load(std::memory_order_acquire) > 0;
+    }
+
+    template <typename Fn>
+    void start(Fn&& fn) {
+        stop_and_join();
+        stop_flag.store(false, std::memory_order_release);
+        worker = std::thread(std::forward<Fn>(fn));
+    }
+
+    void stop_and_join() {
+        stop_flag.store(true, std::memory_order_release);
+        if (worker.joinable()) worker.join();
     }
 };
 

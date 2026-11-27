@@ -283,6 +283,7 @@ struct ExpLruCache {
     std::vector<Entry> entries;
     int32_t head = -1;
     int32_t tail = -1;
+    int32_t empty_count = 0;
     uint64_t cur_gen = 0;
     uint64_t hits = 0;
     uint64_t misses = 0;
@@ -302,6 +303,7 @@ struct ExpLruCache {
         entries.clear();
         head = -1;
         tail = -1;
+        empty_count = 0;
         cur_gen = 0;
         hits = 0;
         misses = 0;
@@ -339,6 +341,41 @@ struct ExpLruCache {
         }
         head = 0;
         tail = slots - 1;
+        empty_count = slots;
+        return true;
+    }
+
+    bool contains(int layer, int32_t eid) const {
+        if (!enabled() || layer < 0 || layer >= num_layers || eid < 0 || eid >= num_experts) return false;
+        return lut[(size_t)layer * (size_t)num_experts + (size_t)eid] >= 0;
+    }
+
+    bool publish_if_empty(int layer, int32_t eid,
+                          const uint8_t* g_src, size_t gs,
+                          const uint8_t* u_src, size_t us,
+                          const uint8_t* d_src, size_t ds) {
+        if (!enabled() || empty_count <= 0 || contains(layer, eid)) return false;
+        if (gs > gu_stride || us > gu_stride || ds > d_stride) return false;
+        int32_t scan = tail;
+        while (scan >= 0 && entries[(size_t)scan].layer >= 0) {
+            scan = entries[(size_t)scan].prev;
+        }
+        if (scan < 0) {
+            empty_count = 0;
+            return false;
+        }
+        uint8_t* dst_g = static_cast<uint8_t*>(buf_g.contents);
+        uint8_t* dst_u = static_cast<uint8_t*>(buf_u.contents);
+        uint8_t* dst_d = static_cast<uint8_t*>(buf_d.contents);
+        memcpy(dst_g + (size_t)scan * gu_stride, g_src, gs);
+        memcpy(dst_u + (size_t)scan * gu_stride, u_src, us);
+        memcpy(dst_d + (size_t)scan * d_stride, d_src, ds);
+        auto& e = entries[(size_t)scan];
+        e.layer = layer;
+        e.expert = eid;
+        lut[(size_t)layer * (size_t)num_experts + (size_t)eid] = scan;
+        touch_mru(scan);
+        --empty_count;
         return true;
     }
 
@@ -384,6 +421,8 @@ struct ExpLruCache {
             auto& e = entries[(size_t)s];
             if (e.layer >= 0 && e.expert >= 0) {
                 lut[(size_t)e.layer * (size_t)num_experts + (size_t)e.expert] = -1;
+            } else if (empty_count > 0) {
+                --empty_count;
             }
             int32_t eid = uniq_ids[u];
             e.layer = layer;
@@ -528,6 +567,7 @@ struct DeepSeekV41Model::Impl {
     std::string expert_profile_path;
     bool save_expert_profile = false;
     uint64_t usage_flush_steps = 0;
+    AsyncPrewarmState prewarm;
 
     void close_nocache_fds() {
         for (int fd : nocache_fds) {
@@ -537,6 +577,7 @@ struct DeepSeekV41Model::Impl {
     }
 
     ~Impl() {
+        prewarm.stop_and_join();
         if (save_expert_profile && !expert_profile_path.empty() && usage_prof.num_layers > 0) {
             usage_prof.save_tsv(expert_profile_path);
         }
@@ -1088,6 +1129,7 @@ void DeepSeekV41Model::load_tokenizer(Tokenizer& tok) const {
 }
 
 void DeepSeekV41Model::load(const std::string& model_path, int max_seq, int max_chunk, int n_slots) {
+    impl_->prewarm.stop_and_join();
     impl_->init_metal();
     gguf.open(model_path, false);
     impl_->init_shard_buffers(gguf);
@@ -1491,61 +1533,78 @@ void DeepSeekV41Model::load(const std::string& model_path, int max_seq, int max_
             impl_->save_expert_profile = true;
         }
     }
+    bool enable_prewarm = true;
+    if (const char* pw = std::getenv("WARPGRID_DS_PREWARM")) {
+        if (pw[0] == '0' && pw[1] == '\0') enable_prewarm = false;
+    }
+    std::vector<std::pair<int, int>> hot_exps;
     if (impl_->exp_cache.enabled() && !impl_->expert_profile_path.empty() &&
         impl_->usage_prof.load_tsv(impl_->expert_profile_path)) {
-        auto top = impl_->usage_prof.top_experts((size_t)impl_->exp_cache.num_slots);
-        if (!top.empty()) {
-            auto tw0 = std::chrono::steady_clock::now();
-            std::vector<std::vector<int32_t>> by_layer((size_t)cfg.num_hidden_layers);
-            for (const auto& le : top) by_layer[(size_t)le.first].push_back(le.second);
-            struct WarmTask { int l; int slot; int eid; };
-            std::vector<WarmTask> tasks;
-            tasks.reserve(top.size());
-            std::vector<int32_t> slots_out;
-            std::vector<std::pair<int32_t, int32_t>> misses_out;
-            for (int l = 0; l < cfg.num_hidden_layers; ++l) {
-                auto& v = by_layer[(size_t)l];
-                if (v.empty()) continue;
-                impl_->exp_cache.pin_and_resolve(l, v.data(), v.size(), slots_out, misses_out);
-                for (const auto& m : misses_out) tasks.push_back({l, m.first, m.second});
+        hot_exps = impl_->usage_prof.top_experts((size_t)impl_->exp_cache.num_slots);
+    }
+    if (enable_prewarm && (impl_->dspark.loaded || !hot_exps.empty())) {
+        std::vector<std::pair<const void*, size_t>> dspark_shards;
+        if (impl_->dspark.loaded) {
+            for (size_t s = 0; s < impl_->dspark.gguf.num_shards(); ++s) {
+                const void* p = impl_->dspark.gguf.shard_mapped(s);
+                size_t sz = impl_->dspark.gguf.shard_size(s);
+                if (p && sz > 0) dspark_shards.push_back({p, sz});
             }
-            impl_->exp_cache.hits = 0;
-            impl_->exp_cache.misses = 0;
-            if (!tasks.empty()) {
-                uint8_t* dst_g = static_cast<uint8_t*>(impl_->exp_cache.buf_g.contents);
-                uint8_t* dst_u = static_cast<uint8_t*>(impl_->exp_cache.buf_u.contents);
-                uint8_t* dst_d = static_cast<uint8_t*>(impl_->exp_cache.buf_d.contents);
-                size_t c_gu = impl_->exp_cache.gu_stride;
-                size_t c_d = impl_->exp_cache.d_stride;
-                const auto* tp = tasks.data();
-                const auto* layers_p = impl_->layers.data();
-                std::atomic<bool> io_err{false};
-                std::atomic<bool>* io_err_p = &io_err;
-                dispatch_apply(tasks.size(), dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t i) {
-                    const auto& t = tp[i];
-                    const auto& lw = layers_p[(size_t)t.l];
-                    size_t slot = (size_t)t.slot;
-                    size_t eid = (size_t)t.eid;
+        }
+        Impl* impl_raw = impl_.get();
+        impl_->prewarm.start([impl_raw, dspark_shards = std::move(dspark_shards), hot_exps = std::move(hot_exps)]() {
+            constexpr size_t kChunk = 64ull * 1024ull * 1024ull;
+            for (const auto& sh : dspark_shards) {
+                const uint8_t* base = static_cast<const uint8_t*>(sh.first);
+                size_t rem = sh.second;
+                size_t off = 0;
+                while (off < rem && !impl_raw->prewarm.should_stop()) {
+                    if (impl_raw->prewarm.should_yield()) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                        continue;
+                    }
+                    size_t take = std::min<size_t>(kChunk, rem - off);
+                    ::madvise(const_cast<uint8_t*>(base + off), take, MADV_WILLNEED);
+                    off += take;
+                }
+            }
+            if (!hot_exps.empty() && impl_raw->exp_cache.enabled()) {
+                std::vector<uint8_t> tmp_g(impl_raw->exp_cache.gu_stride);
+                std::vector<uint8_t> tmp_u(impl_raw->exp_cache.gu_stride);
+                std::vector<uint8_t> tmp_d(impl_raw->exp_cache.d_stride);
+                for (const auto& le : hot_exps) {
+                    if (impl_raw->prewarm.should_stop()) break;
+                    while (impl_raw->prewarm.should_yield() && !impl_raw->prewarm.should_stop()) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    }
+                    if (impl_raw->prewarm.should_stop()) break;
+                    {
+                        std::lock_guard<std::mutex> lk(impl_raw->prewarm.cache_mtx);
+                        if (impl_raw->exp_cache.empty_count <= 0) break;
+                        if (impl_raw->exp_cache.contains(le.first, le.second)) continue;
+                    }
+                    const auto& lw = impl_raw->layers[(size_t)le.first];
+                    size_t eid = (size_t)le.second;
                     size_t gs = lw.ffn_gate_exps.group_stride_bytes;
                     size_t us = lw.ffn_up_exps.group_stride_bytes;
                     size_t ds = lw.ffn_down_exps.group_stride_bytes;
+                    if (gs > tmp_g.size() || us > tmp_u.size() || ds > tmp_d.size()) continue;
                     bool ok = true;
-                    if (lw.ffn_gate_exps.nocache_fd >= 0) ok = ok && pread_all(lw.ffn_gate_exps.nocache_fd, dst_g + slot * c_gu, gs, (off_t)(lw.ffn_gate_exps.file_offset + eid * gs));
-                    else if (lw.ffn_gate_exps.raw_data) memcpy(dst_g + slot * c_gu, lw.ffn_gate_exps.raw_data + eid * gs, gs);
-                    if (lw.ffn_up_exps.nocache_fd >= 0) ok = ok && pread_all(lw.ffn_up_exps.nocache_fd, dst_u + slot * c_gu, us, (off_t)(lw.ffn_up_exps.file_offset + eid * us));
-                    else if (lw.ffn_up_exps.raw_data) memcpy(dst_u + slot * c_gu, lw.ffn_up_exps.raw_data + eid * us, us);
-                    if (lw.ffn_down_exps.nocache_fd >= 0) ok = ok && pread_all(lw.ffn_down_exps.nocache_fd, dst_d + slot * c_d, ds, (off_t)(lw.ffn_down_exps.file_offset + eid * ds));
-                    else if (lw.ffn_down_exps.raw_data) memcpy(dst_d + slot * c_d, lw.ffn_down_exps.raw_data + eid * ds, ds);
-                    if (!ok) io_err_p->store(true, std::memory_order_relaxed);
-                });
-                if (io_err.load(std::memory_order_relaxed)) {
-                    throw std::runtime_error("pread failed during expert cache pre-warm");
+                    if (lw.ffn_gate_exps.nocache_fd >= 0) ok = ok && pread_all(lw.ffn_gate_exps.nocache_fd, tmp_g.data(), gs, (off_t)(lw.ffn_gate_exps.file_offset + eid * gs));
+                    else if (lw.ffn_gate_exps.raw_data) memcpy(tmp_g.data(), lw.ffn_gate_exps.raw_data + eid * gs, gs);
+                    else ok = false;
+                    if (lw.ffn_up_exps.nocache_fd >= 0) ok = ok && pread_all(lw.ffn_up_exps.nocache_fd, tmp_u.data(), us, (off_t)(lw.ffn_up_exps.file_offset + eid * us));
+                    else if (lw.ffn_up_exps.raw_data) memcpy(tmp_u.data(), lw.ffn_up_exps.raw_data + eid * us, us);
+                    else ok = false;
+                    if (lw.ffn_down_exps.nocache_fd >= 0) ok = ok && pread_all(lw.ffn_down_exps.nocache_fd, tmp_d.data(), ds, (off_t)(lw.ffn_down_exps.file_offset + eid * ds));
+                    else if (lw.ffn_down_exps.raw_data) memcpy(tmp_d.data(), lw.ffn_down_exps.raw_data + eid * ds, ds);
+                    else ok = false;
+                    if (!ok || impl_raw->prewarm.should_stop()) continue;
+                    std::lock_guard<std::mutex> lk(impl_raw->prewarm.cache_mtx);
+                    impl_raw->exp_cache.publish_if_empty(le.first, le.second, tmp_g.data(), gs, tmp_u.data(), us, tmp_d.data(), ds);
                 }
-                double ws = std::chrono::duration<double>(std::chrono::steady_clock::now() - tw0).count();
-                fprintf(stderr, "[warpgrid] Pre-warmed %zu hot experts from %s in %.2fs\n",
-                        tasks.size(), impl_->expert_profile_path.c_str(), ws);
             }
-        }
+        });
     }
 
     if (impl_->exp_cache.enabled()) {
@@ -1599,6 +1658,7 @@ void DeepSeekV41Model::forward_logits(const int32_t* h_tokens, int T, int start_
 }
 
 int32_t DeepSeekV41Model::forward_and_greedy(const int32_t* h_tokens, int T, int start_pos, int slot_id) {
+    AsyncPrewarmState::InferScope infer_guard(impl_->prewarm);
     @autoreleasepool {
     if (T <= 0 || T > max_batch_tokens) throw std::runtime_error("Invalid token batch size T");
     if (slot_id < 0 || slot_id >= max_slots) throw std::runtime_error("Invalid slot_id");
@@ -2034,7 +2094,10 @@ int32_t DeepSeekV41Model::forward_and_greedy(const int32_t* h_tokens, int T, int
                 if (impl_->exp_cache.enabled() && U <= (size_t)impl_->exp_cache.num_slots) {
                     std::vector<int32_t> slot_for_u;
                     std::vector<std::pair<int32_t, int32_t>> miss_list;
-                    impl_->exp_cache.pin_and_resolve(l, uniq_ids.data(), U, slot_for_u, miss_list);
+                    {
+                        std::lock_guard<std::mutex> lk(impl_->prewarm.cache_mtx);
+                        impl_->exp_cache.pin_and_resolve(l, uniq_ids.data(), U, slot_for_u, miss_list);
+                    }
                     if (profile_stages) {
                         impl_->prof.exp_unique_total += (uint64_t)U;
                         impl_->prof.exp_misses += (uint64_t)miss_list.size();
@@ -2262,6 +2325,7 @@ int32_t DeepSeekV41Model::forward_and_greedy(const int32_t* h_tokens, int T, int
 }
 
 void DeepSeekV41Model::forward_verify_greedy(const int32_t* h_tokens, int T, int start_pos, int32_t* h_out_tokens) {
+    AsyncPrewarmState::InferScope infer_guard(impl_->prewarm);
     if (T <= 0) return;
     if ((size_t)T * (size_t)cfg.vocab_size * sizeof(float) > impl_->b_logits.length) {
         impl_->b_logits = impl_->alloc_buf((size_t)T * (size_t)cfg.vocab_size * sizeof(float));
@@ -2345,6 +2409,7 @@ void DeepSeekV41Model::commit_dspark_context(int count, int start_pos, int slot_
 
 void DeepSeekV41Model::draft_tokens(int32_t anchor_tok, int anchor_pos, int num_draft, int32_t* h_out_drafts, int slot_id) {
     if (!impl_->dspark.loaded || num_draft <= 0 || slot_id < 0 || slot_id >= max_slots) return;
+    AsyncPrewarmState::InferScope infer_guard(impl_->prewarm);
     auto t_dd0 = std::chrono::steady_clock::now();
     @autoreleasepool {
     auto& ds = impl_->dspark;
