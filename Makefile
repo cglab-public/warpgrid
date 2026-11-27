@@ -57,6 +57,8 @@ clean:
 else
 NVCC ?= /usr/local/cuda/bin/nvcc
 ARCH ?= sm_121a
+ARCH_NUM := $(patsubst sm_%,%,$(ARCH))
+GENCODE := -gencode arch=compute_$(ARCH_NUM),code=sm_$(ARCH_NUM)
 CXXFLAGS := -O3 -std=c++20 -Xcompiler -pthread -Xcompiler -Wall -Xcompiler -Wno-unused-function -lineinfo
 LDFLAGS := -lcublas -lcublasLt -lpthread
 
@@ -65,13 +67,13 @@ SRCS := src/main.cpp src/model.cu src/kernels.cu src/dspark.cu
 all: $(TARGET)
 
 $(TARGET): $(SRCS) $(COMMON_HDRS) src/kernels.cuh src/dspark.hpp
-	$(NVCC) $(CXXFLAGS) -gencode arch=compute_121a,code=sm_121a $(SRCS) -o $(TARGET) $(LDFLAGS)
+	$(NVCC) $(CXXFLAGS) $(GENCODE) $(SRCS) -o $(TARGET) $(LDFLAGS)
 
 tests/test_host: tests/test_host.cpp src/auth.hpp src/config.hpp src/json.hpp src/prefix_cache.hpp src/safetensors.hpp src/telemetry.hpp src/tokenizer.hpp
 	g++ -O3 -std=c++20 -pthread -Wall -DWARPGRID_METAL tests/test_host.cpp -o tests/test_host
 
 tests/test_dflash2_cuda: tests/test_dflash2_cuda.cu src/dspark.cu src/kernels.cu src/dspark.hpp src/kernels.cuh $(COMMON_HDRS)
-	$(NVCC) $(CXXFLAGS) -gencode arch=compute_121a,code=sm_121a tests/test_dflash2_cuda.cu src/dspark.cu src/kernels.cu -o tests/test_dflash2_cuda $(LDFLAGS)
+	$(NVCC) $(CXXFLAGS) $(GENCODE) tests/test_dflash2_cuda.cu src/dspark.cu src/kernels.cu -o tests/test_dflash2_cuda $(LDFLAGS)
 
 test: tests/test_host tests/test_dflash2_cuda
 	./tests/test_host
