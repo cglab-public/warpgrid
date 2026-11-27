@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include "deepseek_v41_metal.hpp"
+#include "../gguf_iq_tables.hpp"
 #include "../deepseek_profile.hpp"
 #include <chrono>
 #ifdef WARPGRID_METAL_PRECOMPILED
@@ -418,6 +419,7 @@ struct DeepSeekV41Model::Impl {
     id<MTLBuffer> b_moe_stage_up = nil;
     id<MTLBuffer> b_moe_stage_down = nil;
     id<MTLBuffer> b_stage_topk_ids = nil;
+    id<MTLBuffer> b_iq1s_grid = nil;
     size_t moe_stage_cap_gate = 0;
     size_t moe_stage_cap_up = 0;
     size_t moe_stage_cap_down = 0;
@@ -944,6 +946,9 @@ struct DeepSeekV41Model::Impl {
             [enc setBuffer:topk_w offset:0 atIndex:3];
             [enc setBuffer:y offset:0 atIndex:4];
             [enc setBytes:&mp length:sizeof(mp) atIndex:5];
+            if (w.type == GgmlType::IQ1_S) {
+                [enc setBuffer:b_iq1s_grid offset:0 atIndex:6];
+            }
             [enc dispatchThreadgroups:MTLSizeMake((w.rows + 7u) / 8u, T, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
             return;
         }
@@ -970,6 +975,9 @@ struct DeepSeekV41Model::Impl {
         [enc setBuffer:topk_ids offset:0 atIndex:3];
         [enc setBuffer:y offset:0 atIndex:4];
         [enc setBytes:&sp length:sizeof(sp) atIndex:5];
+        if (wg.type == GgmlType::IQ1_S) {
+            [enc setBuffer:b_iq1s_grid offset:0 atIndex:6];
+        }
         uint32_t rows_per_tg = (wg.type == GgmlType::IQ1_S) ? 4u : 8u;
         [enc dispatchThreadgroups:MTLSizeMake((wg.rows + rows_per_tg - 1u) / rows_per_tg, T * top_k, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
     }
@@ -1351,6 +1359,7 @@ void DeepSeekV41Model::load(const std::string& model_path, int max_seq, int max_
     impl_->b_router_logits = impl_->alloc_buf(Tmax * (size_t)std::max(1, cfg.n_routed_experts) * sizeof(float));
     impl_->b_topk_ids = impl_->alloc_buf(Tmax * top_k_sz * sizeof(int32_t));
     impl_->b_stage_topk_ids = impl_->alloc_buf(Tmax * top_k_sz * sizeof(int32_t));
+    impl_->b_iq1s_grid = [impl_->dev newBufferWithBytes:kIq1sGridGpu length:sizeof(kIq1sGridGpu) options:MTLResourceStorageModeShared];
     impl_->b_topk_w = impl_->alloc_buf(Tmax * top_k_sz * sizeof(float));
     impl_->b_ffn_gate = impl_->alloc_buf(Tmax * top_k_sz * Inter * sizeof(float));
     impl_->b_ffn_up = impl_->alloc_buf(Tmax * top_k_sz * Inter * sizeof(float));

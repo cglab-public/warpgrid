@@ -2850,16 +2850,37 @@ inline float gguf_iq1s_sub32_h(device const uchar* blk, uint ib, half4 v0, half4
     float s = 0.0f;
     #define IQ1S_GH(L, QBYTE, VA, VB) do { \
         uint idx = uint(QBYTE) | (((uint(qh) >> (3u * (L))) & 7u) << 8); \
-        uint pk = kGgufIq1sGridGpu[idx]; \
-        uint b0 = pk & 0xFFu, b1 = (pk >> 8) & 0xFFu, b2 = (pk >> 16) & 0xFFu, b3 = (pk >> 24) & 0xFFu; \
-        s += float(dot((VA), half4(half(b0 & 0x0Fu), half(b1 & 0x0Fu), half(b2 & 0x0Fu), half(b3 & 0x0Fu)))) \
-           + float(dot((VB), half4(half(b0 >> 4), half(b1 >> 4), half(b2 >> 4), half(b3 >> 4)))); \
+        uchar4 b = as_type<uchar4>(kGgufIq1sGridGpu[idx]); \
+        s += float(dot((VA), half4(b & uchar(0x0Fu)))) \
+           + float(dot((VB), half4(b >> 4))); \
     } while (0)
     IQ1S_GH(0u, qs4.x, v0, v1);
     IQ1S_GH(1u, qs4.y, v2, v3);
     IQ1S_GH(2u, qs4.z, v4, v5);
     IQ1S_GH(3u, qs4.w, v6, v7);
     #undef IQ1S_GH
+    return dl * fma(delta, sumy, s);
+}
+
+inline float gguf_iq1s_sub32_dev_h(device const uchar* blk, device const uint* grid, uint ib, half4 v0, half4 v1, half4 v2, half4 v3, half4 v4, half4 v5, half4 v6, half4 v7, float sumy) {
+    float d = gguf_load_f16(blk);
+    uchar2 qhb = uchar2(*reinterpret_cast<device const packed_uchar2*>(blk + 34u + ib * 2u));
+    ushort qh = ushort(qhb.x) | (ushort(qhb.y) << 8);
+    float dl = d * float(2u * ((uint(qh) >> 12) & 7u) + 1u);
+    float delta = (qh & 0x8000u) ? (-1.0f - 0.125f) : (-1.0f + 0.125f);
+    uchar4 qs4 = uchar4(*reinterpret_cast<device const packed_uchar4*>(blk + 2u + ib * 4u));
+    float s = 0.0f;
+    #define IQ1S_DH(L, QBYTE, VA, VB) do { \
+        uint idx = uint(QBYTE) | (((uint(qh) >> (3u * (L))) & 7u) << 8); \
+        uchar4 b = as_type<uchar4>(grid[idx]); \
+        s += float(dot((VA), half4(b & uchar(0x0Fu)))) \
+           + float(dot((VB), half4(b >> 4))); \
+    } while (0)
+    IQ1S_DH(0u, qs4.x, v0, v1);
+    IQ1S_DH(1u, qs4.y, v2, v3);
+    IQ1S_DH(2u, qs4.z, v4, v5);
+    IQ1S_DH(3u, qs4.w, v6, v7);
+    #undef IQ1S_DH
     return dl * fma(delta, sumy, s);
 }
 
@@ -2870,6 +2891,7 @@ kernel void gguf_moe_gate_up_swiglu_iq1_s(
     device const int* topk_ids [[buffer(3)]],
     device float* Y [[buffer(4)]],
     constant GgufMoeSwigluParams& p [[buffer(5)]],
+    device const uint* grid [[buffer(6)]],
     uint2 tgid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]]) {
     uint tr = tgid.y;
@@ -2904,11 +2926,11 @@ kernel void gguf_moe_gate_up_swiglu_iq1_s(
         uint ibl = ib32 >> 3;
         uint ib = ib32 & 7u;
         ulong boff = e_off + ulong(n0) * row_bytes + ulong(ibl) * 50ul;
-        ga0 += gguf_iq1s_sub32_h(Wg + boff, ib, v0, v1, v2, v3, v4, v5, v6, v7, sumy);
-        ua0 += gguf_iq1s_sub32_h(Wu + boff, ib, v0, v1, v2, v3, v4, v5, v6, v7, sumy);
+        ga0 += gguf_iq1s_sub32_dev_h(Wg + boff, grid, ib, v0, v1, v2, v3, v4, v5, v6, v7, sumy);
+        ua0 += gguf_iq1s_sub32_dev_h(Wu + boff, grid, ib, v0, v1, v2, v3, v4, v5, v6, v7, sumy);
         if (has_r1) {
-            ga1 += gguf_iq1s_sub32_h(Wg + boff + row_bytes, ib, v0, v1, v2, v3, v4, v5, v6, v7, sumy);
-            ua1 += gguf_iq1s_sub32_h(Wu + boff + row_bytes, ib, v0, v1, v2, v3, v4, v5, v6, v7, sumy);
+            ga1 += gguf_iq1s_sub32_dev_h(Wg + boff + row_bytes, grid, ib, v0, v1, v2, v3, v4, v5, v6, v7, sumy);
+            ua1 += gguf_iq1s_sub32_dev_h(Wu + boff + row_bytes, grid, ib, v0, v1, v2, v3, v4, v5, v6, v7, sumy);
         }
     }
     float gv0 = simd_sum(ga0), uv0 = simd_sum(ua0);
@@ -2932,6 +2954,7 @@ kernel void gguf_moe_down_accum_iq1_s_4r(
     device const float* topk_w [[buffer(3)]],
     device float* Y [[buffer(4)]],
     constant GgufMoeParams& p [[buffer(5)]],
+    device const uint* grid [[buffer(6)]],
     uint2 tgid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]]) {
     uint t = tgid.y;
@@ -2963,7 +2986,7 @@ kernel void gguf_moe_down_accum_iq1_s_4r(
             uint ib = ib32 & 7u;
             ulong boff = e_off + ulong(ibl) * 50ul;
             for (uint r = 0; r < cnt; ++r) {
-                acc[r] += gguf_iq1s_sub32_h(W + boff + ulong(r) * row_bytes, ib, v0, v1, v2, v3, v4, v5, v6, v7, sumy);
+                acc[r] += gguf_iq1s_sub32_dev_h(W + boff + ulong(r) * row_bytes, grid, ib, v0, v1, v2, v3, v4, v5, v6, v7, sumy);
             }
         }
         for (uint r = 0; r < cnt; ++r) tot[r] = fma(gw, acc[r], tot[r]);
